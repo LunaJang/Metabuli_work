@@ -4,6 +4,8 @@
 #include "common.h"
 #include <set>
 
+
+
 // new code
 void DisjointSet::makeSet(uint32_t item) {
         parent[item] = item;
@@ -89,6 +91,7 @@ void writeQueryKmerFile(QueryKmerBuffer * queryKmerBuffer,
                         size_t& numOfSplits, 
                         size_t processedReadCnt, 
                         SeqIterator * seqIterator, 
+                        int kmerStride,
                         const string & jobid) {
     time_t beforeSaveFile = time(nullptr);
     size_t queryKmerNum = queryKmerBuffer->startIndexOfReserve;
@@ -119,7 +122,7 @@ void writeQueryKmerFile(QueryKmerBuffer * queryKmerBuffer,
     uint64_t lastKmer = 0;
     size_t write = 0;
 
-    for(size_t i = 0; i < queryKmerNum ; i++) {
+    for(size_t i = 0; i < queryKmerNum ; i += kmerStride) {
         queryKmerList[i].info.sequenceID += processedReadCnt;
         fwrite(& queryKmerList[i].info, sizeof (QueryKmerInfo), 1, infoFile);
         write++;
@@ -407,7 +410,7 @@ void getRepLabel(const std::string & groupRepFileDir,
                  std::unordered_map<uint32_t, int> & repLabel, 
                  const string & jobid,
                  NcbiTaxonomy * taxonomy) {                    
-    int voteMode = 1;
+    int voteMode = 2;
     float majorityThr = 0.5;
 
     for (const auto& group : groupInfo) {
@@ -609,7 +612,7 @@ void Classifier::startClassify(const LocalParameters &par) {
                                              kseq2); // sync kseq1 and kseq2
             
             // saveQueryIdToFile
-            writeQueryKmerFile(&queryKmerBuffer, outDir, numOfSplits, processedReadCnt, seqIterator, jobId);
+            writeQueryKmerFile(&queryKmerBuffer, outDir, numOfSplits, processedReadCnt, seqIterator, par.kmerStride, jobId);
 
             // Print progress
             processedReadCnt += queryReadSplit[splitIdx].readCnt;

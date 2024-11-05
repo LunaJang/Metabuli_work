@@ -41,7 +41,13 @@ using namespace std;
 void flushKmerBuf(uint16_t *buffer, FILE *handleKmerTable, size_t &localBufIdx);
 void getDiffIdx(const uint64_t &lastKmer, const uint64_t &entryToWrite, FILE *handleKmerTable, uint16_t *buffer, size_t &localBufIdx);
 void writeDiffIdx(uint16_t *buffer, FILE *handleKmerTable, uint16_t *toWrite, size_t size, size_t &localBufIdx);
-void writeQueryKmerFile(QueryKmerBuffer * queryKmerBuffer, const std::string& queryKmerFileDir, size_t processedReadCnt, SeqIterator * seqIterator);
+void writeQueryKmerFile(QueryKmerBuffer * queryKmerBuffer, 
+                        const std::string& queryKmerFileDir, 
+                        size_t& numOfSplits, 
+                        size_t processedReadCnt, 
+                        SeqIterator * seqIterator, 
+                        int kmerStride,
+                        const string & jobid);
 
 void processKmerQuery(const std::string& queryKmerFileDir, 
                       const std::string& groupFileDir,

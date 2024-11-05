@@ -59,6 +59,7 @@ public:
     PARAMETER(MIN_SS_MATCH)
     PARAMETER(TIE_RATIO)
     PARAMETER(GROUP_KMER_THR)
+    PARAMETER(KMER_STRIDE)
 
     // DB build parameters
     PARAMETER(LIBRARY_PATH)
@@ -110,6 +111,7 @@ public:
     int minSSMatch;
     float tieRatio;
     int groupKmerThreshold;
+    int kmerStride;
 
     // Database creation
     std::string tinfoPath;

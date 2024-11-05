@@ -166,6 +166,13 @@ LocalParameters::LocalParameters() :
                     typeid(int),
                     (void *) &groupKmerThreshold,
                     "^[0-9]+$"),
+        KMER_STRIDE(KMER_STRIDE_ID,
+                    "--kmer-stride",
+                    "Size of stride to skip k-mers in kmer list file",
+                    "Size of stride to skip k-mers in kmer list file",
+                    typeid(int),
+                    (void *) &kmerStride,
+                    "^[0-9]+$"),
         LIBRARY_PATH(LIBRARY_PATH_ID,
                      "--library-path",
                      "Path to library where the FASTA files are stored",
@@ -325,6 +332,7 @@ LocalParameters::LocalParameters() :
     minSSMatch = 0;
     tieRatio = 0;
     groupKmerThreshold = 0;
+    kmerStride = 0;
 
     // Database creation
     tinfoPath = "";
@@ -392,6 +400,7 @@ LocalParameters::LocalParameters() :
     classify.push_back(&ACCESSION_LEVEL);
     classify.push_back(&TIE_RATIO);
     classify.push_back(&GROUP_KMER_THR);
+    classify.push_back(&KMER_STRIDE);
     // classify.push_back(&MIN_SS_MATCH);
 
     // filter 
