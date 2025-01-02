@@ -433,6 +433,13 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&ACCESSION_LEVEL);
     groupGeneration.push_back(&TIE_RATIO);
 
+    //applyBinning
+    applyBinning.push_back(&PARAM_THREADS);
+    applyBinning.push_back(&TAXONOMY_PATH);
+    applyBinning.push_back(&RAM_USAGE);
+    applyBinning.push_back(&VOTE_MODE);
+    applyBinning.push_back(&MAJORITY_THR);
+
     // filter 
     filter.push_back(&PARAM_THREADS);
     filter.push_back(&SEQ_MODE);

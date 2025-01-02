@@ -23,6 +23,7 @@ public:
 
     std::vector<MMseqsParameter*> classify;
     std::vector<MMseqsParameter*> groupGeneration;
+    std::vector<MMseqsParameter*> applyBinning;
     std::vector<MMseqsParameter*> filter;
     std::vector<MMseqsParameter*> exclusiontest_hiv;
     std::vector<MMseqsParameter*> seqHeader2TaxId;
@@ -62,6 +63,7 @@ public:
 
     // Group generation
     PARAMETER(GROUP_KMER_THR)
+    // Apply binning
     PARAMETER(VOTE_MODE)
     PARAMETER(MAJORITY_THR)
 

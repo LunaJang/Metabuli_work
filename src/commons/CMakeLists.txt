@@ -15,6 +15,8 @@ set(commons_source_files
         commons/Classifier.h
 		commons/GroupGenerator.cpp
         commons/GroupGenerator.h
+		commons/Binning.cpp
+        commons/Binning.h
         commons/BitManipulateMacros.h
         commons/LocalParameters.cpp
         commons/LocalParameters.h
