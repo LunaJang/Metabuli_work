@@ -605,22 +605,24 @@ void GroupGenerator::loadMetabuliResult(const string &resultFileDir,
 }
 
 void GroupGenerator::getRepLabel(const string &groupRepFileDir, 
-                                 vector<pair<int, float>> &metabuliResult, 
-                                 const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                 unordered_map<uint32_t, int> &repLabel, 
-                                 const string &jobId, 
-                                 int voteMode, 
-                                 float majorityThr,
-                                 const float groupScoreThr) {
+    vector<pair<int, float>> &metabuliResult, 
+    const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+    unordered_map<uint32_t, int> &repLabel,                         
+    const string &jobId, 
+    int voteMode, 
+    float majorityThr,
+    const float groupScoreThr) {
 
     for (const auto& [groupId, queryIds] : groupInfo) {
         for (uint32_t queryId : queryIds) {
             if (queryId >= metabuliResult.size()) {
-                continue;
-            }
+            continue;
+        }
         }
     }
 
+    unordered_map<TaxID, TaxID> external2internalTaxID;
+    taxonomy->getExternal2internalTaxID(external2internalTaxID);
 
     for (const auto& group : groupInfo) {
         uint32_t groupId = group.first;
@@ -632,10 +634,9 @@ void GroupGenerator::getRepLabel(const string &groupRepFileDir,
             int query_label = metabuliResult[queryId].first; 
             float score = metabuliResult[queryId].second;
             if (query_label != 0 && score >= groupScoreThr) {
-                setTaxa.emplace_back(query_label, score, voteMode);
+                setTaxa.emplace_back(external2internalTaxID[query_label], score, voteMode);
             }
         }
-
         WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, majorityThr);
 
         if (result.taxon != 0) {
