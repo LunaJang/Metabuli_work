@@ -29,6 +29,16 @@ struct Relation {
     uint32_t id1;
     uint32_t id2;
     uint32_t weight;
+
+    bool operator==(const Relation& other) const {
+        return id1 == other.id1 && id2 == other.id2;
+    }
+};
+
+struct relation_hash {
+    size_t operator()(const Relation& r) const {
+        return hash<uint32_t>()(r.id1) ^ (hash<uint32_t>()(r.id2) << 1);
+    }
 };
 
 // DisjointSet class for handling union-find operations
