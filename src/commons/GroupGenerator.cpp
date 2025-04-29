@@ -145,13 +145,17 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         }
     }   
 
-    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
-    int dynamicGroupKmerThr = static_cast<int>(dynamicThresholding(outDir, numOfGraph, jobId, thresholdK));
+    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId); 
+
+    vector<Relation> mergedRelations;
+    mergeRelations(outDir, numOfGraph, jobId, mergedRelations, 0); // topN은 무시
+    int dynamicGroupKmerThr = static_cast<int>(dynamicThresholding(mergedRelations, thresholdK));
+
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
     //makeGroups(groupInfo, outDir, queryGroupInfo, groupKmerThr, numOfGraph, jobId);
-    makeGroups(groupInfo, outDir, queryGroupInfo, dynamicGroupKmerThr, numOfGraph, jobId);
+    makeGroups(mergedRelations, groupInfo, queryGroupInfo, dynamicGroupKmerThr, processedReadCnt);
     
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
     // loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
@@ -166,47 +170,6 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     applyRepLabel(outDir, outDir, queryGroupInfo, repLabel, groupScoreThr, jobId);
     
     cout << "Number of query k-mers: " << numOfTatalQueryKmerCnt << endl;
-}
-
-void GroupGenerator::makeGroupsFromBinning(const string &binningFileDir, 
-                                           unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &relation,
-                                           unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                           vector<int> &queryGroupInfo, 
-                                           int groupKmerThr) {
-    // Map to store the count of shared Y nodes between X nodes
-    DisjointSet ds;
-    string line;
-
-    cout << "Creating groups based on graph..." << endl;
-    time_t beforeSearch = time(nullptr);
-    
-    for (const auto& currentQueryRelation : relation) {
-        uint32_t currentQueryId = currentQueryRelation.first;
-        for (const auto& [otherQueryId, count] : currentQueryRelation.second) {
-            if (count >= groupKmerThr) {
-                if (ds.parent.find(currentQueryId) == ds.parent.end()) {
-                    ds.makeSet(currentQueryId);
-                }
-                if (ds.parent.find(otherQueryId) == ds.parent.end()) {
-                    ds.makeSet(otherQueryId);
-                }
-                ds.unionSets(currentQueryId, otherQueryId);
-            }
-        }
-    }
-
-    // Collect nodes into groups
-    for (const auto& p : ds.parent) {
-        uint32_t currentQueryId = p.first;
-        uint32_t groupId = ds.find(currentQueryId);
-        groupInfo[groupId].insert(currentQueryId);
-        queryGroupInfo[currentQueryId] = groupId;
-    }
-
-    cout << "Query group created successfully : " << groupInfo.size() << " groups" << endl;
-    cout << "Time spent for query groups: " << double(time(nullptr) - beforeSearch) << endl;
-
-    return;
 }
 
 void GroupGenerator::makeGraph(const string &queryKmerFileDir, 
@@ -357,11 +320,6 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
-
-
-
-
-
 void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &subRelation, 
                                         const string &subGraphFileDir, 
                                         const size_t counter_now,
@@ -397,137 +355,10 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
     }
 }
 
-double GroupGenerator::dynamicThresholding(const std::string &subGraphFileDir,
-                                           size_t numOfGraph,
-                                           const std::string &jobId,
-                                           double thresholdK) {
-    double global_mean = 0.0;
-    double global_M2 = 0.0;
-    size_t global_count = 0;
-    size_t BLOCK_SIZE = 10000;
-
-    for (size_t i = 0; i < numOfGraph; ++i) {
-        std::string fileName = subGraphFileDir + "/" + jobId + "_subGraph" + std::to_string(i);
-        std::ifstream file(fileName, std::ios::binary);
-        if (!file.is_open()) {
-            std::cerr << "Error opening file: " << fileName << std::endl;
-            continue;
-        }
-
-        // Block-wise 계산 변수
-        double block_sum = 0.0, block_sq_sum = 0.0;
-        size_t block_count = 0;
-
-        uint32_t id1, id2, weight;
-        while (file.read(reinterpret_cast<char*>(&id1), sizeof(uint32_t))) {
-            file.read(reinterpret_cast<char*>(&id2), sizeof(uint32_t));
-            file.read(reinterpret_cast<char*>(&weight), sizeof(uint32_t));
-            double w = static_cast<double>(weight);
-            block_sum += w;
-            block_sq_sum += w * w;
-            ++block_count;
-
-            if (block_count == BLOCK_SIZE) {
-                double block_mean = block_sum / block_count;
-                double block_var = (block_sq_sum / block_count) - (block_mean * block_mean);
-                double block_M2 = block_var * block_count;
-
-                // Welford-style 병합
-                double delta = block_mean - global_mean;
-                size_t total_n = global_count + block_count;
-
-                global_mean += delta * (static_cast<double>(block_count) / total_n);
-                global_M2 += block_M2 + delta * delta * global_count * block_count / total_n;
-                global_count = total_n;
-
-                block_sum = block_sq_sum = 0.0;
-                block_count = 0;
-            }
-        }
-
-        // 마지막 블록 처리
-        if (block_count > 0) {
-            double block_mean = block_sum / block_count;
-            double block_var = (block_sq_sum / block_count) - (block_mean * block_mean);
-            double block_M2 = block_var * block_count;
-
-            double delta = block_mean - global_mean;
-            size_t total_n = global_count + block_count;
-
-            global_mean += delta * (static_cast<double>(block_count) / total_n);
-            global_M2 += block_M2 + delta * delta * global_count * block_count / total_n;
-            global_count = total_n;
-        }
-    }
-
-    if (global_count < 2) {
-        std::cerr << "Not enough data to compute threshold." << std::endl;
-        return 0;
-    }
-
-    double stddev = std::sqrt(global_M2 / (global_count - 1));
-    double threshold = global_mean + thresholdK * stddev;
-
-    std::cout << "Number of shared kmer mean: " << global_mean
-                << ", stddev: " << stddev
-                << ", kmer threshold (mean + " << thresholdK << "*std): " << threshold << std::endl;
-
-    return threshold;
-}
-    
-
-void GroupGenerator::makeGroups(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                const string &subGraphFileDir, 
-                                vector<int> &queryGroupInfo, 
-                                int groupKmerThr, 
-                                size_t &numOfGraph,
-                                const string &jobId) {
-    DisjointSet ds;
-    time_t beforeSearch = time(nullptr);
-
-    cout << "Merging relations first..." << endl;
-
-    vector<Relation> mergedRelations;
-    mergeRelations(subGraphFileDir, numOfGraph, jobId, mergedRelations, groupKmerThr, 0); // topN은 무시
-
-    cout << "Creating groups based on merged relations..." << endl;
-
-    ofstream relationLog(subGraphFileDir + "/" + jobId + "_allRelations.txt");
-    if (!relationLog.is_open()) {
-        cerr << "Failed to open relation log file." << endl;
-        return;
-    }
-
-    for (size_t i = 0; i < mergedRelations.size(); ++i) {
-        const Relation& rel = mergedRelations[i];
-
-        relationLog << rel.id1 << ' ' << rel.id2 << ' ' << rel.weight << '\n';
-
-        if (ds.parent.find(rel.id1) == ds.parent.end()) ds.makeSet(rel.id1);
-        if (ds.parent.find(rel.id2) == ds.parent.end()) ds.makeSet(rel.id2);
-        ds.unionSets(rel.id1, rel.id2);
-    }
-
-    for (unordered_map<uint32_t, uint32_t>::iterator it = ds.parent.begin(); it != ds.parent.end(); ++it) {
-        uint32_t queryId = it->first;
-        uint32_t groupId = ds.find(queryId);
-        groupInfo[groupId].insert(queryId);
-        if (queryId >= queryGroupInfo.size()) {
-            queryGroupInfo.resize(queryId + 1, -1);
-        }
-        queryGroupInfo[queryId] = groupId;
-    }
-
-    cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
-    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
-}
-
-
 void GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                     size_t numOfGraph,
                                     const string& jobId,
                                     vector<Relation>& mergedRelations,
-                                    int groupKmerThr,
                                     int topN) { // topN 파라미터는 무시됨
     const size_t BATCH_SIZE = 4096;
 
@@ -601,12 +432,75 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
     for (unordered_map<Relation, uint32_t, relation_hash>::iterator it = totalRelations.begin(); it != totalRelations.end(); ++it) {
         const Relation& key = it->first;
         uint32_t totalWeight = it->second;
-        if (totalWeight >= (uint32_t)groupKmerThr) {
-            mergedRelations.push_back(Relation{key.id1, key.id2, totalWeight});
-        }
+        mergedRelations.push_back(Relation{key.id1, key.id2, totalWeight});
     }
 
     cout << "Relations merged successfully: " << mergedRelations.size() << " relations collected." << endl;
+}
+
+double GroupGenerator::dynamicThresholding(const vector<Relation> &mergedRelations,
+                                           double thresholdK) {
+    double sum = 0.0;
+    double sq_sum = 0.0;
+    size_t count = 0;
+
+    for (const Relation& rel : mergedRelations) {
+        double w = static_cast<double>(rel.weight);
+        sum += w;
+        sq_sum += w * w;
+        count++;
+    }
+
+    if (count < 2) {
+        cerr << "Not enough data to compute threshold." << endl;
+        return 0;
+    }
+
+    double mean = sum / count;
+    double variance = (sq_sum / count) - (mean * mean);
+    double stddev = sqrt(variance);
+
+    double threshold = mean + thresholdK * stddev;
+
+    cout << "Number of shared kmer mean: " << mean
+         << ", stddev: " << stddev
+         << ", kmer threshold (mean + " << thresholdK << "*std): " << threshold << endl;
+
+    return threshold;
+}
+
+    
+
+void GroupGenerator::makeGroups(const vector<Relation> &mergedRelations, 
+                                unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+                                vector<int> &queryGroupInfo, 
+                                int groupKmerThr,
+                                size_t processedReadCnt) {
+    DisjointSet ds;
+    time_t beforeSearch = time(nullptr);
+
+    cout << "Creating groups based on merged relations..." << endl;
+
+    for (const Relation& rel : mergedRelations) {
+        if (rel.weight >= groupKmerThr) {
+            if (ds.parent.find(rel.id1) == ds.parent.end()) ds.makeSet(rel.id1);
+            if (ds.parent.find(rel.id2) == ds.parent.end()) ds.makeSet(rel.id2);
+            ds.unionSets(rel.id1, rel.id2);
+        }
+    }
+
+    for (const auto& p : ds.parent) {
+        uint32_t queryId = p.first;
+        uint32_t groupId = ds.find(queryId);
+        groupInfo[groupId].insert(queryId);
+        if (queryId >= queryGroupInfo.size()) {
+            queryGroupInfo.resize(queryId + 1, -1);
+        }
+        queryGroupInfo[queryId] = groupId;
+    }
+
+    cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
+    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
 void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 

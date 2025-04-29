@@ -170,19 +170,15 @@ public:
                         size_t numOfGraph,
                         const string& jobId,
                         vector<Relation>& mergedRelations,
-                        int groupKmerThr,
                         int topN);
-    double dynamicThresholding(const std::string &subGraphFileDir,
-                               size_t numOfGraph,
-                               const std::string &jobId,
-                               double k);
+    double dynamicThresholding(const vector<Relation>& mergedRelations,
+                               double thresholdK);
 
-    void makeGroups(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
-                    const string &subGraphFileDir, 
+    void makeGroups(const vector<Relation> &mergedRelations, 
+                    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                     vector<int> &queryGroupInfo, 
-                    int groupKmerThr, 
-                    size_t &numOfGraph,
-                    const string &jobId);
+                    int groupKmerThr,
+                    size_t processedReadCnt);
 
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                           const vector<int> &queryGroupInfo, 
@@ -212,12 +208,6 @@ public:
                        const unordered_map<uint32_t, int> &repLabel, 
                        const float groupScoreThr, 
                        const string &jobId);
-    
-    void makeGroupsFromBinning(const string &binningFileDir, 
-                               unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &relation,
-                               unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                               vector<int> &queryGroupInfo, 
-                               int groupKmerThr);
 
     void tempFunction();
 
