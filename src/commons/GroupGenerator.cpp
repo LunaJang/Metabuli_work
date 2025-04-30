@@ -145,10 +145,20 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         }
     }   
 
-    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId); 
+    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);
 
+    vector<pair<int, float>> metabuliResult;       
+    
+    metabuliResult.resize(processedReadCnt, make_pair(-1, 0.0f));
+    loadMetabuliResult(outDir, metabuliResult);
+
+    vector<uint32_t> rewiredMap;
+    rewiredMap.resize(processedReadCnt, -1);
+    unordered_map<uint32_t, vector<uint32_t>> rewiredMapMembers;
+    rewireNodes(metabuliResult, rewiredMap, rewiredMapMembers); // topN은 무시
+    
     vector<Relation> mergedRelations;
-    mergeRelations(outDir, numOfGraph, jobId, mergedRelations, 0); // topN은 무시
+    mergeRelations(outDir, numOfGraph, jobId, rewiredMap, rewiredMapMembers, mergedRelations, 0); // topN은 무시
     int dynamicGroupKmerThr = static_cast<int>(dynamicThresholding(mergedRelations, thresholdK));
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
@@ -157,12 +167,9 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     //makeGroups(groupInfo, outDir, queryGroupInfo, groupKmerThr, numOfGraph, jobId);
     makeGroups(mergedRelations, groupInfo, queryGroupInfo, dynamicGroupKmerThr, processedReadCnt);
     
-    saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
+    saveGroupsToFile(groupInfo, queryGroupInfo, outDir, rewiredMap, rewiredMapMembers, processedReadCnt, jobId);
     // loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
     
-    vector<pair<int, float>> metabuliResult;       
-    metabuliResult.resize(processedReadCnt, make_pair(-1, 0.0f));
-    loadMetabuliResult(outDir, metabuliResult);
 
     unordered_map<uint32_t, int> repLabel; 
     getRepLabel(outDir, metabuliResult, groupInfo, repLabel, jobId, voteMode, majorityThr, groupScoreThr);
@@ -316,7 +323,7 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
     
     numOfGraph = counter.fetch_add(1, std::memory_order_relaxed);
 
-    cout << "Relations generated from files successfully." << endl;
+    cout << "Sub-graphs generated from files successfully." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
@@ -355,20 +362,49 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
     }
 }
 
+void GroupGenerator::rewireNodes(const vector<pair<int, float>>& metabuliResult,
+                                 vector<uint32_t>& rewiredMap,
+                                 unordered_map<uint32_t, vector<uint32_t>>& rewiredMapMembers) {
+    time_t beforeSearch = time(nullptr);
+    cout << "Rewire nodes in same taxa based on metabuli classify..." << endl;
+
+    unordered_map<int, uint32_t> speciesRepMap;  // label → representative
+    rewiredMap.assign(metabuliResult.size(), UINT32_MAX);
+
+    for (uint32_t id = 0; id < metabuliResult.size(); ++id) {
+        int label = metabuliResult[id].first;
+        if (label >= 2) {
+            if (speciesRepMap.count(label) == 0) {
+                speciesRepMap[label] = id;
+            }
+            uint32_t repId = speciesRepMap[label];
+            rewiredMap[id] = repId;
+            rewiredMapMembers[repId].push_back(id);
+        }
+    }
+
+    cout << "Nodes in same taxa rewired: " << metabuliResult.size() << " queries into "
+         << rewiredMapMembers.size() << " taxas" << endl;
+    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
+}
+
 void GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                     size_t numOfGraph,
                                     const string& jobId,
+                                    const vector<uint32_t>& rewiredMap,
+                                    unordered_map<uint32_t, vector<uint32_t>>& rewiredMapMembers,
                                     vector<Relation>& mergedRelations,
-                                    int topN) { // topN 파라미터는 무시됨
-    const size_t BATCH_SIZE = 4096;
+                                    int topN) {
+    time_t beforeSearch = time(nullptr);
+    cout << "Merged sub-graphs into relation..." << endl;
 
+    const size_t BATCH_SIZE = 4096;
     unordered_map<Relation, uint32_t, relation_hash> totalRelations;
 
     vector<ifstream> files(numOfGraph);
-    vector<queue<Relation> > relationBuffers(numOfGraph);
+    vector<queue<Relation>> relationBuffers(numOfGraph);
     vector<bool> fileHasData(numOfGraph, true);
 
-    // 파일 열고 초기 batch 읽기
     for (size_t i = 0; i < numOfGraph; ++i) {
         string fileName = subGraphFileDir + "/" + jobId + "_subGraph" + to_string(i);
         files[i].open(fileName.c_str(), ios::binary);
@@ -401,45 +437,54 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
         }
     };
 
-    bool finished = false;
-    while (!finished) {
+    while (true) {
         pair<uint32_t, uint32_t> minKey(UINT32_MAX, UINT32_MAX);
         size_t selectedFile = -1;
+
         for (size_t i = 0; i < numOfGraph; ++i) {
             if (fileHasData[i] && !relationBuffers[i].empty()) {
                 const Relation& r = relationBuffers[i].front();
                 if (make_pair(r.id1, r.id2) < minKey) {
-                    minKey = make_pair(r.id1, r.id2);
+                    minKey = {r.id1, r.id2};
                     selectedFile = i;
                 }
             }
         }
 
-        if (minKey.first == UINT32_MAX) {
-            finished = true;
-            break;
-        }
+        if (minKey.first == UINT32_MAX) break;
 
         Relation r = relationBuffers[selectedFile].front();
         relationBuffers[selectedFile].pop();
         readNextBatch(selectedFile);
 
+        if (r.id1 >= rewiredMap.size() || r.id2 >= rewiredMap.size()) continue;
+        uint32_t rep1 = rewiredMap[r.id1];
+        uint32_t rep2 = rewiredMap[r.id2];
+        if (rep1 == UINT32_MAX || rep2 == UINT32_MAX || rep1 == rep2) continue;
+
+        if (rep1 > rep2) std::swap(rep1, rep2);
         Relation key = {r.id1, r.id2, 0};
         totalRelations[key] += r.weight;
     }
 
-    // merge 완료 후 모든 relation 저장
-    for (unordered_map<Relation, uint32_t, relation_hash>::iterator it = totalRelations.begin(); it != totalRelations.end(); ++it) {
-        const Relation& key = it->first;
-        uint32_t totalWeight = it->second;
-        mergedRelations.push_back(Relation{key.id1, key.id2, totalWeight});
+    for (auto& entry : totalRelations) {
+        Relation rel = entry.first;
+        
+        double size = (rewiredMapMembers[rel.id1].size() + rewiredMapMembers[rel.id2].size()) * 2;
+        if (size == 0) size = 2.0;
+        rel.weight = entry.second / size;
+
+        mergedRelations.push_back(rel);
     }
 
     cout << "Relations merged successfully: " << mergedRelations.size() << " relations collected." << endl;
+    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
 double GroupGenerator::dynamicThresholding(const vector<Relation> &mergedRelations,
                                            double thresholdK) {
+    time_t beforeSearch = time(nullptr);
+    cout << "Calculate threshold from merged relations..." << endl;
     double sum = 0.0;
     double sq_sum = 0.0;
     size_t count = 0;
@@ -465,6 +510,7 @@ double GroupGenerator::dynamicThresholding(const vector<Relation> &mergedRelatio
     cout << "Number of shared kmer mean: " << mean
          << ", stddev: " << stddev
          << ", kmer threshold (mean + " << thresholdK << "*std): " << threshold << endl;
+    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 
     return threshold;
 }
@@ -476,9 +522,9 @@ void GroupGenerator::makeGroups(const vector<Relation> &mergedRelations,
                                 vector<int> &queryGroupInfo, 
                                 int groupKmerThr,
                                 size_t processedReadCnt) {
+
     DisjointSet ds;
     time_t beforeSearch = time(nullptr);
-
     cout << "Creating groups based on merged relations..." << endl;
 
     for (const Relation& rel : mergedRelations) {
@@ -506,6 +552,9 @@ void GroupGenerator::makeGroups(const vector<Relation> &mergedRelations,
 void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                                       const vector<int> &queryGroupInfo, 
                                       const string &groupFileDir, 
+                                      vector<uint32_t>& rewiredMap,
+                                      const unordered_map<uint32_t, vector<uint32_t>>& rewiredMapMembers,
+                                      size_t processedReadCnt,
                                       const string &jobId) {
     // save group in txt file
     const string& groupInfoFileName = groupFileDir + "/" + jobId + "_groups";
@@ -517,15 +566,20 @@ void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_se
 
     for (const auto& [groupId, queryIds] : groupInfo) {
         outFile1 << groupId << " ";
-        for (const auto& queryId : queryIds) {
-            outFile1 << queryId << " ";
+        for (uint32_t queryId : queryIds) {
+            if (rewiredMapMembers.count(queryId)) {
+                for (uint32_t qid : rewiredMapMembers.at(queryId)) {
+                    outFile1 << qid << " ";
+                }
+            } else {
+                outFile1 << queryId << " ";
+            }
         }
-        outFile1 << endl;
+        outFile1 << '\n';
     }
     outFile1.close();
     cout << "Query group saved to " << groupInfoFileName << " successfully." << endl;
     
-
     const string& queryGroupInfoFileName = groupFileDir + "/" + jobId + "_queryGroupMap";
     ofstream outFile2(queryGroupInfoFileName);
     if (!outFile2.is_open()) {
@@ -533,12 +587,16 @@ void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_se
         return;
     }
 
-    for (size_t i = 0; i < queryGroupInfo.size(); ++i) {
-        outFile2 << queryGroupInfo[i] << "\n";
+    for (int i = 0 ; i < processedReadCnt ; i++) {
+        if (queryGroupInfo[i] == -1 && rewiredMap[i] != -1){
+            outFile2 << queryGroupInfo[rewiredMap[i]] << "\n";
+        }
+        else{
+            outFile2 << queryGroupInfo[i] << "\n";
+        }
     }
     outFile2.close();
     cout << "Query group saved to " << queryGroupInfoFileName << " successfully." << endl;
-
     return;
 }
 
@@ -628,6 +686,8 @@ void GroupGenerator::getRepLabel(const string &groupRepFileDir,
         }
     }
 
+    std::unordered_map<int, int> external2internalTaxId;
+    taxonomy->getExternal2internalTaxID(external2internalTaxId);
 
     for (const auto& group : groupInfo) {
         uint32_t groupId = group.first;
@@ -636,7 +696,7 @@ void GroupGenerator::getRepLabel(const string &groupRepFileDir,
         vector<WeightedTaxHit> setTaxa;
 
         for (const auto& queryId : queryIds) {
-            int query_label = metabuliResult[queryId].first; 
+            int query_label = external2internalTaxId[metabuliResult[queryId].first]; 
             float score = metabuliResult[queryId].second;
             if (query_label != 0 && score >= groupScoreThr) {
                 setTaxa.emplace_back(query_label, score, voteMode);
@@ -645,7 +705,7 @@ void GroupGenerator::getRepLabel(const string &groupRepFileDir,
 
         WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, majorityThr);
 
-        if (result.taxon != 0 && result.taxon != 1) {
+        if (result.taxon != 0) {
             repLabel[groupId] = result.taxon;
         }
     }
@@ -699,7 +759,7 @@ void GroupGenerator::applyRepLabel(const string &resultFileDir,
             uint32_t groupId = queryGroupInfo[queryIdx];
             auto repLabelIt = repLabel.find(groupId);
             if (repLabelIt != repLabel.end() && repLabelIt->second != 0) {
-                fields[2] = to_string(repLabelIt->second);
+                fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
                 fields[0] = "1";
                 // fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
                 fields[5] = "-";

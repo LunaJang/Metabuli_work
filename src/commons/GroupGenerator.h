@@ -1,4 +1,3 @@
-
 #ifndef GROUP_GENERATOR_H
 #define GROUP_GENERATOR_H
 
@@ -111,11 +110,11 @@ public:
                                                             size_t maxBatchSize);
 
     void writeQueryKmerFile(Buffer<QueryKmer>& queryKmerBuffer, 
-                                   const string& queryKmerFileDir, 
-                                   size_t& numOfSplits, 
-                                   size_t numOfThreads, 
-                                   size_t processedReadCnt, 
-                                   const string & jobId);
+                            const string& queryKmerFileDir, 
+                            size_t& numOfSplits, 
+                            size_t numOfThreads, 
+                            size_t processedReadCnt, 
+                            const string & jobId);
     static size_t bufferSize;
 
     template <typename T>
@@ -124,20 +123,17 @@ public:
     }
 
     size_t  fillKmerInfoBuffer(size_t bufferSize,
-                            FILE *kmerInfoFp,
-                            TaxID *infoBuffer) {
+                               FILE *kmerInfoFp,
+                               TaxID *infoBuffer) {
         return loadBuffer(kmerInfoFp, infoBuffer, bufferSize);
     }
 };
-
-
 
 class GroupGenerator {
 protected:
     string dbDir;
     size_t matchPerKmer;
-    
-    // Agents
+
     QueryIndexer *queryIndexer;
     KmerExtractor *kmerExtractor;
     KmerMatcher *kmerMatcher;
@@ -146,7 +142,7 @@ protected:
     TaxonomyWrapper *taxonomy;
     KmerFileHandler *kmerFileHandler;
     SeqIterator *seqIterator;
-    
+
     unordered_map<TaxID, TaxID> taxId2speciesId;
     unordered_map<TaxID, TaxID> taxId2genusId;
 
@@ -166,11 +162,19 @@ public:
                             const string &subGraphFileDir, 
                             const size_t counter_now,
                             const string &jobId);
+
+    void rewireNodes(const vector<pair<int, float>>& metabuliResult,
+                     vector<uint32_t>& rewiredMap,
+                     unordered_map<uint32_t, vector<uint32_t>>& rewiredMapMembers);
+
     void mergeRelations(const string& subGraphFileDir,
                         size_t numOfGraph,
                         const string& jobId,
+                        const vector<uint32_t>& rewiredMap,
+                        unordered_map<uint32_t, vector<uint32_t>>& rewiredMapMembers,
                         vector<Relation>& mergedRelations,
                         int topN);
+
     double dynamicThresholding(const vector<Relation>& mergedRelations,
                                double thresholdK);
 
@@ -183,12 +187,15 @@ public:
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                           const vector<int> &queryGroupInfo, 
                           const string &groupFileDir, 
+                          vector<uint32_t>& rewiredMap,
+                          const unordered_map<uint32_t, vector<uint32_t>>& rewiredMapMembers,
+                          size_t processedReadCnt,
                           const string &jobId);
 
     void loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
-                       vector<int> &queryGroupInfo,
-                       const string &groupFileDir,
-                       const string &jobId);
+                            vector<int> &queryGroupInfo,
+                            const string &groupFileDir,
+                            const string &jobId);
 
     void loadMetabuliResult(const string &resultFileDir, 
                             vector<pair<int, float>> &metabuliResult);
