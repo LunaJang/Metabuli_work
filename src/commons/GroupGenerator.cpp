@@ -505,7 +505,7 @@ double GroupGenerator::dynamicThresholding(const vector<Relation> &mergedRelatio
     double variance = (sq_sum / count) - (mean * mean);
     double stddev = sqrt(variance);
 
-    double threshold = mean + thresholdK * stddev;
+    double threshold = max(mean + thresholdK * stddev, 0);
 
     cout << "Number of shared kmer mean: " << mean
          << ", stddev: " << stddev
@@ -705,7 +705,7 @@ void GroupGenerator::getRepLabel(const string &groupRepFileDir,
 
         WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, majorityThr);
 
-        if (result.taxon != 0) {
+        if (result.taxon != 0 && result.taxon != 1) {
             repLabel[groupId] = result.taxon;
         }
     }
