@@ -505,7 +505,7 @@ double GroupGenerator::dynamicThresholding(const vector<Relation> &mergedRelatio
     double variance = (sq_sum / count) - (mean * mean);
     double stddev = sqrt(variance);
 
-    double threshold = max(mean + thresholdK * stddev, 0);
+    double threshold = max(mean + thresholdK * stddev, 0.0);
 
     cout << "Number of shared kmer mean: " << mean
          << ", stddev: " << stddev
