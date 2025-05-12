@@ -399,9 +399,6 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         if (relationBuffers[i].empty()) fileHasData[i] = false;
     };
 
-    // 통계 변수
-    const size_t NUM_BINS = 200;
-    vector<size_t> histogram(NUM_BINS, 0);
     size_t count = 0;
     uint32_t minWeight = UINT32_MAX;
     uint32_t maxWeight = 0;
@@ -459,11 +456,17 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         cerr << "Failed to reopen relation log." << endl;
         return 0.0;
     }
+    
+    const size_t NUM_BINS = 200;
+    vector<size_t> histogram(NUM_BINS, 0);
+    double logMin = log(static_cast<double>(minWeight) + 1.0);
+    double logMax = log(static_cast<double>(maxWeight) + 1.0);
 
     uint32_t id1, id2, weight;
     while (relationLogRead >> id1 >> id2 >> weight) {
+        double logWeight = log(static_cast<double>(weight) + 1.0);
         size_t binIdx = static_cast<size_t>(
-            ((double)(weight - minWeight) / (maxWeight - minWeight)) * (NUM_BINS - 1)
+            ((logWeight - logMin) / (logMax - logMin)) * (NUM_BINS - 1)
         );
         histogram[binIdx]++;
     }
@@ -472,12 +475,11 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
     // 누적합 계산
     vector<double> cumulative(NUM_BINS, 0.0);
     cumulative[0] = histogram[0];
-    for (size_t i = 1; i < NUM_BINS; ++i) {
+    for (size_t i = 1; i < NUM_BINS; ++i)
         cumulative[i] = cumulative[i - 1] + histogram[i];
-    }
     double total = cumulative.back();
 
-    // 정규화 좌표 생성
+    // 정규화된 좌표 생성
     vector<pair<double, double>> normPoints;
     for (size_t i = 0; i < NUM_BINS; ++i) {
         normPoints.emplace_back(
@@ -492,17 +494,19 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
     for (size_t i = 0; i < NUM_BINS; ++i) {
         double x = normPoints[i].first;
         double y = normPoints[i].second;
-        double dist = abs(y - x) / sqrt(2.0);  // y = x 대각선에서의 수직 거리
+        double dist = abs(y - x) / sqrt(2.0);
         if (dist > maxDist) {
             maxDist = dist;
             elbowBin = i;
         }
     }
 
-    double threshold = minWeight + ((double)elbowBin / (NUM_BINS - 1)) * (maxWeight - minWeight);
+    // logWeight → 원래 weight scale로 복원
+    double logElbow = logMin + ((double)elbowBin / (NUM_BINS - 1)) * (logMax - logMin);
+    double threshold = exp(logElbow) - 1.0;
 
-    cout << "Elbow threshold: " << threshold << " (bin=" << elbowBin << ")" << endl;
-    cout << "Weight range: [" << minWeight << ", " << maxWeight << "], bins: " << NUM_BINS << endl;
+    cout << "Elbow threshold (log scale): " << threshold << " (bin=" << elbowBin << ")" << endl;
+    cout << "Log weight range: [" << logMin << ", " << logMax << "], bins: " << NUM_BINS << endl;
     cout << "Time: " << time(nullptr) - before << " sec" << endl;
 
     return threshold;
