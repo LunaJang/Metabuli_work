@@ -67,11 +67,9 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     size_t voteMode = par.voteMode;
     float majorityThr = par.majorityThr;
     float groupScoreThr = par.groupScoreThr;
-    double thresholdK = par.thresholdK;
     cout << "voteMode: " << voteMode << endl;
     cout << "majorityThr: " << majorityThr << endl;
     cout << "groupScoreThr: " << groupScoreThr << endl;
-    cout << "thresholdK: " << thresholdK << endl;
     
     //Extract k-mers from query sequences and compare them to target k-mer DB
     // while (!complete) {
@@ -143,7 +141,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId, thresholdK));
+    int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId));
     
     makeGroups(outDir, jobId, dynamicGroupKmerThr, groupInfo, queryGroupInfo);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
@@ -355,8 +353,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
 
 double GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                       size_t numOfGraph,
-                                      const string& jobId,
-                                      const double thresholdK) {
+                                      const string& jobId) {
     cout << "Merging and calculating threshold..." << endl;
     time_t before = time(nullptr);
 
@@ -403,7 +400,8 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
     };
 
     // 통계 변수
-    double mean = 0.0, M2 = 0.0;
+    const size_t NUM_BINS = 200;
+    vector<size_t> histogram(NUM_BINS, 0);
     size_t count = 0;
     uint32_t minWeight = UINT32_MAX;
     uint32_t maxWeight = 0;
@@ -443,12 +441,7 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         // 저장 및 통계 계산
         relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
 
-        double w = static_cast<double>(totalWeight);
         ++count;
-        double delta = w - mean;
-        mean += delta / count;
-        M2 += delta * (w - mean);
-        
         minWeight = std::min(minWeight, totalWeight);
         maxWeight = std::max(maxWeight, totalWeight);
     }
@@ -460,12 +453,56 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         return 0.0;
     }
 
-    double stddev = sqrt(M2 / (count - 1));
-    double threshold = max(mean + thresholdK * stddev, 0.0);
+    // Histogram 다시 누적
+    ifstream relationLogRead(subGraphFileDir + "/" + jobId + "_allRelations.txt");
+    if (!relationLogRead.is_open()) {
+        cerr << "Failed to reopen relation log." << endl;
+        return 0.0;
+    }
 
-    cout << "Mean: " << mean << ", Stddev: " << stddev
-         << ", Threshold: " << threshold << endl;
-    cout << "Max weight: " << maxWeight << ", Min weight: " << minWeight << endl;
+    uint32_t id1, id2, weight;
+    while (relationLogRead >> id1 >> id2 >> weight) {
+        size_t binIdx = static_cast<size_t>(
+            ((double)(weight - minWeight) / (maxWeight - minWeight)) * (NUM_BINS - 1)
+        );
+        histogram[binIdx]++;
+    }
+    relationLogRead.close();
+
+    // 누적합 계산
+    vector<double> cumulative(NUM_BINS, 0.0);
+    cumulative[0] = histogram[0];
+    for (size_t i = 1; i < NUM_BINS; ++i) {
+        cumulative[i] = cumulative[i - 1] + histogram[i];
+    }
+    double total = cumulative.back();
+
+    // 정규화 좌표 생성
+    vector<pair<double, double>> normPoints;
+    for (size_t i = 0; i < NUM_BINS; ++i) {
+        normPoints.emplace_back(
+            static_cast<double>(i) / (NUM_BINS - 1),
+            cumulative[i] / total
+        );
+    }
+
+    // Elbow point 찾기
+    double maxDist = -1.0;
+    size_t elbowBin = 0;
+    for (size_t i = 0; i < NUM_BINS; ++i) {
+        double x = normPoints[i].first;
+        double y = normPoints[i].second;
+        double dist = abs(y - x) / sqrt(2.0);  // y = x 대각선에서의 수직 거리
+        if (dist > maxDist) {
+            maxDist = dist;
+            elbowBin = i;
+        }
+    }
+
+    double threshold = minWeight + ((double)elbowBin / (NUM_BINS - 1)) * (maxWeight - minWeight);
+
+    cout << "Elbow threshold: " << threshold << " (bin=" << elbowBin << ")" << endl;
+    cout << "Weight range: [" << minWeight << ", " << maxWeight << "], bins: " << NUM_BINS << endl;
     cout << "Time: " << time(nullptr) - before << " sec" << endl;
 
     return threshold;

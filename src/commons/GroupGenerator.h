@@ -168,8 +168,7 @@ public:
                             const string &jobId);
     double mergeRelations(const string& subGraphFileDir,
                           size_t numOfGraph,
-                          const string& jobId,
-                          const double thresholdK);
+                          const string& jobId);
 
     void makeGroups(const string& relationFileDir,
                     const string& jobId,
