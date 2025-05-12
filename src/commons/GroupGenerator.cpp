@@ -354,7 +354,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
 double GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                       size_t numOfGraph,
                                       const string& jobId) {
-    cout << "Merging and calculating threshold..." << endl;
+    cout << "Merging and calculating geometric mean threshold..." << endl;
     time_t before = time(nullptr);
 
     const size_t BATCH_SIZE = 4096;
@@ -368,7 +368,6 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         return 0.0;
     }
 
-    // 초기 파일 열기 및 버퍼 채우기
     for (size_t i = 0; i < numOfGraph; ++i) {
         string fileName = subGraphFileDir + "/" + jobId + "_subGraph" + to_string(i);
         files[i].open(fileName, ios::binary);
@@ -405,23 +404,17 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
 
     while (true) {
         pair<uint32_t, uint32_t> minKey = {UINT32_MAX, UINT32_MAX};
-
-        // 모든 파일의 버퍼들 중 가장 작은 key 찾기
         for (size_t i = 0; i < numOfGraph; ++i) {
             if (!relationBuffers[i].empty()) {
                 const Relation& r = relationBuffers[i].front();
                 pair<uint32_t, uint32_t> key = {r.id1, r.id2};
-                if (key < minKey) {
-                    minKey = key;
-                }
+                if (key < minKey) minKey = key;
             }
         }
 
-        if (minKey.first == UINT32_MAX) break; // 모두 끝났으면 종료
+        if (minKey.first == UINT32_MAX) break;
 
-        // 같은 key를 가진 관계들 모아서 weight 합산
         uint32_t totalWeight = 0;
-
         for (size_t i = 0; i < numOfGraph; ++i) {
             while (!relationBuffers[i].empty()) {
                 const Relation& r = relationBuffers[i].front();
@@ -429,13 +422,10 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
                     totalWeight += r.weight;
                     relationBuffers[i].pop();
                     if (relationBuffers[i].empty()) readNextBatch(i);
-                } else {
-                    break;
-                }
+                } else break;
             }
         }
 
-        // 저장 및 통계 계산
         relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
 
         ++count;
@@ -450,15 +440,15 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         return 0.0;
     }
 
-    // Histogram 다시 누적
+    // === [1] LOG SCALE HISTOGRAM ===
     ifstream relationLogRead(subGraphFileDir + "/" + jobId + "_allRelations.txt");
     if (!relationLogRead.is_open()) {
         cerr << "Failed to reopen relation log." << endl;
         return 0.0;
     }
-    
+
     const size_t NUM_BINS = 200;
-    vector<size_t> histogram(NUM_BINS, 0);
+    vector<size_t> logHist(NUM_BINS, 0);
     double logMin = log(static_cast<double>(minWeight) + 1.0);
     double logMax = log(static_cast<double>(maxWeight) + 1.0);
 
@@ -468,49 +458,97 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         size_t binIdx = static_cast<size_t>(
             ((logWeight - logMin) / (logMax - logMin)) * (NUM_BINS - 1)
         );
-        histogram[binIdx]++;
+        logHist[binIdx]++;
     }
     relationLogRead.close();
 
-    // 누적합 계산
-    vector<double> cumulative(NUM_BINS, 0.0);
-    cumulative[0] = histogram[0];
+    vector<double> logCum(NUM_BINS, 0.0);
+    logCum[0] = logHist[0];
     for (size_t i = 1; i < NUM_BINS; ++i)
-        cumulative[i] = cumulative[i - 1] + histogram[i];
-    double total = cumulative.back();
+        logCum[i] = logCum[i - 1] + logHist[i];
+    double totalLog = logCum.back();
 
-    // 정규화된 좌표 생성
-    vector<pair<double, double>> normPoints;
+    vector<pair<double, double>> logPoints;
     for (size_t i = 0; i < NUM_BINS; ++i) {
-        normPoints.emplace_back(
+        logPoints.emplace_back(
             static_cast<double>(i) / (NUM_BINS - 1),
-            cumulative[i] / total
+            logCum[i] / totalLog
         );
     }
 
-    // Elbow point 찾기
-    double maxDist = -1.0;
-    size_t elbowBin = 0;
+    double maxDistLog = -1.0;
+    size_t elbowBinLog = 0;
     for (size_t i = 0; i < NUM_BINS; ++i) {
-        double x = normPoints[i].first;
-        double y = normPoints[i].second;
+        double x = logPoints[i].first;
+        double y = logPoints[i].second;
         double dist = abs(y - x) / sqrt(2.0);
-        if (dist > maxDist) {
-            maxDist = dist;
-            elbowBin = i;
+        if (dist > maxDistLog) {
+            maxDistLog = dist;
+            elbowBinLog = i;
         }
     }
 
-    // logWeight → 원래 weight scale로 복원
-    double logElbow = logMin + ((double)elbowBin / (NUM_BINS - 1)) * (logMax - logMin);
-    double threshold = exp(logElbow) - 1.0;
+    double logElbow = logMin + ((double)elbowBinLog / (NUM_BINS - 1)) * (logMax - logMin);
+    double logThr = exp(logElbow) - 1.0;
 
-    cout << "Elbow threshold (log scale): " << threshold << " (bin=" << elbowBin << ")" << endl;
-    cout << "Log weight range: [" << logMin << ", " << logMax << "], bins: " << NUM_BINS << endl;
+    // === [2] LINEAR SCALE HISTOGRAM ===
+    vector<size_t> linHist(NUM_BINS, 0);
+    relationLogRead.open(subGraphFileDir + "/" + jobId + "_allRelations.txt");
+    if (!relationLogRead.is_open()) {
+        cerr << "Failed to reopen relation log for linear histogram." << endl;
+        return 0.0;
+    }
+
+    while (relationLogRead >> id1 >> id2 >> weight) {
+        size_t binIdx = static_cast<size_t>(
+            ((double)(weight - minWeight) / (maxWeight - minWeight)) * (NUM_BINS - 1)
+        );
+        linHist[binIdx]++;
+    }
+    relationLogRead.close();
+
+    vector<double> linCum(NUM_BINS, 0.0);
+    linCum[0] = linHist[0];
+    for (size_t i = 1; i < NUM_BINS; ++i)
+        linCum[i] = linCum[i - 1] + linHist[i];
+    double totalLin = linCum.back();
+
+    vector<pair<double, double>> linPoints;
+    for (size_t i = 0; i < NUM_BINS; ++i) {
+        linPoints.emplace_back(
+            static_cast<double>(i) / (NUM_BINS - 1),
+            linCum[i] / totalLin
+        );
+    }
+
+    double maxDistLin = -1.0;
+    size_t elbowBinLin = 0;
+    for (size_t i = 0; i < NUM_BINS; ++i) {
+        double x = linPoints[i].first;
+        double y = linPoints[i].second;
+        double dist = abs(y - x) / sqrt(2.0);
+        if (dist > maxDistLin) {
+            maxDistLin = dist;
+            elbowBinLin = i;
+        }
+    }
+
+    double linearThr = minWeight + ((double)elbowBinLin / (NUM_BINS - 1)) * (maxWeight - minWeight);
+
+    // === [3] FINAL GEOMETRIC MEAN ===
+    if (logThr <= 0.0) logThr = 1e-5;
+    double finalThr = sqrt(logThr * linearThr);
+
+    // === [4] 출력 ===
+    cout << "Log scale elbow threshold:    " << logThr << " (bin=" << elbowBinLog << ")" << endl;
+    cout << "Linear scale elbow threshold: " << linearThr << " (bin=" << elbowBinLin << ")" << endl;
+    cout << "Final threshold (geometric mean): " << finalThr << endl;
+    cout << "Weight range: [" << minWeight << ", " << maxWeight << "]" << endl;
     cout << "Time: " << time(nullptr) - before << " sec" << endl;
 
-    return threshold;
+    return finalThr;
 }
+
 
 void GroupGenerator::makeGroups(const string& relationFileDir,
                                 const string& jobId,
