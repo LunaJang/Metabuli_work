@@ -410,11 +410,24 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
     auto flush = [&](uint32_t prevId1) {
         if (buffer.empty()) return;
 
-        double edge_mean = 0.0;
-        for (const auto& [id2, weight] : buffer)
-            edge_mean += weight;
-        edge_mean /= buffer.size();
-        double thr = thresholdK * edge_mean;
+        uint32_t edge_median = 0;
+
+        if (buffer.size() < 5) {
+            uint64_t sum = 0;
+            for (const auto& [id2, weight] : buffer) {
+                sum += weight;
+            }
+            edge_median = static_cast<uint32_t>(sum / buffer.size());
+        } else {
+            vector<uint32_t> weights;
+            for (const auto& [id2, weight] : buffer)
+                weights.push_back(weight);
+
+            nth_element(weights.begin(), weights.begin() + weights.size() / 2, weights.end());
+            edge_median = weights[weights.size() / 2];
+        }
+
+        uint32_t thr = thresholdK * edge_median;
 
         for (const auto& [id2, weight] : buffer) {
             if (weight >= thr) {
@@ -424,6 +437,7 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
 
         buffer.clear();
     };
+
 
     while (true) {
         pair<uint32_t, uint32_t> minKey = {UINT32_MAX, UINT32_MAX};
