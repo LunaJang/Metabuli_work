@@ -143,9 +143,9 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId, thresholdK));
+    mergeRelations(outDir, numOfGraph, jobId, thresholdK);
     
-    makeGroups(outDir, jobId, 120, groupInfo, queryGroupInfo);    
+    makeGroups(outDir, jobId, groupInfo, queryGroupInfo);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
     loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
     
@@ -276,7 +276,7 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
 
             // 수집된 query ID 간 관계 누적
             for (size_t i = 0; i < currentQueryIds.size(); ++i) {
-                for (size_t j = i; j < currentQueryIds.size(); ++j) {
+                for (size_t j = 0; j < currentQueryIds.size(); ++j) {
                     if (currentQueryIds[i] != currentQueryIds[j]){                    
                         uint32_t a = min(currentQueryIds[i], currentQueryIds[j]);
                         uint32_t b = max(currentQueryIds[i], currentQueryIds[j]);
@@ -353,7 +353,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
     }
 }
 
-double GroupGenerator::mergeRelations(const string& subGraphFileDir,
+void GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                       size_t numOfGraph,
                                       const string& jobId,
                                       const double thresholdK) {
@@ -368,10 +368,9 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
     ofstream relationLog(subGraphFileDir + "/" + jobId + "_allRelations.txt");
     if (!relationLog.is_open()) {
         cerr << "Failed to open relation log file." << endl;
-        return 0.0;
+        return ;
     }
 
-    // 초기 파일 열기 및 버퍼 채우기
     for (size_t i = 0; i < numOfGraph; ++i) {
         string fileName = subGraphFileDir + "/" + jobId + "_subGraph" + to_string(i);
         files[i].open(fileName, ios::binary);
@@ -402,31 +401,45 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         if (relationBuffers[i].empty()) fileHasData[i] = false;
     };
 
-    // 통계 변수
-    double mean = 0.0, M2 = 0.0;
-    size_t count = 0;
     uint32_t minWeight = UINT32_MAX;
     uint32_t maxWeight = 0;
+
+    uint32_t currentId1 = UINT32_MAX;
+    vector<pair<uint32_t, uint32_t>> buffer;
+
+    auto flush = [&](uint32_t prevId1) {
+        if (buffer.empty()) return;
+
+        double edge_mean = 0.0;
+        for (const auto& [id2, weight] : buffer)
+            edge_mean += weight;
+        edge_mean /= buffer.size();
+        double thr = thresholdK * edge_mean;
+
+        for (const auto& [id2, weight] : buffer) {
+            if (weight >= thr) {
+                relationLog << prevId1 << ' ' << id2 << ' ' << weight << '\n';
+            }
+        }
+
+        buffer.clear();
+    };
 
     while (true) {
         pair<uint32_t, uint32_t> minKey = {UINT32_MAX, UINT32_MAX};
 
-        // 모든 파일의 버퍼들 중 가장 작은 key 찾기
         for (size_t i = 0; i < numOfGraph; ++i) {
             if (!relationBuffers[i].empty()) {
                 const Relation& r = relationBuffers[i].front();
                 pair<uint32_t, uint32_t> key = {r.id1, r.id2};
-                if (key < minKey) {
+                if (key < minKey)
                     minKey = key;
-                }
             }
         }
 
-        if (minKey.first == UINT32_MAX) break; // 모두 끝났으면 종료
+        if (minKey.first == UINT32_MAX) break;
 
-        // 같은 key를 가진 관계들 모아서 weight 합산
         uint32_t totalWeight = 0;
-
         for (size_t i = 0; i < numOfGraph; ++i) {
             while (!relationBuffers[i].empty()) {
                 const Relation& r = relationBuffers[i].front();
@@ -434,46 +447,33 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
                     totalWeight += r.weight;
                     relationBuffers[i].pop();
                     if (relationBuffers[i].empty()) readNextBatch(i);
-                } else {
-                    break;
-                }
+                } else break;
             }
         }
 
-        // 저장 및 통계 계산
-        relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
+        if (currentId1 != minKey.first) {
+            flush(currentId1);
+            currentId1 = minKey.first;
+        }
 
-        double w = static_cast<double>(totalWeight);
-        ++count;
-        double delta = w - mean;
-        mean += delta / count;
-        M2 += delta * (w - mean);
-        
+        buffer.emplace_back(minKey.second, totalWeight);
+
         minWeight = std::min(minWeight, totalWeight);
         maxWeight = std::max(maxWeight, totalWeight);
     }
 
+    flush(currentId1);
     relationLog.close();
 
-    if (count < 2) {
-        cerr << "Not enough data to compute threshold." << endl;
-        return 0.0;
-    }
 
-    double stddev = sqrt(M2 / (count - 1));
-    double threshold = max(mean + thresholdK * stddev, 0.0);
-
-    cout << "Mean: " << mean << ", Stddev: " << stddev
-         << ", Threshold: " << threshold << endl;
     cout << "Max weight: " << maxWeight << ", Min weight: " << minWeight << endl;
     cout << "Time: " << time(nullptr) - before << " sec" << endl;
 
-    return threshold;
 }
+
 
 void GroupGenerator::makeGroups(const string& relationFileDir,
                                 const string& jobId,
-                                int groupKmerThr,
                                 unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                                 vector<int> &queryGroupInfo) {
     cout << "Creating groups from relation file..." << endl;
@@ -489,11 +489,9 @@ void GroupGenerator::makeGroups(const string& relationFileDir,
 
     uint32_t id1, id2, weight;
     while (file >> id1 >> id2 >> weight) {
-        if (static_cast<int>(weight) > groupKmerThr) {
-            if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
-            if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
-            ds.unionSets(id1, id2);
-        }
+        if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
+        if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
+        ds.unionSets(id1, id2);
     }
 
     for (const auto& [queryId, _] : ds.parent) {
