@@ -166,15 +166,17 @@ public:
                             const string &subGraphFileDir, 
                             const size_t counter_now,
                             const string &jobId);
-    void mergeRelations(const string& subGraphFileDir,
-                          size_t numOfGraph,
-                          const string& jobId,
-                          const double thresholdK);
 
-    void makeGroups(const string& relationFileDir,
-                    const string& jobId,
-                    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                    vector<int> &queryGroupInfo);
+    void mergeRelations(const string& subGraphFileDir,
+                        size_t numOfGraph,
+                        const string& jobId,
+                        unordered_map<uint32_t, pair<double, int>>& nodeStat,
+                        unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap);
+
+    void makeGroups(const unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap,
+                    const unordered_map<uint32_t, pair<double, int>>& nodeStat,
+                    unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
+                    vector<int>& queryGroupInfo);
 
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                           const vector<int> &queryGroupInfo, 

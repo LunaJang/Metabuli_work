@@ -71,7 +71,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     cout << "voteMode: " << voteMode << endl;
     cout << "majorityThr: " << majorityThr << endl;
     cout << "groupScoreThr: " << groupScoreThr << endl;
-    cout << "thresholdK: " << thresholdK << endl;
+    // cout << "thresholdK: " << thresholdK << endl;
     
     //Extract k-mers from query sequences and compare them to target k-mer DB
     // while (!complete) {
@@ -140,12 +140,15 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     // makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
     numOfGraph = 32;
 
+    unordered_map<uint32_t, pair<double, int>> nodeStat;
+    unordered_map<Relation, uint32_t, relation_hash> edgeWeightMap;
+
+    mergeRelations(outDir, numOfGraph, jobId, nodeStat, edgeWeightMap);
+    
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    mergeRelations(outDir, numOfGraph, jobId, thresholdK);
-    
-    makeGroups(outDir, jobId, groupInfo, queryGroupInfo);    
+    makeGroups(edgeWeightMap, nodeStat, groupInfo, queryGroupInfo);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
     loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
     
@@ -354,22 +357,17 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
 }
 
 void GroupGenerator::mergeRelations(const string& subGraphFileDir,
-                                      size_t numOfGraph,
-                                      const string& jobId,
-                                      const double thresholdK) {
-    cout << "Merging and calculating threshold..." << endl;
+                                    size_t numOfGraph,
+                                    const string& jobId,
+                                    unordered_map<uint32_t, pair<double, int>>& nodeStat,
+                                    unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap) {
+    cout << "Merging and collecting edge statistics..." << endl;
     time_t before = time(nullptr);
 
     const size_t BATCH_SIZE = 4096;
     vector<ifstream> files(numOfGraph);
     vector<queue<Relation>> relationBuffers(numOfGraph);
     vector<bool> fileHasData(numOfGraph, true);
-
-    ofstream relationLog(subGraphFileDir + "/" + jobId + "_allRelations.txt");
-    if (!relationLog.is_open()) {
-        cerr << "Failed to open relation log file." << endl;
-        return ;
-    }
 
     for (size_t i = 0; i < numOfGraph; ++i) {
         string fileName = subGraphFileDir + "/" + jobId + "_subGraph" + to_string(i);
@@ -401,63 +399,46 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
         if (relationBuffers[i].empty()) fileHasData[i] = false;
     };
 
-    uint32_t minWeight = UINT32_MAX;
-    uint32_t maxWeight = 0;
+    Relation currentKey = {UINT32_MAX, UINT32_MAX, 0};
+    uint32_t totalWeight = 0;
 
-    uint32_t currentId1 = UINT32_MAX;
-    vector<pair<uint32_t, uint32_t>> buffer;
+    auto flush = [&]() {
+        if (currentKey.id1 == UINT32_MAX) return;
 
-    auto flush = [&](uint32_t prevId1) {
-        if (buffer.empty()) return;
+        // 누적 weight 저장
+        Relation key = currentKey;
+        key.weight = 0; // 무시
+        edgeWeightMap[key] = totalWeight;
 
-        uint32_t edge_median = 0;
+        // node 통계 누적
+        nodeStat[key.id1].first += totalWeight;
+        nodeStat[key.id1].second += 1;
+        nodeStat[key.id2].first += totalWeight;
+        nodeStat[key.id2].second += 1;
 
-        if (buffer.size() < 5) {
-            uint64_t sum = 0;
-            for (const auto& [id2, weight] : buffer) {
-                sum += weight;
-            }
-            edge_median = static_cast<uint32_t>(sum / buffer.size());
-        } else {
-            vector<uint32_t> weights;
-            for (const auto& [id2, weight] : buffer)
-                weights.push_back(weight);
-
-            nth_element(weights.begin(), weights.begin() + weights.size() / 2, weights.end());
-            edge_median = weights[weights.size() / 2];
-        }
-
-        uint32_t thr = thresholdK * edge_median;
-
-        for (const auto& [id2, weight] : buffer) {
-            if (weight >= thr) {
-                relationLog << prevId1 << ' ' << id2 << ' ' << weight << '\n';
-            }
-        }
-
-        buffer.clear();
+        // 초기화
+        totalWeight = 0;
     };
 
-
     while (true) {
-        pair<uint32_t, uint32_t> minKey = {UINT32_MAX, UINT32_MAX};
+        Relation minRel = {UINT32_MAX, UINT32_MAX, 0};
 
         for (size_t i = 0; i < numOfGraph; ++i) {
             if (!relationBuffers[i].empty()) {
                 const Relation& r = relationBuffers[i].front();
-                pair<uint32_t, uint32_t> key = {r.id1, r.id2};
-                if (key < minKey)
-                    minKey = key;
+                if (r.id1 < minRel.id1 || (r.id1 == minRel.id1 && r.id2 < minRel.id2)) {
+                    minRel = r;
+                }
             }
         }
 
-        if (minKey.first == UINT32_MAX) break;
+        if (minRel.id1 == UINT32_MAX) break;
 
-        uint32_t totalWeight = 0;
+        // 합산
         for (size_t i = 0; i < numOfGraph; ++i) {
             while (!relationBuffers[i].empty()) {
                 const Relation& r = relationBuffers[i].front();
-                if (r.id1 == minKey.first && r.id2 == minKey.second) {
+                if (r.id1 == minRel.id1 && r.id2 == minRel.id2) {
                     totalWeight += r.weight;
                     relationBuffers[i].pop();
                     if (relationBuffers[i].empty()) readNextBatch(i);
@@ -465,47 +446,69 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
             }
         }
 
-        if (currentId1 != minKey.first) {
-            flush(currentId1);
-            currentId1 = minKey.first;
+        if (currentKey.id1 != minRel.id1 || currentKey.id2 != minRel.id2) {
+            flush();
+            currentKey = minRel;
         }
-
-        buffer.emplace_back(minKey.second, totalWeight);
-
-        minWeight = std::min(minWeight, totalWeight);
-        maxWeight = std::max(maxWeight, totalWeight);
     }
 
-    flush(currentId1);
-    relationLog.close();
+    flush(); // 마지막 edge 처리
 
-
-    cout << "Max weight: " << maxWeight << ", Min weight: " << minWeight << endl;
+    cout << "Merging completed." << endl;
+    cout << "Collected " << edgeWeightMap.size() << " edges." << endl;
     cout << "Time: " << time(nullptr) - before << " sec" << endl;
-
 }
 
 
-void GroupGenerator::makeGroups(const string& relationFileDir,
-                                const string& jobId,
-                                unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                vector<int> &queryGroupInfo) {
-    cout << "Creating groups from relation file..." << endl;
-    time_t beforeSearch = time(nullptr);
 
-    ifstream file(relationFileDir + "/" + jobId + "_allRelations.txt");
-    if (!file.is_open()) {
-        cerr << "Failed to open relation file: " << relationFileDir << endl;
-        return;
-    }
+void GroupGenerator::makeGroups(const unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap,
+                                const unordered_map<uint32_t, pair<double, int>>& nodeStat,
+                                unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
+                                vector<int>& queryGroupInfo) {
+                                
+    cout << "Creating groups using gamma-based filtering..." << endl;
+    time_t beforeSearch = time(nullptr);
 
     DisjointSet ds;
 
-    uint32_t id1, id2, weight;
-    while (file >> id1 >> id2 >> weight) {
-        if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
-        if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
-        ds.unionSets(id1, id2);
+    const double bestThreshold = 57.0;
+
+    double totalWeight = 0.0;
+    size_t totalEdges = 0;
+    for (const auto& [rel, weight] : edgeWeightMap) {
+        totalWeight += static_cast<double>(weight);
+        ++totalEdges;
+    }
+
+    if (totalEdges == 0) {
+        cerr << "No edges to process for grouping." << endl;
+        return;
+    }
+
+    double globalMeanWeight = totalWeight / totalEdges;
+    double gamma = bestThreshold / globalMeanWeight;
+
+    cout << "Used threshold = " << bestThreshold
+         << ", Global mean weight = " << globalMeanWeight
+         << ", Gamma = " << gamma << endl;
+
+    for (const auto& [rel, weight] : edgeWeightMap) {
+        uint32_t id1 = rel.id1;
+        uint32_t id2 = rel.id2;
+
+        auto it1 = nodeStat.find(id1);
+        auto it2 = nodeStat.find(id2);
+        if (it1 == nodeStat.end() || it2 == nodeStat.end()) continue;
+
+        double mean1 = it1->second.first / max(1, it1->second.second);
+        double mean2 = it2->second.first / max(1, it2->second.second);
+        double threshold = gamma * std::min(mean1, mean2);
+
+        if (static_cast<double>(weight) >= threshold) {
+            if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
+            if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
+            ds.unionSets(id1, id2);
+        }
     }
 
     for (const auto& [queryId, _] : ds.parent) {
@@ -520,6 +523,7 @@ void GroupGenerator::makeGroups(const string& relationFileDir,
     cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
+
 
 
 
