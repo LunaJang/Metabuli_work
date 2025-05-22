@@ -176,7 +176,8 @@ public:
     void makeGroups(const unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap,
                     const unordered_map<uint32_t, double>& nodeMedian,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
-                    vector<int>& queryGroupInfo);
+                    vector<int>& queryGroupInfo,
+                    double thresholdK);
 
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                           const vector<int> &queryGroupInfo, 

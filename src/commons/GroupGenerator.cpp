@@ -71,7 +71,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     cout << "voteMode: " << voteMode << endl;
     cout << "majorityThr: " << majorityThr << endl;
     cout << "groupScoreThr: " << groupScoreThr << endl;
-    // cout << "thresholdK: " << thresholdK << endl;
+    cout << "thresholdK: " << thresholdK << endl;
     
     //Extract k-mers from query sequences and compare them to target k-mer DB
     // while (!complete) {
@@ -147,7 +147,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    makeGroups(edgeWeightMap, nodeMedian, groupInfo, queryGroupInfo);    
+    makeGroups(edgeWeightMap, nodeMedian, groupInfo, queryGroupInfo, thresholdK);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
     loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
     
@@ -471,14 +471,15 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
 void GroupGenerator::makeGroups(const unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap,
                                 const unordered_map<uint32_t, double>& nodeMedian,
                                 unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
-                                vector<int>& queryGroupInfo) {
+                                vector<int>& queryGroupInfo,
+                                double thresholdK) {
                                 
     cout << "Creating groups using gamma-based filtering (median version)..." << endl;
     time_t beforeSearch = time(nullptr);
 
     DisjointSet ds;
 
-    const double bestThreshold = 57.0;
+    const double bestThreshold = thresholdK;
 
     double totalWeight = 0.0;
     size_t totalEdges = 0;
