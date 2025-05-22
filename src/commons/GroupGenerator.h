@@ -170,11 +170,11 @@ public:
     void mergeRelations(const string& subGraphFileDir,
                         size_t numOfGraph,
                         const string& jobId,
-                        unordered_map<uint32_t, pair<double, int>>& nodeStat,
-                        unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap);
+                        unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap,
+                        unordered_map<uint32_t, double>& nodeMedian);
 
     void makeGroups(const unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap,
-                    const unordered_map<uint32_t, pair<double, int>>& nodeStat,
+                    const unordered_map<uint32_t, double>& nodeMedian,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                     vector<int>& queryGroupInfo);
 
