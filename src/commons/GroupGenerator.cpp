@@ -140,14 +140,15 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     // makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
     numOfGraph = 32;
 
-    unordered_map<uint32_t, double> nodeMedian;
     unordered_map<Relation, uint32_t, relation_hash> edgeWeightMap;
-    mergeRelations(outDir, numOfGraph, jobId, edgeWeightMap, nodeMedian);
+    unordered_map<uint32_t, pair<double, int>> nodeStat;
+    unordered_map<uint32_t, int> nodeDegree;
+    mergeRelations(outDir, numOfGraph, jobId, edgeWeightMap, nodeStat, nodeDegree);
     
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    makeGroups(edgeWeightMap, nodeMedian, groupInfo, queryGroupInfo, thresholdK);    
+    makeGroups(edgeWeightMap, nodeStat, nodeDegree, groupInfo, queryGroupInfo, thresholdK);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
     loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
     
@@ -359,7 +360,8 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                     size_t numOfGraph,
                                     const string& jobId,
                                     unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap,
-                                    unordered_map<uint32_t, double>& nodeMedian) {
+                                    unordered_map<uint32_t, pair<double, int>>& nodeStat,
+                                    unordered_map<uint32_t, int>& nodeDegree) {
     cout << "Merging and collecting edge statistics..." << endl;
     time_t before = time(nullptr);
 
@@ -367,8 +369,6 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
     vector<ifstream> files(numOfGraph);
     vector<queue<Relation>> relationBuffers(numOfGraph);
     vector<bool> fileHasData(numOfGraph, true);
-
-    unordered_map<uint32_t, vector<uint32_t>> nodeEdges;
 
     for (size_t i = 0; i < numOfGraph; ++i) {
         string fileName = subGraphFileDir + "/" + jobId + "_subGraph" + to_string(i);
@@ -410,8 +410,13 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
         key.weight = 0;
         edgeWeightMap[key] = totalWeight;
 
-        nodeEdges[key.id1].push_back(totalWeight);
-        nodeEdges[key.id2].push_back(totalWeight);
+        nodeStat[key.id1].first += totalWeight;
+        nodeStat[key.id1].second++;
+        nodeStat[key.id2].first += totalWeight;
+        nodeStat[key.id2].second++;
+
+        nodeDegree[key.id1]++;
+        nodeDegree[key.id2]++;
 
         totalWeight = 0;
     };
@@ -449,18 +454,6 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
 
     flush();
 
-    // ✅ 여기서 median 계산
-    for (auto& [node, weights] : nodeEdges) {
-        size_t n = weights.size();
-        std::nth_element(weights.begin(), weights.begin() + n / 2, weights.end());
-        double median = static_cast<double>(weights[n / 2]);
-        if (n % 2 == 0) {
-            std::nth_element(weights.begin(), weights.begin() + n / 2 - 1, weights.end());
-            median = (median + weights[n / 2 - 1]) / 2.0;
-        }
-        nodeMedian[node] = median;
-    }
-
     cout << "Merging completed." << endl;
     cout << "Collected " << edgeWeightMap.size() << " edges." << endl;
     cout << "Time: " << time(nullptr) - before << " sec" << endl;
@@ -469,17 +462,16 @@ void GroupGenerator::mergeRelations(const string& subGraphFileDir,
 
 
 void GroupGenerator::makeGroups(const unordered_map<Relation, uint32_t, relation_hash>& edgeWeightMap,
-                                const unordered_map<uint32_t, double>& nodeMedian,
+                                const unordered_map<uint32_t, pair<double, int>>& nodeStat,
+                                const unordered_map<uint32_t, int>& nodeDegree,
                                 unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                                 vector<int>& queryGroupInfo,
                                 double thresholdK) {
-                                
-    cout << "Creating groups using gamma-based filtering (median version)..." << endl;
+
+    cout << "Creating groups using mean + degree-based filtering..." << endl;
     time_t beforeSearch = time(nullptr);
 
     DisjointSet ds;
-
-    const double bestThreshold = thresholdK;
 
     double totalWeight = 0.0;
     size_t totalEdges = 0;
@@ -494,25 +486,25 @@ void GroupGenerator::makeGroups(const unordered_map<Relation, uint32_t, relation
     }
 
     double globalMeanWeight = totalWeight / totalEdges;
-    double gamma = bestThreshold / globalMeanWeight;
+    double gamma = thresholdK / globalMeanWeight;
 
-    cout << "Used threshold = " << bestThreshold
+    cout << "Used thresholdK = " << thresholdK
          << ", Global mean weight = " << globalMeanWeight
-         << ", Gamma = " << gamma << endl;
+         << ", Gamma (mean filter) = " << gamma << endl;
 
     for (const auto& [rel, weight] : edgeWeightMap) {
         uint32_t id1 = rel.id1;
         uint32_t id2 = rel.id2;
 
-        auto it1 = nodeMedian.find(id1);
-        auto it2 = nodeMedian.find(id2);
-        if (it1 == nodeMedian.end() || it2 == nodeMedian.end()) continue;
+        auto it1 = nodeStat.find(id1);
+        auto it2 = nodeStat.find(id2);
+        if (it1 == nodeStat.end() || it2 == nodeStat.end()) continue;
 
-        double median1 = it1->second;
-        double median2 = it2->second;
-        double threshold = gamma * std::min(median1, median2);
+        int deg1 = nodeDegree.count(id1) ? nodeDegree.at(id1) : 1;
+        int deg2 = nodeDegree.count(id2) ? nodeDegree.at(id2) : 1;
+        double degSim = std::min(deg1, deg2) / (double)std::max(deg1, deg2);
 
-        if (static_cast<double>(weight) >= threshold) {
+        if (degSim * weight >= 40) {
             if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
             if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
             ds.unionSets(id1, id2);
