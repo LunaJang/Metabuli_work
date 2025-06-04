@@ -170,13 +170,13 @@ public:
                           size_t numOfGraph,
                           const string& jobId,
                           const vector<pair<int, float>>& metabuliResult,
-                          const double thresholdK);
+                          unordered_map<uint32_t, uint32_t>& nodeMax);
 
     void makeGroups(const string& relationFileDir,
                     const string& jobId,
-                    int groupKmerThr,
                     unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                    vector<int> &queryGroupInfo);
+                    vector<int> &queryGroupInfo,
+                    unordered_map<uint32_t, uint32_t>& nodeMax);
 
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                           const vector<int> &queryGroupInfo, 

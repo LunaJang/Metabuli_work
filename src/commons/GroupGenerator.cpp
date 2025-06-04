@@ -73,72 +73,68 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     cout << "groupScoreThr: " << groupScoreThr << endl;
     cout << "thresholdK: " << thresholdK << endl;
     
-    //Extract k-mers from query sequences and compare them to target k-mer DB
-    // while (!complete) {
-    //     tries++;
+    while (!complete) {
+        tries++;
 
-    //     // new code
-    //     if (tries == 1) {
-    //             cout << "Indexing query file ...";
-    //     }
-    //     queryIndexer->setBytesPerKmer(matchPerKmer);
-    //     queryIndexer->indexQueryFile(processedReadCnt);
-    //     const vector<QuerySplit> & queryReadSplit = queryIndexer->getQuerySplits();
+        // new code
+        if (tries == 1) {
+                cout << "Indexing query file ...";
+        }
+        queryIndexer->setBytesPerKmer(matchPerKmer);
+        queryIndexer->indexQueryFile(processedReadCnt);
+        const vector<QuerySplit> & queryReadSplit = queryIndexer->getQuerySplits();
 
-    //     if (tries == 1) {
-    //         totalSeqCnt = queryIndexer->getReadNum_1();
-    //         cout << "Done" << endl;
-    //         cout << "Total number of sequences: " << queryIndexer->getReadNum_1() << endl;
-    //         cout << "Total read length: " << queryIndexer->getTotalReadLength() <<  "nt" << endl;
-    //     }
+        if (tries == 1) {
+            totalSeqCnt = queryIndexer->getReadNum_1();
+            cout << "Done" << endl;
+            cout << "Total number of sequences: " << queryIndexer->getReadNum_1() << endl;
+            cout << "Total read length: " << queryIndexer->getTotalReadLength() <<  "nt" << endl;
+        }
 
-    //     // Set up kseq
-    //     KSeqWrapper* kseq1 = KSeqFactory(par.filenames[0].c_str());
-    //     KSeqWrapper* kseq2 = nullptr;
-    //     if (par.seqMode == 2) { kseq2 = KSeqFactory(par.filenames[1].c_str()); }
+        // Set up kseq
+        KSeqWrapper* kseq1 = KSeqFactory(par.filenames[0].c_str());
+        KSeqWrapper* kseq2 = nullptr;
+        if (par.seqMode == 2) { kseq2 = KSeqFactory(par.filenames[1].c_str()); }
 
-    //     // Move kseq to unprocessed reads
-    //     for (size_t i = 0; i < processedReadCnt; i++) {
-    //         kseq1->ReadEntry();
-    //         if (par.seqMode == 2) { kseq2->ReadEntry(); }
-    //     }
+        // Move kseq to unprocessed reads
+        for (size_t i = 0; i < processedReadCnt; i++) {
+            kseq1->ReadEntry();
+            if (par.seqMode == 2) { kseq2->ReadEntry(); }
+        }
 
-    //     for (size_t splitIdx = 0; splitIdx < queryReadSplit.size(); splitIdx++) {
-    //         // Allocate memory for query list
-    //         queryList.clear();
-    //         queryList.resize(queryReadSplit[splitIdx].end - queryReadSplit[splitIdx].start);
+        for (size_t splitIdx = 0; splitIdx < queryReadSplit.size(); splitIdx++) {
+            // Allocate memory for query list
+            queryList.clear();
+            queryList.resize(queryReadSplit[splitIdx].end - queryReadSplit[splitIdx].start);
 
-    //         // Allocate memory for query k-mer buffer
-    //         queryKmerBuffer.reallocateMemory(queryReadSplit[splitIdx].kmerCnt);
+            // Allocate memory for query k-mer buffer
+            queryKmerBuffer.reallocateMemory(queryReadSplit[splitIdx].kmerCnt);
 
-    //         // Initialize query k-mer buffer and match buffer
-    //         queryKmerBuffer.startIndexOfReserve = 0;
+            // Initialize query k-mer buffer and match buffer
+            queryKmerBuffer.startIndexOfReserve = 0;
 
-    //         // Extract query k-mers
-    //         kmerExtractor->extractQueryKmers(queryKmerBuffer,
-    //                                          queryList,
-    //                                          queryReadSplit[splitIdx],
-    //                                          par,
-    //                                          kseq1,
-    //                                          kseq2); 
-    //         kmerFileHandler->writeQueryKmerFile(queryKmerBuffer, outDir, numOfSplits, numOfThreads, processedReadCnt, jobId);
-    //         processedReadCnt += queryReadSplit[splitIdx].readCnt;
-    //         cout << "The number of processed sequences: " << processedReadCnt << " (" << (double) processedReadCnt / (double) totalSeqCnt << ")" << endl;
+            // Extract query k-mers
+            kmerExtractor->extractQueryKmers(queryKmerBuffer,
+                                             queryList,
+                                             queryReadSplit[splitIdx],
+                                             par,
+                                             kseq1,
+                                             kseq2); 
+            kmerFileHandler->writeQueryKmerFile(queryKmerBuffer, outDir, numOfSplits, numOfThreads, processedReadCnt, jobId);
+            processedReadCnt += queryReadSplit[splitIdx].readCnt;
+            cout << "The number of processed sequences: " << processedReadCnt << " (" << (double) processedReadCnt / (double) totalSeqCnt << ")" << endl;
 
-    //         numOfTatalQueryKmerCnt += queryKmerBuffer.startIndexOfReserve;
-    //     }
-    //     delete kseq1;
-    //     if (par.seqMode == 2) {
-    //         delete kseq2;
-    //     }
-    //     if (processedReadCnt == totalSeqCnt) {
-    //         complete = true;
-    //     }
-    // }   
-    processedReadCnt = 12048859;
-    numOfSplits = 6;
-    // makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
-    numOfGraph = 32;
+            numOfTatalQueryKmerCnt += queryKmerBuffer.startIndexOfReserve;
+        }
+        delete kseq1;
+        if (par.seqMode == 2) {
+            delete kseq2;
+        }
+        if (processedReadCnt == totalSeqCnt) {
+            complete = true;
+        }
+    }   
+    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
 
     vector<pair<int, float>> metabuliResult;       
     metabuliResult.resize(processedReadCnt, make_pair(-1, 0.0f));
@@ -147,12 +143,12 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId, metabuliResult, thresholdK));
+    unordered_map<uint32_t, uint32_t> nodeMax;
+    int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId, metabuliResult, nodeMax));
     
-    makeGroups(outDir, jobId, 120, groupInfo, queryGroupInfo);    
+    makeGroups(outDir, jobId, groupInfo, queryGroupInfo, nodeMax);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
-    loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
-    
+    loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);    
 
     unordered_map<uint32_t, int> repLabel; 
     getRepLabel(outDir, metabuliResult, groupInfo, repLabel, jobId, voteMode, majorityThr, groupScoreThr);
@@ -358,7 +354,7 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                       size_t numOfGraph,
                                       const string& jobId,
                                       const vector<pair<int, float>>& metabuliResult,
-                                      double thresholdK) {
+                                      unordered_map<uint32_t, uint32_t>& nodeMax) {
     cout << "Merging and calculating threshold via elbow..." << endl;
     time_t before = time(nullptr);
 
@@ -404,11 +400,6 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         if (relationBuffers[i].empty()) fileHasData[i] = false;
     };
 
-    // weight 저장
-    std::unordered_map<int, int> external2internalTaxId;
-    taxonomy->getExternal2internalTaxID(external2internalTaxId);
-    vector<double> trueWeights, falseWeights;
-
     while (true) {
         pair<uint32_t, uint32_t> minKey = {UINT32_MAX, UINT32_MAX};
 
@@ -435,75 +426,25 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
             }
         }
 
-        // metabuli 결과 기반 taxonomy 비교
-        int label1 = external2internalTaxId[metabuliResult[minKey.first].first];
-        int label2 = external2internalTaxId[metabuliResult[minKey.second].first];
-        
-        if (taxonomy->getTaxIdAtRank(label1, "genus") == taxonomy->getTaxIdAtRank(label2, "genus"))
-        //if (taxonomy->getTaxIdAtRank(metabuliResult[minKey.first].first, "genus") == taxonomy->getTaxIdAtRank(metabuliResult[minKey.second].first, "genus"))
-            trueWeights.push_back(totalWeight);
-        else
-            falseWeights.push_back(totalWeight);
+        nodeMax[minKey.first] = std::max(nodeMax[minKey.first], totalWeight);
+        nodeMax[minKey.second] = std::max(nodeMax[minKey.second], totalWeight);
 
         relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
     }
 
     relationLog.close();
 
-    if (trueWeights.size() < 10 || falseWeights.size() < 10) {
-        cerr << "Insufficient true/false edges for elbow detection." << endl;
-        return 0.0;
-    }
-
-    // Elbow 계산 함수
-    auto findElbow = [](const vector<double>& data) -> double {
-        vector<double> sorted = data;
-        std::sort(sorted.begin(), sorted.end());
-
-        size_t N = sorted.size();
-        vector<double> x(N), y(N);
-        for (size_t i = 0; i < N; ++i) {
-            x[i] = sorted[i];
-            y[i] = static_cast<double>(i) / (N - 1);
-        }
-
-        double x0 = x.front(), y0 = y.front();
-        double x1 = x.back(), y1 = y.back();
-        double dx = x1 - x0, dy = y1 - y0;
-        double maxDist = -1.0;
-        size_t elbowIdx = 0;
-
-        for (size_t i = 0; i < N; ++i) {
-            double px = x[i], py = y[i];
-            double u = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy);
-            double projx = x0 + u * dx, projy = y0 + u * dy;
-            double dist = sqrt((projx - px)*(projx - px) + (projy - py)*(projy - py));
-            if (dist > maxDist) {
-                maxDist = dist;
-                elbowIdx = i;
-            }
-        }
-        return x[elbowIdx];
-    };
-
-    double elbowFalse = findElbow(falseWeights);
-    double elbowTrue = findElbow(trueWeights);
-    double threshold = elbowFalse * (1.0 - thresholdK) + elbowTrue * thresholdK;
-
-    cout << "[Elbow-based thresholding]" << endl;
-    cout << "False elbow: " << elbowFalse << ", True elbow: " << elbowTrue << endl;
-    cout << "Threshold (K=" << thresholdK << "): " << threshold << endl;
     cout << "Time: " << time(nullptr) - before << " sec" << endl;
 
-    return threshold;
+    return 0;
 }
 
 
 void GroupGenerator::makeGroups(const string& relationFileDir,
                                 const string& jobId,
-                                int groupKmerThr,
                                 unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                vector<int> &queryGroupInfo) {
+                                vector<int> &queryGroupInfo,
+                                unordered_map<uint32_t, uint32_t>& nodeMax) {
     cout << "Creating groups from relation file..." << endl;
     time_t beforeSearch = time(nullptr);
 
@@ -517,7 +458,7 @@ void GroupGenerator::makeGroups(const string& relationFileDir,
 
     uint32_t id1, id2, weight;
     while (file >> id1 >> id2 >> weight) {
-        if (static_cast<int>(weight) > groupKmerThr) {
+        if (static_cast<int>(weight)*10 > std::max(nodeMax[id1], nodeMax[id2])) {
             if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
             if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
             ds.unionSets(id1, id2);
@@ -625,6 +566,8 @@ void GroupGenerator::loadGroupsFromFile(unordered_map<uint32_t, unordered_set<ui
 
 void GroupGenerator::loadMetabuliResult(const string &resultFileDir, 
                                         vector<pair<int, float>> &metabuliResult) {
+    cout << "Start to read original Metabuli result loaded from " << resultFileDir + "/1_classifications.tsv" << endl;
+
     ifstream inFile(resultFileDir + "/1_classifications.tsv");
     if (!inFile.is_open()) {
         cerr << "Error opening file: " << resultFileDir + "/1_classifications.tsv" << endl;
