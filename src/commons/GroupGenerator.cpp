@@ -67,11 +67,9 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     size_t voteMode = par.voteMode;
     float majorityThr = par.majorityThr;
     float groupScoreThr = par.groupScoreThr;
-    double thresholdK = par.thresholdK;
     cout << "voteMode: " << voteMode << endl;
     cout << "majorityThr: " << majorityThr << endl;
     cout << "groupScoreThr: " << groupScoreThr << endl;
-    cout << "thresholdK: " << thresholdK << endl;
     
     while (!complete) {
         tries++;
@@ -355,7 +353,7 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                       const string& jobId,
                                       const vector<pair<int, float>>& metabuliResult,
                                       unordered_map<uint32_t, uint32_t>& nodeMax) {
-    cout << "Merging and calculating threshold via elbow..." << endl;
+    cout << "Merging and pruning graph..." << endl;
     time_t before = time(nullptr);
 
     const size_t BATCH_SIZE = 4096;
