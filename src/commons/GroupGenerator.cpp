@@ -456,7 +456,7 @@ void GroupGenerator::makeGroups(const string& relationFileDir,
 
     uint32_t id1, id2, weight;
     while (file >> id1 >> id2 >> weight) {
-        if (static_cast<int>(weight)*10 > std::max(nodeMax[id1], nodeMax[id2])) {
+        if (static_cast<int>(weight)*10 > std::min(nodeMax[id1], nodeMax[id2])) {
             if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
             if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
             ds.unionSets(id1, id2);
