@@ -141,10 +141,10 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    unordered_map<uint32_t, uint32_t> nodeMax;
-    int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId, metabuliResult, nodeMax));
+    unordered_map<uint32_t, uint32_t> nodeMean;
+    int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId, metabuliResult, nodeMean));
     
-    makeGroups(outDir, jobId, groupInfo, queryGroupInfo, nodeMax);    
+    makeGroups(outDir, jobId, groupInfo, queryGroupInfo, nodeMean);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
     loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);    
 
@@ -352,7 +352,7 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
                                       size_t numOfGraph,
                                       const string& jobId,
                                       const vector<pair<int, float>>& metabuliResult,
-                                      unordered_map<uint32_t, uint32_t>& nodeMax) {
+                                      unordered_map<uint32_t, uint32_t>& nodeMean) {
     cout << "Merging and pruning graph..." << endl;
     time_t before = time(nullptr);
 
@@ -398,6 +398,9 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         if (relationBuffers[i].empty()) fileHasData[i] = false;
     };
 
+    std::unordered_map<uint32_t, uint64_t> nodeSumWeight;
+    std::unordered_map<uint32_t, uint32_t> nodeEdgeCount;
+
     while (true) {
         pair<uint32_t, uint32_t> minKey = {UINT32_MAX, UINT32_MAX};
 
@@ -424,10 +427,18 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
             }
         }
 
-        nodeMax[minKey.first] = std::max(nodeMax[minKey.first], totalWeight);
-        nodeMax[minKey.second] = std::max(nodeMax[minKey.second], totalWeight);
+        // 누적 합 및 개수 저장
+        nodeSumWeight[minKey.first] += totalWeight;
+        nodeSumWeight[minKey.second] += totalWeight;
+        nodeEdgeCount[minKey.first]++;
+        nodeEdgeCount[minKey.second]++;
 
         relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
+    }
+
+    // 평균 계산
+    for (const auto& [node, sum] : nodeSumWeight) {
+        nodeMean[node] = static_cast<uint32_t>(sum / nodeEdgeCount[node]); 
     }
 
     relationLog.close();
@@ -442,7 +453,7 @@ void GroupGenerator::makeGroups(const string& relationFileDir,
                                 const string& jobId,
                                 unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                                 vector<int> &queryGroupInfo,
-                                unordered_map<uint32_t, uint32_t>& nodeMax) {
+                                unordered_map<uint32_t, uint32_t>& nodeMean) {
     cout << "Creating groups from relation file..." << endl;
     time_t beforeSearch = time(nullptr);
 
@@ -456,7 +467,7 @@ void GroupGenerator::makeGroups(const string& relationFileDir,
 
     uint32_t id1, id2, weight;
     while (file >> id1 >> id2 >> weight) {
-        if (static_cast<int>(weight)*10 > std::min(nodeMax[id1], nodeMax[id2])) {
+        if (static_cast<int>(weight)*10 > std::min(nodeMean[id1], nodeMean[id2])) {
             if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
             if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
             ds.unionSets(id1, id2);
