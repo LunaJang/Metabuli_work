@@ -138,7 +138,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
 
     vector<pair<int, float>> metabuliResult;       
-    metabuliResult.resize(processedReadCnt, make_pair(-1, 0.0f));
+    //metabuliResult.resize(processedReadCnt, make_pair(-1, 0.0f));
     loadMetabuliResult(outDir, metabuliResult);
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
@@ -636,7 +636,8 @@ void GroupGenerator::loadMetabuliResult(const string &resultFileDir,
         float score;
         string query_name; // query_name is not used.
         ss >> label >> query_name >> query_label >> read_length >> score;
-        metabuliResult[id] = {query_label, score}; 
+        //metabuliResult[id] = {query_label, score}; 
+        metabuliResult.push_back({query_label, score}); 
         id ++;
     }
 

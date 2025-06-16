@@ -344,7 +344,8 @@ void SeqIterator::fillQueryKmerBuffer(
             if (checkN == 1) {
                 kmerBuffer.buffer[posToWrite] = {UINT64_MAX, 0, 0, frame};
             } else {
-                //addDNAInfo_QueryKmer(tempKmer, seq, forOrRev, kmerCnt, frame, seqLen);
+                tempKmer = 0;
+                addDNAInfo_QueryKmer(tempKmer, seq, forOrRev, kmerCnt, frame, seqLen);
                 if (forOrRev == 0) {
                     kmerBuffer.buffer[posToWrite] = {tempKmer, seqID, (frame % 3) + (kmerCnt * 3) + offset, frame};
                 } else {
@@ -425,7 +426,7 @@ void
 SeqIterator::addDNAInfo_QueryKmer(uint64_t &kmer, const char *seq, int forOrRev, uint32_t kmerCnt, uint32_t frame,
                                   int seqLen) {
     uint32_t start = (frame % 3) + (kmerCnt * 3);
-    kmer <<= bitsFor8Codons;
+    //kmer <<= bitsFor8Codons;
     size_t end = seqLen - 1;
 
     if (forOrRev == 0) { // Forward
