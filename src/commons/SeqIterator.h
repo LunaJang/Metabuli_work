@@ -27,8 +27,9 @@
 
 KSEQ_INIT(kseq_buffer_t*, kseq_buffer_reader)
 
-//#define kmerLength 8
-#define kmerLength 12
+// #define kmerLength 8
+// #define kmerLength 12
+#define kmerLength 32
 
 #define nuc2int(x) (x & 14u)>>1u
 
@@ -70,7 +71,10 @@ public:
                              uint32_t seqID, vector<int> *aaFrames, uint32_t offset = 0);
 
     void fillQuerySyncmerBuffer(const char *seq, int seqLen, Buffer<QueryKmer> &kmerBuffer, size_t &posToWrite,
-                             uint32_t seqID, vector<int> *aaFrames, uint32_t offset = 0);
+                                uint32_t seqID, vector<int> *aaFrames, uint32_t offset = 0);
+    
+    void fillQueryKmerDNABuffer(const char *seq, int seqLen, Buffer<QueryKmer> &kmerBuffer, size_t &posToWrite, 
+                                uint32_t seqID, uint32_t offset = 0);
 
     string reverseCompliment(string &read) const;
 
@@ -156,6 +160,7 @@ public:
     void printKmerInDNAsequence(uint64_t kmer);
 
     void printAAKmer(uint64_t kmer, int shits = 28);
+    void printDNAKmer(uint64_t kmer, int len = 32);
 
     explicit SeqIterator(const LocalParameters &par);
     ~SeqIterator();

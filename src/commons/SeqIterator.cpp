@@ -364,6 +364,26 @@ void SeqIterator::fillQueryKmerBuffer(
     }
 }
 
+void SeqIterator::fillQueryKmerDNABuffer(
+    const char *seq,
+    int seqLen, 
+    Buffer<QueryKmer> &kmerBuffer, 
+    size_t &posToWrite, 
+    uint32_t seqID, 
+    uint32_t offset) {
+        
+    for (uint32_t kmerCnt = 0; kmerCnt < seqLen - kmerLength - spaceNum + 1; kmerCnt++) {
+        uint64_t tempKmer = 0;
+        for (int i = 0, j = 0; i < kmerLength + spaceNum_int; i++, j += mask_int[i]) {   
+            tempKmer |= uint64_t(nuc2int(atcg[seq[kmerCnt + i]])) << (j * 2);
+        }
+        kmerBuffer.buffer[posToWrite] = {tempKmer, seqID, kmerCnt, offset};
+        posToWrite++;
+        //printDNAKmer(tempKmer,32);
+    }
+
+}
+
 void SeqIterator::fillQuerySyncmerBuffer(
     const char *seq,
     int seqLen, 
@@ -1442,3 +1462,12 @@ void SeqIterator::printAAKmer(uint64_t kmer, int shifts) {
         cout << aminoacid[aa8mer[i]];
     }
 } 
+
+void SeqIterator::printDNAKmer(uint64_t kmer, int len) {
+    static const char int2nuc[4] = {'A', 'C', 'T', 'G'};
+    string dna;
+    for (int j = 0; j < len; j++) {
+        dna += int2nuc[(kmer >> (j * 2)) & 0x3];
+    }
+    cout << dna << endl;
+}

@@ -146,7 +146,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     queryGroupInfo.resize(processedReadCnt, -1);
     int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId, metabuliResult, thresholdK));
     
-    makeGroups(outDir, jobId, dynamicGroupKmerThr, groupInfo, queryGroupInfo);    
+    makeGroups(outDir, jobId, 120, groupInfo, queryGroupInfo);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
     loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
     
@@ -782,11 +782,14 @@ void GroupGenerator::applyRepLabel(const string &resultFileDir,
             if (repLabelIt != repLabel.end()){
                 // LCA successed
                 if (repLabelIt->second != 0) {
-                    if (fields[0] == "0") {
-                        fields[0] = "1";
-                        fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
-                        fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
-                    }
+                    // if (fields[0] == "0") {
+                    //     fields[0] = "1";
+                    //     fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
+                    //     fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
+                    // }
+                    fields[0] = "1";
+                    fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
+                    fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
                 }
                 // LCA failed
                 else {
