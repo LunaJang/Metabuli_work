@@ -135,10 +135,10 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             complete = true;
         }
     }   
-    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
-
     vector<MetabuliInfo> metabuliResult;       
     loadMetabuliResult(outDir, metabuliResult);
+    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, metabuliResult, jobId);   
+    return;
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
@@ -163,6 +163,7 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
                                size_t &numOfThreads, 
                                size_t &numOfGraph,
                                size_t processedReadCnt,
+                               const vector<MetabuliInfo>& metabuliResult,
                                const string &jobId) {
     
     cout << "Creating graphs based on kmer-query relation..." << endl;
@@ -221,6 +222,10 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
         vector<uint32_t> currentQueryIds;
         currentQueryIds.reserve(1024);
 
+        string kmerQueryFile = queryKmerFileDir + "/" + jobId + "kmerQueryFile";
+        std::ofstream relationOut(kmerQueryFile, std::ios::app);
+        string kmerQueryString = "";
+
         while (true) {
             uint64_t currentKmer = UINT64_MAX;
 
@@ -266,34 +271,44 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
                 }
             }
 
-            
-            std::sort(currentQueryIds.begin(), currentQueryIds.end());
-            auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
-            currentQueryIds.erase(last, currentQueryIds.end());
-
-            // 수집된 query ID 간 관계 누적
-            for (size_t i = 0; i < currentQueryIds.size(); ++i) {
-                for (size_t j = i+1; j < currentQueryIds.size(); ++j) {            
-                    uint32_t a = min(currentQueryIds[i], currentQueryIds[j]);
-                    uint32_t b = max(currentQueryIds[i], currentQueryIds[j]);
-                    if (threadRelation[a][b] == 0){
-                        processedRelationCnt++;
+            if (currentQueryIds.size() > 1){
+                std::sort(currentQueryIds.begin(), currentQueryIds.end());
+                auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
+                currentQueryIds.erase(last, currentQueryIds.end());
+                int numTrueEdge = 0;
+                int numFalseEdge = 0;
+                // 수집된 query ID 간 관계 누적
+                for (size_t i = 0; i < currentQueryIds.size(); ++i) {
+                    for (size_t j = i+1; j < currentQueryIds.size(); ++j) {   
+                        if (metabuliResult[currentQueryIds[i]].name == metabuliResult[currentQueryIds[j]].name)
+                            numTrueEdge++;
+                        else
+                            numFalseEdge++;         
+                        uint32_t a = min(currentQueryIds[i], currentQueryIds[j]);
+                        uint32_t b = max(currentQueryIds[i], currentQueryIds[j]);
+                        if (threadRelation[a][b] == 0){
+                            processedRelationCnt++;
+                        }
+                        threadRelation[a][b]++;
                     }
-                    threadRelation[a][b]++;
                 }
-            }
+                kmerQueryString +=  seqIterator->translateAAKmer(currentKmer, 0) + "\t" + std::to_string(currentQueryIds.size()) + "\t" +  std::to_string(numTrueEdge) + "\t" + std::to_string(numFalseEdge) + "\n";
 
-            if (processedRelationCnt > RELATION_THRESHOLD) {
-                size_t counter_now = counter.fetch_add(1, memory_order_relaxed);
-                saveSubGraphToFile(threadRelation, queryKmerFileDir, counter_now, jobId);
-                threadRelation.clear();
-                processedRelationCnt = 0;
+                if (processedRelationCnt > RELATION_THRESHOLD) {
+                    relationOut << kmerQueryString;
+                    kmerQueryString = "";
+                    size_t counter_now = counter.fetch_add(1, memory_order_relaxed);
+                    saveSubGraphToFile(threadRelation, queryKmerFileDir, counter_now, jobId);
+                    threadRelation.clear();
+                    processedRelationCnt = 0;
+                }
             }
         }
 
         if (!threadRelation.empty()) {
             size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
             saveSubGraphToFile(threadRelation, queryKmerFileDir, counter_now, jobId);
+            relationOut << kmerQueryString;
         }
 
         // mmap 해제

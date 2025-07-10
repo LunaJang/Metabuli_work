@@ -1453,3 +1453,20 @@ void SeqIterator::printAAKmer(uint64_t kmer, int shifts) {
         cout << aminoacid[aa8mer[i]];
     }
 } 
+
+string SeqIterator::translateAAKmer(uint64_t kmer, int shifts) {
+    kmer >>= shifts;
+    vector<int> aakmer(kmerLen);
+    for (int i = 0; i < kmerLen; i++) {
+        int quotient = kmer / powers[kmerLen - 1 - i];
+        kmer = kmer - (quotient * powers[kmerLen - 1 - i]);
+        aakmer[kmerLen - 1 - i] = quotient;
+    }
+    string aminoacid = "ARNDCQEGHILKMFPSTWYVX";
+    string result = "";
+    for (int i = 0; i < kmerLen; i++) {
+        result += aminoacid[aakmer[i]];
+    }
+
+    return result;
+} 

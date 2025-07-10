@@ -166,6 +166,7 @@ public:
                    size_t &numOfThreads, 
                    size_t &numOfGraph,
                    size_t processedReadCnt,
+                   const vector<MetabuliInfo>& metabuliResult,
                    const string &jobId);
 
     void saveSubGraphToFile(const unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &subRelation, 
