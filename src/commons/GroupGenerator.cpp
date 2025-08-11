@@ -135,15 +135,15 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             complete = true;
         }
     }   
-    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
-
     vector<MetabuliInfo> metabuliResult;       
     loadMetabuliResult(outDir, metabuliResult);
+
+    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, metabuliResult, jobId);   
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    int dynamicGroupKmerThr = static_cast<int>(mergeRelations(outDir, numOfGraph, jobId, metabuliResult, thresholdK));
+    double dynamicGroupKmerThr = mergeRelations(outDir, numOfGraph, jobId, metabuliResult, thresholdK);
     
     makeGroups(outDir, jobId, dynamicGroupKmerThr, groupInfo, queryGroupInfo);    
     saveGroupsToFile(groupInfo, queryGroupInfo, outDir, jobId);
@@ -163,6 +163,7 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
                                size_t &numOfThreads, 
                                size_t &numOfGraph,
                                size_t processedReadCnt,
+                               const vector<MetabuliInfo>& metabuliResult,
                                const string &jobId) {
     
     cout << "Creating graphs based on kmer-query relation..." << endl;
@@ -175,7 +176,10 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
     {
         int threadIdx = omp_get_thread_num();
         size_t processedRelationCnt = 0;
-        unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> threadRelation;
+        unordered_map<uint32_t, unordered_map<uint32_t, double>> threadRelation;     
+           
+        std::unordered_map<int, int> external2internalTaxId;
+        taxonomy->getExternal2internalTaxID(external2internalTaxId);
 
         // 파일 관련 초기화
         MmapedData<uint16_t> *diffFileList = new MmapedData<uint16_t>[numOfSplits];
@@ -230,8 +234,7 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
                     currentKmer = min(currentKmer, kmerInfoBuffers[file][bufferPos[file]].first);
                 }
             }
-            
-            
+
             if (currentKmer == UINT64_MAX) break;
 
             currentQueryIds.clear();
@@ -267,19 +270,39 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
             }
 
             
-            std::sort(currentQueryIds.begin(), currentQueryIds.end());
-            auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
-            currentQueryIds.erase(last, currentQueryIds.end());
-
-            // 수집된 query ID 간 관계 누적
-            for (size_t i = 0; i < currentQueryIds.size(); ++i) {
-                for (size_t j = i+1; j < currentQueryIds.size(); ++j) {            
-                    uint32_t a = min(currentQueryIds[i], currentQueryIds[j]);
-                    uint32_t b = max(currentQueryIds[i], currentQueryIds[j]);
-                    if (threadRelation[a][b] == 0){
-                        processedRelationCnt++;
+            if (currentQueryIds.size() > 1){
+                std::sort(currentQueryIds.begin(), currentQueryIds.end());
+                auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
+                currentQueryIds.erase(last, currentQueryIds.end());
+                double numTrueEdge = 0;
+                double numFalseEdge = 0;
+                // 수집된 query ID 간 관계 누적
+                for (size_t i = 0; i < currentQueryIds.size(); ++i) {
+                    for (size_t j = i+1; j < currentQueryIds.size(); ++j) {   
+                        //if (metabuliResult[currentQueryIds[i]].name == metabuliResult[currentQueryIds[j]].name)
+                        if (external2internalTaxId[metabuliResult[currentQueryIds[i]].label] == external2internalTaxId[metabuliResult[currentQueryIds[j]].label])
+                            numTrueEdge++;
+                        else
+                            numFalseEdge++;         
                     }
-                    threadRelation[a][b]++;
+                }
+
+                for (size_t i = 0; i < currentQueryIds.size(); ++i) {
+                    for (size_t j = i+1; j < currentQueryIds.size(); ++j) {   
+                        uint32_t a = min(currentQueryIds[i], currentQueryIds[j]);
+                        uint32_t b = max(currentQueryIds[i], currentQueryIds[j]);
+                        if (threadRelation[a][b] == 0){
+                            processedRelationCnt++;
+                        }
+                        threadRelation[a][b] += numTrueEdge / (numTrueEdge + numFalseEdge);
+                    }
+                }
+
+                if (processedRelationCnt > RELATION_THRESHOLD) {
+                    size_t counter_now = counter.fetch_add(1, memory_order_relaxed);
+                    saveSubGraphToFile(threadRelation, queryKmerFileDir, counter_now, jobId);
+                    threadRelation.clear();
+                    processedRelationCnt = 0;
                 }
             }
 
@@ -313,7 +336,7 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
-void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &subRelation, 
+void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_map<uint32_t, double>> &subRelation, 
                                         const string &subGraphFileDir, 
                                         const size_t counter_now,
                                         const string &jobId) {
@@ -326,7 +349,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
     }
 
     // 정렬 후 저장
-    vector<tuple<uint32_t, uint32_t, uint32_t>> sortedRelations;
+    vector<tuple<uint32_t, uint32_t, double>> sortedRelations;
     for (const auto &[id1, inner_map] : subRelation) {
         for (const auto &[id2, weight] : inner_map) {
             sortedRelations.emplace_back(id1, id2, weight);
@@ -337,7 +360,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
     for (const auto &[id1, id2, weight] : sortedRelations) {
         outFile.write(reinterpret_cast<const char*>(&id1), sizeof(uint32_t));
         outFile.write(reinterpret_cast<const char*>(&id2), sizeof(uint32_t));
-        outFile.write(reinterpret_cast<const char*>(&weight), sizeof(uint32_t));
+        outFile.write(reinterpret_cast<const char*>(&weight), sizeof(double));
     }
 
     outFile.close();
@@ -368,6 +391,17 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
     }
 
     // 초기 파일 열기 및 버퍼 채우기
+    auto readNextBatch = [&](size_t i) {
+        for (size_t j = 0; j < BATCH_SIZE; ++j) {
+            Relation r;
+            if (!files[i].read(reinterpret_cast<char*>(&r.id1), sizeof(uint32_t))) break;
+            if (!files[i].read(reinterpret_cast<char*>(&r.id2), sizeof(uint32_t))) break;
+            if (!files[i].read(reinterpret_cast<char*>(&r.weight), sizeof(double))) break;
+            relationBuffers[i].push(r);
+        }
+        if (relationBuffers[i].empty()) fileHasData[i] = false;
+    };
+
     for (size_t i = 0; i < numOfGraph; ++i) {
         string fileName = subGraphFileDir + "/" + jobId + "_subGraph" + to_string(i);
         files[i].open(fileName, ios::binary);
@@ -376,27 +410,8 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
             fileHasData[i] = false;
             continue;
         }
-
-        for (size_t j = 0; j < BATCH_SIZE; ++j) {
-            Relation r;
-            if (!files[i].read(reinterpret_cast<char*>(&r.id1), sizeof(uint32_t))) break;
-            if (!files[i].read(reinterpret_cast<char*>(&r.id2), sizeof(uint32_t))) break;
-            if (!files[i].read(reinterpret_cast<char*>(&r.weight), sizeof(uint32_t))) break;
-            relationBuffers[i].push(r);
-        }
-        if (relationBuffers[i].empty()) fileHasData[i] = false;
+        readNextBatch(i);  
     }
-
-    auto readNextBatch = [&](size_t i) {
-        for (size_t j = 0; j < BATCH_SIZE; ++j) {
-            Relation r;
-            if (!files[i].read(reinterpret_cast<char*>(&r.id1), sizeof(uint32_t))) break;
-            if (!files[i].read(reinterpret_cast<char*>(&r.id2), sizeof(uint32_t))) break;
-            if (!files[i].read(reinterpret_cast<char*>(&r.weight), sizeof(uint32_t))) break;
-            relationBuffers[i].push(r);
-        }
-        if (relationBuffers[i].empty()) fileHasData[i] = false;
-    };
 
     // weight 저장
     std::unordered_map<int, int> external2internalTaxId;
@@ -416,7 +431,7 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
 
         if (minKey.first == UINT32_MAX) break;
 
-        uint32_t totalWeight = 0;
+        double totalWeight = 0;
 
         for (size_t i = 0; i < numOfGraph; ++i) {
             while (!relationBuffers[i].empty()) {
@@ -430,19 +445,19 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         }
 
         // metabuli 결과 기반 taxonomy 비교
-        // int label1 = external2internalTaxId[metabuliResult[minKey.first].label];
-        // int label2 = external2internalTaxId[metabuliResult[minKey.second].label];
+        int label1 = external2internalTaxId[metabuliResult[minKey.first].label];
+        int label2 = external2internalTaxId[metabuliResult[minKey.second].label];
         
-        // if (taxonomy->getTaxIdAtRank(label1, "genus") == taxonomy->getTaxIdAtRank(label2, "genus"))
-        //     trueWeights.emplace_back(totalWeight);
-        // else
-        //     falseWeights.emplace_back(totalWeight);
-
-        //  query name 기반 taxonomy 비교
-        if (metabuliResult[minKey.first].name == metabuliResult[minKey.second].name)
+        if (taxonomy->getTaxIdAtRank(label1, "genus") == taxonomy->getTaxIdAtRank(label2, "genus"))
             trueWeights.emplace_back(totalWeight);
         else
             falseWeights.emplace_back(totalWeight);
+
+        //  query name 기반 taxonomy 비교
+        // if (metabuliResult[minKey.first].name == metabuliResult[minKey.second].name)
+        //     trueWeights.emplace_back(totalWeight);
+        // else
+        //     falseWeights.emplace_back(totalWeight);
 
         relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
     }
@@ -500,7 +515,7 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
 
 void GroupGenerator::makeGroups(const string& relationFileDir,
                                 const string& jobId,
-                                int groupKmerThr,
+                                double groupKmerThr,
                                 unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                                 vector<int> &queryGroupInfo) {
     cout << "Creating groups from relation file..." << endl;
@@ -514,9 +529,10 @@ void GroupGenerator::makeGroups(const string& relationFileDir,
 
     DisjointSet ds;
 
-    uint32_t id1, id2, weight;
+    uint32_t id1, id2;
+    double weight;
     while (file >> id1 >> id2 >> weight) {
-        if (static_cast<int>(weight) > groupKmerThr) {
+        if (weight > groupKmerThr) {
             if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
             if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
             ds.unionSets(id1, id2);
@@ -787,23 +803,24 @@ void GroupGenerator::applyRepLabel(const string &resultFileDir,
             fields[7] = to_string(groupId);
             auto repLabelIt = repLabel.find(groupId);
             if (repLabelIt != repLabel.end()){
-                // // LCA successed
-                // if (repLabelIt->second != 0) {
-                //     if (fields[0] == "0") {
-                //         fields[0] = "1";
-                //         fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
-                //         fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
-                //     }
-                // }
+                // LCA successed
+                if (repLabelIt->second != 0) {
+                    if (fields[0] == "0") {
+                        fields[0] = "1";
+                        fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
+                        fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
+                    }
+                }
                 // // LCA failed
                 // else {
                 //     fields[0] = "0";
                 //     fields[2] = "0";
                 //     fields[5] = "no rank";
                 // }         
-                fields[0] = "1";
-                fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
-                fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);   
+                
+                // fields[0] = "1";
+                // fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
+                // fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);   
             }
         }
         for (size_t i = 0; i < fields.size(); ++i) {

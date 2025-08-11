@@ -28,7 +28,7 @@ using namespace std;
 struct Relation {
     uint32_t id1;
     uint32_t id2;
-    uint32_t weight;
+    double weight;
 
     bool operator==(const Relation& other) const {
         return id1 == other.id1 && id2 == other.id2;
@@ -166,9 +166,10 @@ public:
                    size_t &numOfThreads, 
                    size_t &numOfGraph,
                    size_t processedReadCnt,
+                   const vector<MetabuliInfo>& metabuliResult,
                    const string &jobId);
 
-    void saveSubGraphToFile(const unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &subRelation, 
+    void saveSubGraphToFile(const unordered_map<uint32_t, unordered_map<uint32_t, double>> &subRelation, 
                             const string &subGraphFileDir, 
                             const size_t counter_now,
                             const string &jobId);
@@ -180,7 +181,7 @@ public:
 
     void makeGroups(const string& relationFileDir,
                     const string& jobId,
-                    int groupKmerThr,
+                    double groupKmerThr,
                     unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                     vector<int> &queryGroupInfo);
 
