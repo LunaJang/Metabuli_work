@@ -14,6 +14,7 @@
 #include "QueryIndexer.h"
 #include "ReducedKmerMatcher.h"
 #include "KmerExtractor.h"
+#include "GeneticCode.h"
 #include "Taxonomer.h"
 #include "Reporter.h"
 #include "KSeqWrapper.h"
@@ -163,7 +164,7 @@ protected:
     KmerFileHandler *kmerFileHandler;
     
     unordered_map<TaxID, TaxID> taxId2speciesId;
-    unordered_map<TaxID, TaxID> taxId2genusId;
+    unordered_map<TaxID, TaxID> taxId2genusId;    
 
 public:
     GroupGenerator(LocalParameters & par);
@@ -177,6 +178,7 @@ public:
                    size_t &numOfThreads, 
                    size_t &numOfGraph,
                    size_t processedReadCnt,
+                   vector<MetabuliInfo>& metabuliResult,
                    const string &jobId);
 
     void saveSubGraphToFile(const unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &subRelation, 

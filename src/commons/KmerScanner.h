@@ -3,7 +3,7 @@
 
 #include <iostream>
 #include <deque>
-
+#include <string>
 #include "Kmer.h"
 #include "GeneticCode.h"
 #include "common.h"
@@ -19,6 +19,15 @@ struct Kmer {
             int aa = (aaPart >> (35 - 5 * i)) & 0x1F;
             std::cout << code.aminoacids[aa];
         }
+    }
+
+    std::string transAA(const GeneticCode & code, int k) const{
+        std::string trans_value = "";
+        for (int i = 0; i < k; ++i) {
+            int aa = (value >> (((k - 1) * 5) - 5 * i)) & 0x1F;
+            trans_value += code.aminoacids[aa];
+        }
+        return trans_value;
     }
 
     void printAA(const GeneticCode & code, int k) const {

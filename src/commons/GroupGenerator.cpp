@@ -106,6 +106,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
             // Initialize query k-mer buffer and match buffer
             queryKmerBuffer.startIndexOfReserve = 0;
+            memset(queryKmerBuffer.buffer, 0, queryKmerBuffer.bufferSize * sizeof(QueryKmer));
 
             // Extract query k-mers
             kmerExtractor->extractQueryKmers(queryKmerBuffer,
@@ -127,14 +128,12 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         }
         if (processedReadCnt == totalSeqCnt) {
             complete = true;
-        } else {
-            memset(queryKmerBuffer.buffer, 0, queryKmerBuffer.bufferSize * sizeof(Kmer));
         }
     }   
-    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, jobId);   
-
     vector<MetabuliInfo> metabuliResult;       
     loadMetabuliResult(outDir, metabuliResult);
+
+    makeGraph(outDir, numOfSplits, numOfThreads, numOfGraph, processedReadCnt, metabuliResult, jobId);   
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
@@ -156,12 +155,12 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
 void GroupGenerator::filterCommonKmers(Buffer<QueryKmer>& queryKmerBuffer,
                                        const string & db){
-    cout << "Filtering common k-mers from query k-mer buffer... ";
+    cout << "Filtering common k-mers (" + db + "/common-kmers-no-mask) " + "from query k-mer buffer... " << endl;
     time_t beforeFilter = time(nullptr);
 
     string gtdbListDB;
-    std::string diffIdxFileName = db + "/common-kmers-with-mask" + "/diffIdx";
-    std::string infoFileName = db + "/common-kmers-with-mask" + "/info";
+    std::string diffIdxFileName = db + "/common-kmers-no-mask" + "/diffIdx";
+    std::string infoFileName = db + "/common-kmers-no-mask" + "/info";
     DeltaIdxReader* deltaIdxReaders = new DeltaIdxReader(diffIdxFileName, 
                                                          infoFileName, 
                                                          1024 * 1024 * 32, 
@@ -263,7 +262,8 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
                                size_t &numOfSplits, 
                                size_t &numOfThreads, 
                                size_t &numOfGraph,
-                               size_t processedReadCnt,
+                               size_t processedReadCnt,                               
+                               vector<MetabuliInfo>& metabuliResult,
                                const string &jobId) {
     
     cout << "Creating graphs based on kmer-query relation..." << endl;
@@ -281,6 +281,11 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
         // 파일 관련 초기화
         MmapedData<uint16_t> *diffFileList = new MmapedData<uint16_t>[numOfSplits];
         MmapedData<QueryKmerInfo> *infoFileList = new MmapedData<QueryKmerInfo>[numOfSplits];
+
+        string falseRelationFileName = queryKmerFileDir + "/" + jobId + "_false_relation_" + to_string(threadIdx);
+        ofstream falseRelationFile(falseRelationFileName);
+        // string trueRelationFileName = queryKmerFileDir + "/" + jobId + "_true_relation_" + to_string(threadIdx);
+        // ofstream trueRelationFile(trueRelationFileName);
 
         // 💡 버퍼링용 구조
         vector<vector<pair<uint64_t, QueryKmerInfo>>> kmerInfoBuffers(numOfSplits);
@@ -316,11 +321,13 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
                 diffFileIdx[file], infoFileIdx[file], 
                 kmerCurrentVal[file], BATCH_SIZE);
 
-            bufferPos[file] = 0;
+            bufferPos[file] = 0;       
         }
 
         vector<uint32_t> currentQueryIds;
         currentQueryIds.reserve(1024);
+        vector<QueryKmerInfo> currentQueryKmerInfos;
+        currentQueryKmerInfos.reserve(1024);
 
         while (true) {
             uint64_t currentKmer = UINT64_MAX;
@@ -336,6 +343,7 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
             if (currentKmer == UINT64_MAX) break;
 
             currentQueryIds.clear();
+            currentQueryKmerInfos.clear();
 
             // 현재 k-mer와 동일한 k-mer를 가지는 query ID 수집
             for (size_t file = 0; file < numOfSplits; ++file) {
@@ -343,15 +351,8 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
                     kmerInfoBuffers[file][bufferPos[file]].first == currentKmer) {
                     
                     uint32_t seqId = kmerInfoBuffers[file][bufferPos[file]].second.sequenceID;
-                    // #pragma omp critical 
-                    // cout << "[READ ] seqID: " << seqId
-                    // << ", kmer: " << currentKmer
-                    // << ", fileIdx: " << file << ", thread: " << threadIdx << endl;
-            
-
-                    if (seqId != UINT32_MAX && seqId < processedReadCnt) {
-                        currentQueryIds.emplace_back(seqId);
-                    }
+                    currentQueryIds.emplace_back(seqId);
+                    currentQueryKmerInfos.emplace_back(kmerInfoBuffers[file][bufferPos[file]].second);
 
                     bufferPos[file]++;
 
@@ -366,7 +367,30 @@ void GroupGenerator::makeGraph(const string &queryKmerFileDir,
                     }
                 }
             }
+            
+            std::vector<bool> falseInfos(currentQueryKmerInfos.size(), false);
+            for (size_t i = 0; i < currentQueryKmerInfos.size(); ++i) {
+                for (size_t j = i+1; j < currentQueryKmerInfos.size(); ++j) {    
+                    string name1 = metabuliResult[currentQueryKmerInfos[i].sequenceID].name;
+                    string name2 = metabuliResult[currentQueryKmerInfos[j].sequenceID].name;
 
+                    name1 = name1.substr(0, name1.find('.'));
+                    name2 = name2.substr(0, name2.find('.'));
+
+                    if (name1 != name2){
+                        falseInfos[i] = true;
+                        falseInfos[j] = true;
+                    }
+                }
+            }
+
+            for (size_t i = 0; i < currentQueryKmerInfos.size(); ++i){
+                if (falseInfos[i]){
+                    Kmer transKmer(currentKmer, currentQueryKmerInfos[i].pos);
+                    falseRelationFile << transKmer.transAA(*geneticCode, 12) << ' ' << currentQueryKmerInfos[i].sequenceID << ' ' << currentQueryKmerInfos[i].pos << '\n';
+                    // falseRelationFile << currentQueryIds[i] << ' ' << currentQueryKmerInfos[i].sequenceID << ' ' << currentQueryKmerInfos[i].pos << '\n';
+                }
+            }
             
             std::sort(currentQueryIds.begin(), currentQueryIds.end());
             auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
@@ -421,6 +445,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
     const string subGraphFileName = subGraphFileDir + "/" + jobId + "_subGraph" + to_string(counter_now);
 
     ofstream outFile(subGraphFileName, ios::binary);
+    // ofstream outFile(subGraphFileName);
     if (!outFile.is_open()) {
         cerr << "Error opening file: " << subGraphFileName << endl;
         return;
@@ -439,6 +464,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint32_t, unordered_
         outFile.write(reinterpret_cast<const char*>(&id1), sizeof(uint32_t));
         outFile.write(reinterpret_cast<const char*>(&id2), sizeof(uint32_t));
         outFile.write(reinterpret_cast<const char*>(&weight), sizeof(uint32_t));
+        // outFile << id1 << ' ' << id2 << ' ' << weight << '\n';
     }
 
     outFile.close();
@@ -481,6 +507,7 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
     for (size_t i = 0; i < numOfGraph; ++i) {
         string fileName = subGraphFileDir + "/" + jobId + "_subGraph" + to_string(i);
         files[i].open(fileName, ios::binary);
+        // files[i].open(fileName);
         if (!files[i].is_open()) {
             cerr << "Error opening file: " << fileName << endl;
             continue;
@@ -524,15 +551,33 @@ double GroupGenerator::mergeRelations(const string& subGraphFileDir,
         int label1 = external2internalTaxId[metabuliResult[minKey.first].label];
         int label2 = external2internalTaxId[metabuliResult[minKey.second].label];
         
-        if (taxonomy->getTaxIdAtRank(label1, "genus") == taxonomy->getTaxIdAtRank(label2, "genus"))
-            trueWeights.emplace_back(totalWeight);
-        else
-            falseWeights.emplace_back(totalWeight);
+        if (taxonomy->getTaxIdAtRank(label1, "genus") != 0 && taxonomy->getTaxIdAtRank(label2, "genus") != 0){
+            if (taxonomy->getTaxIdAtRank(label1, "genus") == taxonomy->getTaxIdAtRank(label2, "genus"))
+                trueWeights.emplace_back(totalWeight);
+            else
+                falseWeights.emplace_back(totalWeight);
+        }
 
         relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
     }
 
     relationLog.close();
+
+    // vector<double> tempSorted = falseWeights;
+    // std::sort(tempSorted.begin(), tempSorted.end());
+    // double tempFalse = tempSorted[0];
+    // int tempFalseCnt = 0;
+    // for (int i = 0; i < tempSorted.size(); i++){
+    //     if (tempFalse == tempSorted[i]){
+    //         tempFalseCnt++;
+    //     }
+    //     else{
+    //         cout << tempFalse << ": " << tempFalseCnt << endl;
+    //         tempFalse = tempSorted[i];
+    //         tempFalseCnt = 1;
+    //     }
+    // }
+    // cout << tempFalse << ": " << tempFalseCnt << endl;
 
     if (trueWeights.size() < 10 || falseWeights.size() < 10) {
         cerr << "Insufficient true/false edges for elbow detection." << endl;
@@ -639,7 +684,7 @@ void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_se
     for (const auto& [groupId, queryIds] : groupInfo) {
         outFile1 << groupId << " ";
         for (const auto& queryId : queryIds) {
-            outFile1 << metabuliResult[queryId].name << " ";
+            outFile1 << metabuliResult[queryId].name << "\t";
         }
         outFile1 << endl;
     }
@@ -717,6 +762,7 @@ void GroupGenerator::loadMetabuliResult(const string &resultFileDir,
     }
 
     string line;
+    metabuliResult.push_back({0, 0.0, "0"});
     while (getline(inFile, line)) {
         stringstream ss(line);
         int label, query_label, read_length;
