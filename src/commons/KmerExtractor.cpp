@@ -25,6 +25,9 @@ KmerExtractor::KmerExtractor(
             kmerLen = 12;
         } else if (kmerFormat == 4) {
             kmerScanners[i] = new KmerScanner_aa2aa(12);
+        } else if (kmerFormat == 5) {
+            kmerScanners[i] = new SyncmerScanner_dna2aa(geneticCode, 12, par.smerLen);
+            kmerLen = 12;
         } else {
             std::cerr << "Error: Invalid k-mer format specified." << std::endl;
             exit(EXIT_FAILURE);
@@ -365,7 +368,6 @@ void KmerExtractor::fillQueryKmerBuffer(
         Kmer kmer;
         while ((kmer = kmerScanners[threadID]->next()).value != UINT64_MAX) {
             kmerBuffer.buffer[posToWrite++] = {kmer.value, seqID, kmer.pos + offset, (uint8_t) frame};
-            kmer.printAA(kmerScanners[threadID]->getGeneticCode(), 12); cout << endl;// For test
         }
     }
 }
