@@ -212,8 +212,7 @@ public:
         const size_t counter_now);
 
     double mergeRelations(size_t numOfGraph,
-                          const vector<MetabuliInfo>& metabuliResult,
-                          const double thresholdK);
+                        const vector<MetabuliInfo>& metabuliResult);
 
     void mergeRelations(size_t numOfGraph);
 
@@ -227,8 +226,7 @@ public:
 
     void loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
                        vector<int> &queryGroupInfo,
-                       const string &groupFileDir,
-                       const string &jobId);
+                       const string &groupFileDir);
 
     void loadMetabuliResult(vector<MetabuliInfo>& metabuliResult);
 

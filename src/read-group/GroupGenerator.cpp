@@ -48,6 +48,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     size_t totalSeqCnt = 0;
     size_t numOfSplits = 0;
     size_t numOfGraph = 0;
+    int threshold = 0;
 
     float groupScoreThr = par.groupScoreThr;
     double thresholdK = par.thresholdK;
@@ -98,6 +99,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
             // Initialize query k-mer buffer and match buffer
             queryKmerBuffer.startIndexOfReserve = 0;
+            memset(queryKmerBuffer.buffer, 0, queryKmerBuffer.bufferSize * sizeof(Kmer));
 
             // Extract query k-mers
             kmerExtractor->extractQueryKmers(queryKmerBuffer,
@@ -129,28 +131,29 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     }   
     // processedReadCnt = 10151370;
     // numOfSplits = 6;
-    makeGraph(numOfSplits, numOfThreads, numOfGraph, processedReadCnt);   
 
     vector<MetabuliInfo> metabuliResult;       
     loadMetabuliResult(metabuliResult);
 
+    makeGraph(numOfSplits, numOfThreads, numOfGraph, processedReadCnt);   
+
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
-    mergeRelations(numOfGraph);
-    // int dynamicGroupKmerThr = static_cast<int>(mergeRelations(numOfGraph, metabuliResult, thresholdK));
+    // mergeRelations(numOfGraph);
+    threshold = static_cast<int>(ceil(mergeRelations(numOfGraph, metabuliResult)));
     if (par.minEdgeWeight != 0) {
         makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
     } else {
-        makeGroups(132, groupInfo, queryGroupInfo);    
+        makeGroups(threshold, groupInfo, queryGroupInfo);    
     }
     saveGroupsToFile(groupInfo, queryGroupInfo, metabuliResult);
-    //loadGroupsFromFile(groupInfo, queryGroupInfo, outDir, jobId);
+    //loadGroupsFromFile(groupInfo, queryGroupInfo, outDir);
     
 
     unordered_map<uint32_t, int> repLabel; 
     getRepLabel(metabuliResult, groupInfo, repLabel, groupScoreThr);
-    //loadRepLabel(outDir, repLabel, jobId);
+    //loadRepLabel(outDir, repLabel);
     applyRepLabel(queryGroupInfo, repLabel, groupScoreThr);
     
     cout << "Number of query k-mers: " << numOfTatalQueryKmerCnt << endl;
@@ -273,8 +276,7 @@ void GroupGenerator::filterCommonKmers(Buffer<Kmer>& queryKmerBuffer,
 void GroupGenerator::filterCommonKmers(
     Buffer<Kmer> & qKmers,
     Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
-    const string & commonKmerDB
-) {
+    const string & commonKmerDB) {
     // cout << "Filtering common k-mers from query k-mer buffer... ";
     string gtdbListDB;
     std::string diffIdxFileName = commonKmerDB +"/diffIdx";
@@ -805,8 +807,7 @@ void GroupGenerator::makeGraph(
 
 void GroupGenerator::saveSubGraphToFile(
     const unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &subRelation, 
-    const size_t counter_now
-) {
+    const size_t counter_now) {
     const string subGraphFileName = outDir + "/subGraph_" + to_string(counter_now);
 
     ofstream outFile(subGraphFileName, ios::binary);
@@ -841,12 +842,11 @@ void GroupGenerator::saveSubGraphToFile(
 
 double GroupGenerator::mergeRelations(
     size_t numOfGraph,
-    const vector<MetabuliInfo>& metabuliResult,
-    double thresholdK
-) {
-    cout << "Merging and calculating threshold via elbow..." << endl;
+    const vector<MetabuliInfo>& metabuliResult) {
+    cout << "Merging reads relations..." << endl;
     time_t before = time(nullptr);
 
+    const double thresholdK = 0.5;
     const size_t BATCH_SIZE = 4096;
     vector<ifstream> files(numOfGraph);
     vector<queue<Relation>> relationBuffers(numOfGraph);
@@ -911,41 +911,52 @@ double GroupGenerator::mergeRelations(
             }
         }
 
+        // string name1 = metabuliResult[minKey.first].name;
+        // string name2 = metabuliResult[minKey.second].name;
+        // name1 = name1.substr(0, name1.find('.'));
+        // name2 = name2.substr(0, name2.find('.'));
+        // if (name1 == name2){
+        //     relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
+        // }
+
         int label1 = external2internalTaxId[metabuliResult[minKey.first].label];
         int label2 = external2internalTaxId[metabuliResult[minKey.second].label];
-        // classified + unclasssified -> false edge
-        // unclassified + unclassified -> true edge
-        // classified + classified -> genus 비교
-        if (taxonomy->getTaxIdAtRank(label1, "genus") == taxonomy->getTaxIdAtRank(label2, "genus"))
-            trueWeights.emplace_back(totalWeight);
-        else
-            falseWeights.emplace_back(totalWeight);
-
+        if (taxonomy->getTaxIdAtRank(label1, "species") != 0 && taxonomy->getTaxIdAtRank(label2, "species") != 0){
+            if (taxonomy->getTaxIdAtRank(label1, "species") == taxonomy->getTaxIdAtRank(label2, "species"))
+                trueWeights.emplace_back(totalWeight);
+            else
+                falseWeights.emplace_back(totalWeight);
+        }
+        else if (taxonomy->getTaxIdAtRank(label1, "genus") != 0 && taxonomy->getTaxIdAtRank(label2, "genus") != 0){
+            if (taxonomy->getTaxIdAtRank(label1, "genus") == taxonomy->getTaxIdAtRank(label2, "genus"))
+                trueWeights.emplace_back(totalWeight);
+            else
+                falseWeights.emplace_back(totalWeight);
+        }
         relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
     }
-
     relationLog.close();
+
+    // vector<double> tempSorted = falseWeights;
+    // std::sort(tempSorted.begin(), tempSorted.end());
+    // double tempFalse = tempSorted[0];
+    // int tempFalseCnt = 0;
+    // for (int i = 0; i < tempSorted.size(); i++){
+    //     if (tempFalse == tempSorted[i]){
+    //         tempFalseCnt++;
+    //     }
+    //     else{
+    //         cout << tempFalse << ": " << tempFalseCnt << endl;
+    //         tempFalse = tempSorted[i];
+    //         tempFalseCnt = 1;
+    //     }
+    // }
+    // cout << tempFalse << ": " << tempFalseCnt << endl;
 
     if (trueWeights.size() < 10 || falseWeights.size() < 10) {
         cerr << "Insufficient true/false edges for elbow detection." << endl;
         return 120.0;
     }
-
-    vector<double> tempSorted = falseWeights;
-    std::sort(tempSorted.begin(), tempSorted.end());
-    double tempFalse = tempSorted[0];
-    int tempFalseCnt = 0;
-    for (int i = 0; i < tempSorted.size(); i++){
-        if (tempFalse == tempSorted[i]){
-            tempFalseCnt++;
-        }
-        else{
-            cout << tempFalse << ": " << tempFalseCnt << endl;
-            tempFalse = tempSorted[i];
-            tempFalseCnt = 1;
-        }
-    }
-    cout << tempFalse << ": " << tempFalseCnt << endl;
 
     // Elbow 계산 함수
     auto findElbow = [](const vector<double>& data) -> double {
@@ -986,15 +997,13 @@ double GroupGenerator::mergeRelations(
     cout << "False elbow: " << elbowFalse << ", True elbow: " << elbowTrue << endl;
     cout << "Threshold (K=" << thresholdK << "): " << threshold << endl;
     cout << "Time: " << time(nullptr) - before << " sec" << endl;
-
     return threshold;
 }
 
 
 void GroupGenerator::mergeRelations(
-    size_t numOfGraph
-) {
-    cout << "Merging and calculating threshold via elbow..." << endl;
+    size_t numOfGraph) {
+    cout << "Merging reads relations..." << endl;
     time_t before = time(nullptr);
 
     const size_t BATCH_SIZE = 4096;
@@ -1103,8 +1112,7 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 void GroupGenerator::saveGroupsToFile(
     const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
     const vector<int> &queryGroupInfo, 
-    const vector<MetabuliInfo>& metabuliResult
-) {
+    const vector<MetabuliInfo>& metabuliResult) {
     // save group in txt file
     const string& groupInfoFileName = outDir + "/groups";
     ofstream outFile1(groupInfoFileName);
@@ -1132,7 +1140,7 @@ void GroupGenerator::saveGroupsToFile(
     }
 
     for (size_t i = 0; i < queryGroupInfo.size(); ++i) {
-        outFile2 << queryGroupInfo[i] << "\n";
+        outFile2 << metabuliResult[i].name << "\t" << queryGroupInfo[i] << "\n";
     }
     outFile2.close();
     cout << "Query group saved to " << queryGroupInfoFileName << " successfully." << endl;
@@ -1142,10 +1150,9 @@ void GroupGenerator::saveGroupsToFile(
 
 void GroupGenerator::loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
                                         vector<int> &queryGroupInfo,
-                                        const string &groupFileDir,
-                                        const string &jobId) {
-    const string groupInfoFileName = groupFileDir + "/" + jobId + "_groups";
-    const string queryGroupInfoFileName = groupFileDir + "/" + jobId + "_queryGroupMap";
+                                        const string &groupFileDir) {
+    const string groupInfoFileName = groupFileDir + "/groups";
+    const string queryGroupInfoFileName = groupFileDir + "/queryGroupMap";
 
     // 1. Load groupInfo
     ifstream inFile1(groupInfoFileName);
@@ -1344,11 +1351,11 @@ void GroupGenerator::applyRepLabel(
             if (repLabelIt != repLabel.end()){
                 // LCA successed
                 if (repLabelIt->second != 0) {
-                    // if (fields[0] == "0") {
-                    // }
-                    fields[0] = "1";
-                    fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
-                    fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
+                    if (fields[0] == "0") {
+                        fields[0] = "1";
+                        fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
+                        fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
+                    }
                 }
             }
         }
@@ -1560,8 +1567,7 @@ void KmerFileHandler::writeQueryKmerFile2(
     const string& outDir,
     size_t& numOfSplits, 
     size_t numOfThreads,
-    size_t processedReadCnt
-) {
+    size_t processedReadCnt) {
     size_t blankCnt = std::find_if(queryKmerBuffer.buffer,
                                    queryKmerBuffer.buffer + queryKmerBuffer.startIndexOfReserve, 
                                    [](const auto& kmer) { return kmer.qInfo.sequenceID != 0;}

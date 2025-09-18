@@ -8,3 +8,6 @@
 [submodule "lib/fasta_validator"]
 	path = lib/fasta_validator
 	url = https://github.com/jaebeom-kim/fasta_validator.git
+[submodule "lib/yxml"]
+	path = lib/yxml
+	url = https://g.blicky.net/yxml.git

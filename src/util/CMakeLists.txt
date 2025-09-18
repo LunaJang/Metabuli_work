@@ -1,5 +1,6 @@
 set(util_source_files
         util/grade.cpp
+        util/gradeGroup.cpp
         util/database-report.cpp
         util/mapping2taxon.cpp
         util/gradeByCladeSize.cpp
