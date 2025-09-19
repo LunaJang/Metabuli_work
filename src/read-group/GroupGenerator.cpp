@@ -145,7 +145,8 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     if (par.minEdgeWeight != 0) {
         makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
     } else {
-        makeGroups(threshold, groupInfo, queryGroupInfo);    
+        // makeGroups(threshold, groupInfo, queryGroupInfo);    
+        makeGroups(90, groupInfo, queryGroupInfo);    
     }
     saveGroupsToFile(groupInfo, queryGroupInfo, metabuliResult);
     //loadGroupsFromFile(groupInfo, queryGroupInfo, outDir);
@@ -648,7 +649,7 @@ void GroupGenerator::makeGraph(
     {
         int threadIdx = omp_get_thread_num();
         size_t processedRelationCnt = 0;
-        unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> threadRelation;
+        unordered_map<uint32_t, unordered_map<uint32_t, Relation>> threadRelation;
 
         // 파일 관련 초기화
         MmapedData<uint16_t> *diffFileList = new MmapedData<uint16_t>[numOfSplits];
@@ -691,7 +692,6 @@ void GroupGenerator::makeGraph(
         }
 
         vector<uint32_t> currentQueryIds;
-        // vector<QueryKmerInfo> currentQueryInfos;
         currentQueryIds.reserve(1024);
 
         while (true) {
@@ -708,42 +708,14 @@ void GroupGenerator::makeGraph(
             if (currentKmer == UINT64_MAX) break;
 
             currentQueryIds.clear();
-            // currentQueryInfos.clear();
-            // 현재 k-mer와 동일한 k-mer를 가지는 query ID 수집
             for (size_t file = 0; file < numOfSplits; ++file) {
                 while (bufferPos[file] < kmerInfoBuffers[file].size() &&
                     kmerInfoBuffers[file][bufferPos[file]].first == currentKmer) {
                     
                     uint32_t seqId = (uint32_t) kmerInfoBuffers[file][bufferPos[file]].second.sequenceID;
-                    // #pragma omp critical 
-                    // cout << "[READ ] seqID: " << seqId
-                    // << ", kmer: " << currentKmer
-                    // << ", fileIdx: " << file << ", thread: " << threadIdx << endl;
-            
                     if (seqId != UINT32_MAX && seqId < processedReadCnt) {
                         currentQueryIds.emplace_back(seqId);
-                        // currentQueryInfos.emplace_back(kmerInfoBuffers[file][bufferPos[file]].second);
                     }
-
-                    // if (currentQueryIds.size() > 1) {
-                    //     for (size_t z = 0; z < currentQueryIds.size();z++) {
-                    //         for (size_t k = z+1; k < currentQueryIds.size();k++) {
-                    //             uint32_t a = currentQueryIds[z];
-                    //             uint32_t b = currentQueryIds[k];
-                    //             uint32_t diff = std::max(a, b) - std::min(a, b);
-                    //             if (diff > 100000 && a < 10 || b < 10) {
-                    //                 #pragma omp critical
-                    //                 {
-                    //                     cout << currentKmer << endl;
-                    //                     cout << currentQueryInfos[z].sequenceID << ", " << currentQueryInfos[z].pos << ", " << currentQueryInfos[z].frame << endl;
-                    //                     cout << currentQueryInfos[k].sequenceID << ", " << currentQueryInfos[k].pos << ", " << currentQueryInfos[k].frame << endl;
-                    //                 }
-
-                    //             }
-                    //         }
-                    //     }
-                    // }                    
-
                     bufferPos[file]++;
 
                     // 버퍼 끝이면 다시 채우기
@@ -768,10 +740,15 @@ void GroupGenerator::makeGraph(
                 for (size_t j = i+1; j < currentQueryIds.size(); ++j) {            
                     uint32_t a = min(currentQueryIds[i], currentQueryIds[j]);
                     uint32_t b = max(currentQueryIds[i], currentQueryIds[j]);
-                    if (threadRelation[a][b] == 0){
+                    if (threadRelation[a][b].weight == 0){
                         processedRelationCnt++;
+                        threadRelation[a][b].weight+=1;
+                        threadRelation[a][b].id1_shared_kmer_start = ;
+                        threadRelation[a][b].id1_shared_kmer_end = ;
+                        threadRelation[a][b].id2_shared_kmer_start = ;
+                        threadRelation[a][b].id2_shared_kmer_end = ;
+
                     }
-                    threadRelation[a][b]++;
                 }
             }
 
@@ -806,7 +783,7 @@ void GroupGenerator::makeGraph(
 }
 
 void GroupGenerator::saveSubGraphToFile(
-    const unordered_map<uint32_t, unordered_map<uint32_t, uint32_t>> &subRelation, 
+    const unordered_map<uint32_t, unordered_map<uint32_t, map<string, uint32_t>>> &subRelation, 
     const size_t counter_now) {
     const string subGraphFileName = outDir + "/subGraph_" + to_string(counter_now);
 
@@ -819,16 +796,20 @@ void GroupGenerator::saveSubGraphToFile(
     // 정렬 후 저장
     vector<tuple<uint32_t, uint32_t, uint32_t>> sortedRelations;
     for (const auto &[id1, inner_map] : subRelation) {
-        for (const auto &[id2, weight] : inner_map) {
+        for (const auto &[id2, relationInfo] : inner_map) {
             sortedRelations.emplace_back(id1, id2, weight);
         }
     }
     sort(sortedRelations.begin(), sortedRelations.end());
 
-    for (const auto &[id1, id2, weight] : sortedRelations) {
+    for (const auto &[id1, id2, weight, id1_shared_kmer_start, id1_shared_kmer_end, id2_shared_kmer_start, id2_shared_kmer_end] : sortedRelations) {
         outFile.write(reinterpret_cast<const char*>(&id1), sizeof(uint32_t));
         outFile.write(reinterpret_cast<const char*>(&id2), sizeof(uint32_t));
         outFile.write(reinterpret_cast<const char*>(&weight), sizeof(uint32_t));
+        outFile.write(reinterpret_cast<const char*>(&id1_shared_kmer_start), sizeof(uint32_t));
+        outFile.write(reinterpret_cast<const char*>(&id1_shared_kmer_end), sizeof(uint32_t));
+        outFile.write(reinterpret_cast<const char*>(&id2_shared_kmer_start), sizeof(uint32_t));
+        outFile.write(reinterpret_cast<const char*>(&id2_shared_kmer_end), sizeof(uint32_t));
     }
 
     outFile.close();
@@ -910,6 +891,7 @@ double GroupGenerator::mergeRelations(
                 } else break;
             }
         }
+        // relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
 
         // string name1 = metabuliResult[minKey.first].name;
         // string name2 = metabuliResult[minKey.second].name;
@@ -933,71 +915,56 @@ double GroupGenerator::mergeRelations(
             else
                 falseWeights.emplace_back(totalWeight);
         }
-        relationLog << minKey.first << ' ' << minKey.second << ' ' << totalWeight << '\n';
     }
     relationLog.close();
 
-    // vector<double> tempSorted = falseWeights;
-    // std::sort(tempSorted.begin(), tempSorted.end());
-    // double tempFalse = tempSorted[0];
-    // int tempFalseCnt = 0;
-    // for (int i = 0; i < tempSorted.size(); i++){
-    //     if (tempFalse == tempSorted[i]){
-    //         tempFalseCnt++;
-    //     }
-    //     else{
-    //         cout << tempFalse << ": " << tempFalseCnt << endl;
-    //         tempFalse = tempSorted[i];
-    //         tempFalseCnt = 1;
-    //     }
-    // }
-    // cout << tempFalse << ": " << tempFalseCnt << endl;
-
     if (trueWeights.size() < 10 || falseWeights.size() < 10) {
         cerr << "Insufficient true/false edges for elbow detection." << endl;
-        return 120.0;
+        return 90.0;
     }
 
+    return 90.0;
+
     // Elbow 계산 함수
-    auto findElbow = [](const vector<double>& data) -> double {
-        vector<double> sorted = data;
-        std::sort(sorted.begin(), sorted.end());
+    // auto findElbow = [](const vector<double>& data) -> double {
+    //     vector<double> sorted = data;
+    //     std::sort(sorted.begin(), sorted.end());
 
-        size_t N = sorted.size();
-        vector<double> x(N), y(N);
-        for (size_t i = 0; i < N; ++i) {
-            x[i] = sorted[i];
-            y[i] = static_cast<double>(i) / (N - 1);
-        }
+    //     size_t N = sorted.size();
+    //     vector<double> x(N), y(N);
+    //     for (size_t i = 0; i < N; ++i) {
+    //         x[i] = sorted[i];
+    //         y[i] = static_cast<double>(i) / (N - 1);
+    //     }
 
-        double x0 = x.front(), y0 = y.front();
-        double x1 = x.back(), y1 = y.back();
-        double dx = x1 - x0, dy = y1 - y0;
-        double maxDist = -1.0;
-        size_t elbowIdx = 0;
+    //     double x0 = x.front(), y0 = y.front();
+    //     double x1 = x.back(), y1 = y.back();
+    //     double dx = x1 - x0, dy = y1 - y0;
+    //     double maxDist = -1.0;
+    //     size_t elbowIdx = 0;
 
-        for (size_t i = 0; i < N; ++i) {
-            double px = x[i], py = y[i];
-            double u = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy);
-            double projx = x0 + u * dx, projy = y0 + u * dy;
-            double dist = sqrt((projx - px)*(projx - px) + (projy - py)*(projy - py));
-            if (dist > maxDist) {
-                maxDist = dist;
-                elbowIdx = i;
-            }
-        }
-        return x[elbowIdx];
-    };
+    //     for (size_t i = 0; i < N; ++i) {
+    //         double px = x[i], py = y[i];
+    //         double u = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy);
+    //         double projx = x0 + u * dx, projy = y0 + u * dy;
+    //         double dist = sqrt((projx - px)*(projx - px) + (projy - py)*(projy - py));
+    //         if (dist > maxDist) {
+    //             maxDist = dist;
+    //             elbowIdx = i;
+    //         }
+    //     }
+    //     return x[elbowIdx];
+    // };
 
-    double elbowFalse = findElbow(falseWeights);
-    double elbowTrue = findElbow(trueWeights);
-    double threshold = elbowFalse * (1.0 - thresholdK) + elbowTrue * thresholdK;
+    // double elbowFalse = findElbow(falseWeights);
+    // double elbowTrue = findElbow(trueWeights);
+    // double threshold = elbowFalse * (1.0 - thresholdK) + elbowTrue * thresholdK;
 
-    cout << "[Elbow-based thresholding]" << endl;
-    cout << "False elbow: " << elbowFalse << ", True elbow: " << elbowTrue << endl;
-    cout << "Threshold (K=" << thresholdK << "): " << threshold << endl;
-    cout << "Time: " << time(nullptr) - before << " sec" << endl;
-    return threshold;
+    // cout << "[Elbow-based thresholding]" << endl;
+    // cout << "False elbow: " << elbowFalse << ", True elbow: " << elbowTrue << endl;
+    // cout << "Threshold (K=" << thresholdK << "): " << threshold << endl;
+    // cout << "Time: " << time(nullptr) - before << " sec" << endl;
+    // return threshold;
 }
 
 

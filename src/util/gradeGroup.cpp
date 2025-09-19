@@ -27,7 +27,8 @@ struct GradeResult{
     string path;
 };
 
-void countAtRank_CAMI(unordered_map<string, unordered_map<int, vector<int>>> tax2groups, unordered_map<int, vector<int>> group2taxs, 
+void countAtRank_CAMI(const unordered_map<int, vector<int>>& tax2groupsAtRank, 
+                      const unordered_map<int, vector<int>>& group2taxs, 
                       const TaxonomyWrapper & ncbiTaxonomy, CountAtRank & count, const string & rank);
 
 void setGradeGroupDefault(LocalParameters & par){
@@ -101,13 +102,13 @@ int gradeGroup(int argc, const char **argv, const Command &command) {
     readGroupFileListFile.open(readGroupFileList);
     vector<string> readGroupFileNames;
     if (readGroupFileListFile.is_open()) {
-        while (getline(groupFileListFile, eachLine)) {
+        while (getline(readGroupFileListFile, eachLine)) {
             readGroupFileNames.push_back(eachLine);
         }
     } else {
         cerr << "Cannot open file for read group file list" << endl;
     }
-    cout << "Grouping results loaded" << endl;
+    cout << "Read-group mapping results loaded" << endl;
 
     size_t numberOfFiles = groupFileNames.size();
     vector<GradeResult> results;
@@ -159,6 +160,7 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                 cout << "Cannot open file for answer" << endl;
             }
             map.close();
+            cout << "Mapping loaded" << endl;
 
             regex regexName("(GC[AF]_[0-9]+\\.[0-9]+)");
 
@@ -177,7 +179,7 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                     continue;
                 }
 
-                vector<string> fields = Util::split(groupResultLine, "\t");     
+                vector<string> fields = Util::split(groupResultLine, " ");     
                 for (int i = 1; i < fields.size(); i++){
                     string id = fields[i];
                     if (par.testType == "gtdb") {
@@ -222,38 +224,40 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                 
                 // Parse grouping result
                 vector<string> fields = Util::split(readGroupResultLine, "\t");    
+                if (stoi(fields[1]) != -1){
                 string id = fields[0];
-                if (par.testType == "gtdb") {
-                    regex_search(id, assacc2, regexName);
-                    id = assacc2[0];
-                    // remove version number
-                    size_t pos = id.find('.');
-                    if (pos != string::npos) {
+                    if (par.testType == "gtdb") {
+                        regex_search(id, assacc2, regexName);
+                        id = assacc2[0];
+                        // remove version number
+                        size_t pos = id.find('.');
+                        if (pos != string::npos) {
+                            id = id.substr(0, pos);
+                        }
+                    } else if (par.testType == "hiv" || par.testType == "hiv-ex") {
+                        size_t pos = id.find('_');
                         id = id.substr(0, pos);
+                    } else if (par.testType == "cami" || par.testType == "cami-long" || par.testType == "cami-euk") {
+                        size_t pos = id.find('/');
+                        id = id.substr(0, pos);
+                    } else if (par.testType == "over") {
+                        regex_search(id, assacc2, regexName);
+                        id = assacc2[0];
                     }
-                } else if (par.testType == "hiv" || par.testType == "hiv-ex") {
-                    size_t pos = id.find('_');
-                    id = id.substr(0, pos);
-                } else if (par.testType == "cami" || par.testType == "cami-long" || par.testType == "cami-euk") {
-                    size_t pos = id.find('/');
-                    id = id.substr(0, pos);
-                } else if (par.testType == "over") {
-                    regex_search(id, assacc2, regexName);
-                    id = assacc2[0];
-                }
 
-                for (const string &rank: ranks_local) {
-                    tax2groups[rank][ncbiTaxonomy.getTaxIdAtRank(assacc2taxid[id], rank)].push_back(stoi(fields[1]));     
+                    for (const string &rank: ranks_local) {
+                        tax2groups[rank][ncbiTaxonomy.getTaxIdAtRank(assacc2taxid[id], rank)].push_back(stoi(fields[1]));     
+                    }
                 }
-
                 numReads++;
+
             }
             readGroupFile.close();
             
             // Score the classification
             for (const string &rank: ranks_local) {
-                countAtRank_CAMI(tax2groups, group2taxs, ncbiTaxonomy,
-                                    results[i].countsAtRanks[rank], rank);
+                countAtRank_CAMI(tax2groups[rank], group2taxs, ncbiTaxonomy,
+                                 results[i].countsAtRanks[rank], rank);
                 results[i].countsAtRanks[rank].calculate();                 
             }
 
@@ -268,21 +272,25 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
     cout << "Rank\t";
     for (size_t i = 0; i < results.size(); i++) {
         cout << "Purity\tRecall\tF1\tARI\t";
+        cout << "Purity\tRecall\tF1\t";
     }
     cout << endl;
     for (const string &rank: ranks) {
         cout << rank << "\t";
         for (auto & result : results) {
+            // cout << result.countsAtRanks[rank].purity << "\t" << result.countsAtRanks[rank].recall
+            //      << "\t" << result.countsAtRanks[rank].f1 << "\t" << result.countsAtRanks[rank].ARI << "\t";
             cout << result.countsAtRanks[rank].purity << "\t" << result.countsAtRanks[rank].recall
-                 << "\t" << result.countsAtRanks[rank].f1 << "\t" << result.countsAtRanks[rank].ARI << "\t";
+                 << "\t" << result.countsAtRanks[rank].f1 << "\t";
         }
         cout << endl;
     }
     return 0;
 }
 
-void countAtRank_CAMI(unordered_map<string, unordered_map<int, vector<int>>> tax2groups, unordered_map<int, vector<int>> group2taxs, 
-                      const TaxonomyWrapper & ncbiTaxonomy, CountAtRank & count, const string & rank) {
+void countAtRank_CAMI(const unordered_map<int, vector<int>>& tax2groupsAtRank, 
+                      const unordered_map<int, vector<int>>& group2taxs, 
+                      const TaxonomyWrapper& ncbiTaxonomy, CountAtRank& count, const string& rank) {
     // purity (number of reads with major taxonomy in each group)
     float numMajorTaxs = 0;
     float numGroupedReads = 0;
@@ -302,9 +310,9 @@ void countAtRank_CAMI(unordered_map<string, unordered_map<int, vector<int>>> tax
     count.purity = numMajorTaxs / numGroupedReads;
 
     // recall (number of reads with same taxonomy from one group containing most of the reads / number of reads with same taxonomy)
-    float sumRecall = 0;
-    float numGroups = 0;
-    for (const auto& [tax, groupIds] : tax2groups[rank]){
+    float numMajorGroup = 0;
+    float numTaxGroups = 0;
+    for (const auto& [tax, groupIds] : tax2groupsAtRank){
         std::unordered_map<TaxID, float> freq;
         for (const auto& groupId : groupIds){
             freq[groupId]++;
@@ -315,8 +323,49 @@ void countAtRank_CAMI(unordered_map<string, unordered_map<int, vector<int>>> tax
         for (auto &p : freq) {
             numMajorGroupinTax = max(numMajorGroupinTax, p.second);
         }
-        sumRecall += numMajorGroupinTax / groupIds.size();
-        numGroups++;
+        numMajorGroup += numMajorGroupinTax;
+        numTaxGroups += groupIds.size();
     }
-    count.recall = sumRecall / numGroups;
+    count.recall = numMajorGroup / numTaxGroups;
+
+    auto comb2 = [](long long n) -> long long { return (n < 2) ? 0LL : (n * (n - 1)) / 2; };
+
+    // contingency: groupId -> (labelAtRank -> count)
+    // std::unordered_map<int, std::unordered_map<int, long long>> contingency;
+    // std::unordered_map<int, long long> groupSizes;  // a_i
+    // std::unordered_map<int, long long> labelSizes;  // b_j
+    // long long N = 0;
+
+    // for (const auto& [gid, memberTaxs] : group2taxs) {
+    //     auto& row = contingency[gid];
+    //     long long gi = 0;
+    //     for (int t : memberTaxs) {
+    //         int lab = ncbiTaxonomy.getTaxIdAtRank(t, rank);
+    //         if (lab <= 0) continue;                 // unknown 제외(규칙 일관)
+    //         ++row[lab];
+    //         ++labelSizes[lab];
+    //         ++gi;
+    //     }
+    //     groupSizes[gid] += gi;
+    //     N += gi;
+    // }
+
+    // long double sum_nij2 = 0.0L, A = 0.0L, B = 0.0L;
+    // for (const auto& [gid, row] : contingency)
+    //     for (const auto& [lab, cnt] : row)
+    //         sum_nij2 += static_cast<long double>(comb2(cnt));
+
+    // for (const auto& [gid, a] : groupSizes) A += static_cast<long double>(comb2(a));
+    // for (const auto& [lab, b] : labelSizes) B += static_cast<long double>(comb2(b));
+
+    // const long double CN2 = static_cast<long double>(comb2(N));
+    // double ari = 0.0;
+    // if (CN2 > 0.0L) {
+    //     const long double expected = (A * B) / CN2;
+    //     const long double maxIndex = 0.5L * (A + B);
+    //     const long double denom = maxIndex - expected;
+    //     const long double numer = sum_nij2 - expected;
+    //     ari = (denom != 0.0L) ? static_cast<double>(numer / denom) : 0.0;
+    // }
+    // count.ARI = ari;
 }

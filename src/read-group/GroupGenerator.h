@@ -28,9 +28,11 @@
 using namespace std;
 
 struct Relation {
-    uint32_t id1;
-    uint32_t id2;
-    uint32_t weight;
+    uint32_t weight = 0;
+    uint32_t id1_shared_kmer_start = numeric_limits<uint32_t>::max();;
+    uint32_t id1_shared_kmer_end = 0;
+    uint32_t id2_shared_kmer_start = numeric_limits<uint32_t>::max();;
+    uint32_t id3_shared_kmer_end = 0;
 
     bool operator==(const Relation& other) const {
         return id1 == other.id1 && id2 == other.id2;
@@ -45,11 +47,11 @@ struct Relation {
 //     }
 // };
 
-struct relation_hash {
-    size_t operator()(const Relation& r) const {
-        return hash<uint64_t>()((static_cast<uint64_t>(r.id1) << 32) | r.id2);
-    }
-};
+// struct relation_hash {
+//     size_t operator()(const Relation& r) const {
+//         return hash<uint64_t>()((static_cast<uint64_t>(r.id1) << 32) | r.id2);
+//     }
+// };
 
 // DisjointSet class for handling union-find operations
 class DisjointSet {

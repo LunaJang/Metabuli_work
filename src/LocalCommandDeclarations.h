@@ -8,6 +8,7 @@ extern int classify(int argc, const char **argv, const Command& command);
 extern int groupGeneration(int argc, const char **argv, const Command& command);
 extern int filter(int argc, const char **argv, const Command& command);
 extern int grade(int argc, const char **argv, const Command& command);
+extern int gradeGroup(int argc, const char **argv, const Command& command);
 extern int gradeByCladeSize(int argc, const char **argv, const Command& command);
 extern int seqHeader2TaxId(int argc, const char **argv, const Command& command);
 extern int addToLibrary(int argc, const char **argv, const Command& command);
