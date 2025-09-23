@@ -93,9 +93,8 @@ public:
     PARAMETER(PARAM_OUTDIR)
 
     // Group generation
-    PARAMETER(THR_K)
     PARAMETER(MIN_EDGE_WEIGHT)
-    PARAMETER(GROUP_SCORE_THR)
+    PARAMETER(MIN_OVERLAP_RATIO)
 
     // DB build parameters
     PARAMETER(LIBRARY_PATH)
@@ -178,8 +177,7 @@ public:
     int matchPerKmer;
     int minSSMatch;
     float tieRatio;
-    float thresholdK;
-    float groupScoreThr;
+    float minOverlapRatio;
     int minEdgeWeight;
     int neighborKmers;
     int printLineage;

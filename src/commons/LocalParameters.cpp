@@ -236,13 +236,6 @@ LocalParameters::LocalParameters() :
                     typeid(std::string),
                     (void *) &outputDir,
                     "^.*$"),
-        THR_K(THR_K_ID,
-                    "--thr-k",
-                    "Min. num. of shared kmer for read grouping",
-                    "Min. num. of shared kmer for read grouping",
-                    typeid(float),
-                    (void *) &thresholdK,
-                    "^(-?(10(\\.0+)?|[0-9](\\.[0-9]+)?))$"),
         MIN_EDGE_WEIGHT(MIN_EDGE_WEIGHT_ID,
                         "--min-edge",
                         "Min. edge weight for read grouping",
@@ -250,12 +243,12 @@ LocalParameters::LocalParameters() :
                         typeid(int),
                         (void *) &minEdgeWeight,
                         "^[0-9]+$"),
-        GROUP_SCORE_THR(GROUP_SCORE_THR_ID,
-                    "--group-score-thr",
-                    "Min. score for read grouping",
-                    "Min. score for read grouping",
+        MIN_OVERLAP_RATIO(MIN_OVERLAP_RATIO_ID,
+                    "--min-ratio",
+                    "Min. shared kmer range ratio between two reads for read grouping",
+                    "Min. shared kmer range ratio between two reads for read grouping",
                     typeid(float),
-                    (void *) &groupScoreThr,
+                    (void *) &minOverlapRatio,
                     "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         LIBRARY_PATH(LIBRARY_PATH_ID,
                      "--library-path",
@@ -539,10 +532,6 @@ LocalParameters::LocalParameters() :
     minSSMatch = 0;
     tieRatio = 0;
 
-    // Group generation
-    thresholdK = 0.5;
-    groupScoreThr=0.15;
-
     // Database creation
     tinfoPath = "";
     libraryPath = "";
@@ -673,8 +662,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&SEQ_MODE);
     groupGeneration.push_back(&RAM_USAGE);
     groupGeneration.push_back(&MATCH_PER_KMER);
-    groupGeneration.push_back(&THR_K);
-    groupGeneration.push_back(&GROUP_SCORE_THR);    
+    groupGeneration.push_back(&MIN_OVERLAP_RATIO);    
     groupGeneration.push_back(&PARAM_MASK_RESIDUES);
     groupGeneration.push_back(&PARAM_MASK_PROBABILTY);
     groupGeneration.push_back(&TIE_RATIO);

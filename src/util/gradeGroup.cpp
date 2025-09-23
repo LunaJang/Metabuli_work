@@ -179,7 +179,7 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                     continue;
                 }
 
-                vector<string> fields = Util::split(groupResultLine, " ");     
+                vector<string> fields = Util::split(groupResultLine, "/t");     
                 for (int i = 1; i < fields.size(); i++){
                     string id = fields[i];
                     if (par.testType == "gtdb") {
@@ -254,7 +254,7 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
             }
             readGroupFile.close();
             
-            // Score the classification
+            // Score the groupinh
             for (const string &rank: ranks_local) {
                 countAtRank_CAMI(tax2groups[rank], group2taxs, ncbiTaxonomy,
                                  results[i].countsAtRanks[rank], rank);
@@ -271,7 +271,7 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
 
     cout << "Rank\t";
     for (size_t i = 0; i < results.size(); i++) {
-        cout << "Purity\tRecall\tF1\tARI\t";
+        // cout << "Purity\tRecall\tF1\tARI\t";
         cout << "Purity\tRecall\tF1\t";
     }
     cout << endl;

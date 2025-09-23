@@ -27,54 +27,46 @@
 #define BufferSize 16'777'216 //16 * 1024 * 1024 // 16 M
 using namespace std;
 
+struct RelationInfo {
+    uint32_t query1_shared_kmer_start_pos;
+    uint32_t query1_shared_kmer_end_pos;
+    uint32_t query2_shared_kmer_start_pos;
+    uint32_t query2_shared_kmer_end_pos;
+    uint32_t weight;
+
+    RelationInfo() : query1_shared_kmer_start_pos(UINT32_MAX), query1_shared_kmer_end_pos(0), 
+                     query2_shared_kmer_start_pos(UINT32_MAX), query2_shared_kmer_end_pos(0), 
+                     weight(0) {}
+    RelationInfo(uint32_t query1_shared_kmer_start_pos, uint32_t query1_shared_kmer_end_pos, 
+                 uint32_t query2_shared_kmer_start_pos, uint32_t query2_shared_kmer_end_pos, 
+                 uint16_t weight) : query1_shared_kmer_start_pos(query1_shared_kmer_start_pos), query1_shared_kmer_end_pos(query1_shared_kmer_end_pos), 
+                                    query2_shared_kmer_start_pos(query2_shared_kmer_start_pos), query2_shared_kmer_end_pos(query2_shared_kmer_end_pos), 
+                                    weight(weight) {}
+};
+
 struct Relation {
-    uint32_t weight = 0;
-    uint32_t id1_shared_kmer_start = numeric_limits<uint32_t>::max();;
-    uint32_t id1_shared_kmer_end = 0;
-    uint32_t id2_shared_kmer_start = numeric_limits<uint32_t>::max();;
-    uint32_t id3_shared_kmer_end = 0;
     uint32_t id1;
     uint32_t id2;
-    uint16_t weight;
+    RelationInfo info;
 
-    Relation() : id1(0), id2(0), weight(0) {}
-    Relation(uint32_t id1, uint32_t id2, uint16_t weight) : id1(id1), id2(id2), weight(weight) {}
+    Relation(uint32_t a = 0, uint32_t b = 0): id1(a), id2(b), info() {}
+    Relation(uint32_t a, uint32_t b, RelationInfo info): id1(a), id2(b), info(info) {}
+
+    static bool compare(const Relation& a, const Relation& b) {
+        if (a.id1 != b.id1) return a.id1 < b.id1;
+        return a.id2 < b.id2;
+    }
+
+    bool operator<(const Relation& other) const {
+        if (id1 != other.id1) return id1 < other.id1;
+        return id2 < other.id2;
+    }
 
     bool operator==(const Relation& other) const {
         return id1 == other.id1 && id2 == other.id2;
     }
-
-    bool operator<(const Relation& other) const {
-        if (id1 != other.id1)
-            return id1 < other.id1;
-        if (id2 != other.id2)
-            return id2 < other.id2;
-        return weight < other.weight;
-    }
-
-    static bool compare(const Relation& a, const Relation& b) {
-        if (a.id1 != b.id1)
-            return a.id1 < b.id1;
-        return a.id2 < b.id2;
-    }
-
 };
 
-// struct compareForKmerFilter {
-//     bool operator()(const QueryKmer& a, const QueryKmer& b) const {
-//         if (a.info.sequenceID != b.info.sequenceID)
-//             return a.info.sequenceID < b.info.sequenceID;
-//         return a.info.pos < b.info.pos;
-//     }
-// };
-
-// struct relation_hash {
-//     size_t operator()(const Relation& r) const {
-//         return hash<uint64_t>()((static_cast<uint64_t>(r.id1) << 32) | r.id2);
-//     }
-// };
-
-// DisjointSet class for handling union-find operations
 class DisjointSet {
 public:
     DisjointSet() {}
@@ -157,25 +149,22 @@ public:
 
     void makeGraph(size_t processedReadCnt);
     
-    void saveSubGraphToFile(
-        const unordered_map<uint64_t, uint16_t> & pair2weight,
-        const size_t counter_now);
+    void saveSubGraphToFile(const unordered_map<uint64_t, RelationInfo>& pair2info,
+                            const size_t counter_now);
 
-    double mergeRelations(size_t numOfGraph,
-                          const vector<MetabuliInfo>& metabuliResult,
-                          const double thresholdK);
-    
     void mergeTrueRelations(
         const vector<MetabuliInfo>& metabuliResult);
 
     void mergeRelations();
 
-    void makeGroups(int groupKmerThr,
+    void makeGroups(int minEdgeWeight,
+                    float minOverlapRatio,
                     unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                     vector<int> &queryGroupInfo);
 
     void makeGroupsFromSubGraphs(
-        uint32_t groupKmerThr,
+        uint32_t minEdgeWeight,
+        float minOverlapRatio,
         unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
         vector<int> &queryGroupInfo,
         const vector<MetabuliInfo>& metabuliResult);
@@ -193,15 +182,13 @@ public:
     void getRepLabel(
         vector<MetabuliInfo>& metabuliResult, 
         const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-        unordered_map<uint32_t, int> &repLabel, 
-        const float groupScoreThr);
+        unordered_map<uint32_t, int> &repLabel);
     
     void loadRepLabel(std::unordered_map<uint32_t, int> &repLabel);
 
     void applyRepLabel( 
         const vector<int> &queryGroupInfo, 
-        const unordered_map<uint32_t, int> &repLabel, 
-        const float groupScoreThr);
+        const unordered_map<uint32_t, int> &repLabel);
 
     void writeKmers(
         Buffer<Kmer>& queryKmerBuffer, 

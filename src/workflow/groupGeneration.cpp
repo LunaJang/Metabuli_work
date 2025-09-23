@@ -7,6 +7,7 @@
 void setGroupGenerationDefaults(LocalParameters & par){    
     par.neighborKmers = 0;
     par.minEdgeWeight = 0;
+    par.minOverlapRatio = 0.0;
     par.syncmer = 0;
     par.smerLen = 9;
     par.kmerFormat = 3;
@@ -20,8 +21,6 @@ void setGroupGenerationDefaults(LocalParameters & par){
     par.maskProb = 0.9;
     par.matchPerKmer = 4;
     par.tieRatio = 0.95;
-    par.thresholdK = 0.5;
-    par.groupScoreThr = 0.15;
 }
 
 int groupGeneration(int argc, const char **argv, const Command& command)
