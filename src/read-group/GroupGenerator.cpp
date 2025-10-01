@@ -113,16 +113,17 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
     vector<MetabuliInfo> metabuliResult;       
     loadMetabuliResult(metabuliResult);
-
     makeGraph(processedReadCnt);   
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, -1);
+    unordered_map<uint32_t, int> repLabel; 
     
     // Use all edges
     if (par.printLog) {
-        mergeRelations();
+        // mergeRelations();
+        mergeTrueRelations(metabuliResult);
         if (par.minEdgeWeight != 0) {
             makeGroups(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo);
         } else {
@@ -135,9 +136,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             makeGroupsFromSubGraphs(0, 0, groupInfo, queryGroupInfo, metabuliResult);    
         }
     }
-    saveGroupsToFile(groupInfo, queryGroupInfo, metabuliResult);
 
-    unordered_map<uint32_t, int> repLabel; 
     getRepLabel(metabuliResult, groupInfo, repLabel);
     applyRepLabel(queryGroupInfo, repLabel);
 
@@ -490,10 +489,26 @@ void GroupGenerator::mergeTrueRelations(const vector<MetabuliInfo>& metabuliResu
             }
         }
         if (minRelation.id1 == UINT32_MAX) break;
+
+        uint32_t query1_shared_kmer_start_pos = UINT32_MAX;
+        uint32_t query1_shared_kmer_end_pos = 0;
+        uint32_t query2_shared_kmer_start_pos = UINT32_MAX;
+        uint32_t query2_shared_kmer_end_pos = 0;
         uint32_t totalWeight = 0;
+
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] == minRelation) {
                 totalWeight += currentRelations[i].info.weight;
+                if (currentRelations[i].info.query1_shared_kmer_start_pos < query1_shared_kmer_start_pos){
+                    query1_shared_kmer_start_pos = currentRelations[i].info.query1_shared_kmer_start_pos;    
+                } else if(currentRelations[i].info.query1_shared_kmer_end_pos > query1_shared_kmer_end_pos){
+                    query1_shared_kmer_end_pos = currentRelations[i].info.query1_shared_kmer_end_pos;
+                }
+                if (currentRelations[i].info.query2_shared_kmer_start_pos < query2_shared_kmer_start_pos){
+                    query2_shared_kmer_start_pos = currentRelations[i].info.query2_shared_kmer_start_pos;    
+                } else if(currentRelations[i].info.query2_shared_kmer_end_pos > query2_shared_kmer_end_pos){
+                    query2_shared_kmer_end_pos = currentRelations[i].info.query2_shared_kmer_end_pos;
+                }
                 currentRelations[i] = relationBuffers[i]->getNext();
                 if (currentRelations[i] == Relation()) {
                     currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX);
@@ -503,7 +518,10 @@ void GroupGenerator::mergeTrueRelations(const vector<MetabuliInfo>& metabuliResu
         std::string name1 = metabuliResult[minRelation.id1].name.substr(0, 15);
         std::string name2 = metabuliResult[minRelation.id2].name.substr(0, 15);
         if (name1 == name2) {
-            relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
+            relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' 
+            << query1_shared_kmer_end_pos - query1_shared_kmer_start_pos << '\t' 
+            << query2_shared_kmer_end_pos - query2_shared_kmer_start_pos << '\t' 
+            << totalWeight << '\n';
         }
     }
     relationLog.close();
@@ -539,11 +557,13 @@ void GroupGenerator::mergeRelations() {
             }
         }
         if (minRelation.id1 == UINT32_MAX) break;
+        
         uint32_t query1_shared_kmer_start_pos = UINT32_MAX;
         uint32_t query1_shared_kmer_end_pos = 0;
         uint32_t query2_shared_kmer_start_pos = UINT32_MAX;
         uint32_t query2_shared_kmer_end_pos = 0;
         uint32_t totalWeight = 0;
+
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] == minRelation) {
                 totalWeight += currentRelations[i].info.weight;
@@ -820,6 +840,7 @@ void GroupGenerator::getRepLabel(
             }
         }
 
+        // WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, 0.5);
         WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, 0.5);
 
         if (result.taxon != 0 && result.taxon != 1) {
