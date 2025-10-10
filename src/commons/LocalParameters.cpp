@@ -691,7 +691,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MIN_VOTE_SCORE);
     groupGeneration.push_back(&SCORE_COL);
     groupGeneration.push_back(&WEIGHT_MODE);
- 
+
 
     // filter 
     filter.push_back(&PARAM_THREADS);

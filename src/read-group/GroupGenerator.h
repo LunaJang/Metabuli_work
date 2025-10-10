@@ -147,9 +147,6 @@ public:
                            Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
                            const string & db="");
 
-    void filterCommonKmers2(Buffer<Kmer>& queryKmerBuffer,
-                           Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
-                           const string & db="");
 
     void makeGraph(size_t processedReadCnt);
     
@@ -161,13 +158,13 @@ public:
 
     void mergeRelations();
 
-    void makeGroups(int minEdgeWeight,
-                    float minOverlapRatio,
+    void makeGroups(int groupKmerThr,
+                    double minOverlapRatio,
                     unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                     vector<int> &queryGroupInfo);
 
     void makeGroupsFromSubGraphs(
-        uint32_t minEdgeWeight,
+        int groupKmerThr,
         float minOverlapRatio,
         unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
         vector<int> &queryGroupInfo,
@@ -186,7 +183,8 @@ public:
     void getRepLabel(
         vector<MetabuliInfo>& metabuliResult, 
         const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-        unordered_map<uint32_t, int> &repLabel);
+        unordered_map<uint32_t, int> &repLabel,
+        const float minVoteScr);
     
     void loadRepLabel(std::unordered_map<uint32_t, int> &repLabel);
 

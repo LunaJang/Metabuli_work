@@ -111,9 +111,9 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         } 
     }   
 
+    makeGraph(processedReadCnt);   
     vector<MetabuliInfo> metabuliResult;       
     loadMetabuliResult(metabuliResult);
-    makeGraph(processedReadCnt);   
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
@@ -123,13 +123,12 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     // Use all edges
     if (par.printLog) {
         mergeRelations();
-        makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
+        makeGroups(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo);
     } else {
-        makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, metabuliResult);
+        makeGroupsFromSubGraphs(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo, metabuliResult);
     }
     saveGroupsToFile(groupInfo, queryGroupInfo, metabuliResult);
-    unordered_map<uint32_t, int> repLabel; 
-    getRepLabel(metabuliResult, groupInfo, repLabel);
+    getRepLabel(metabuliResult, groupInfo, repLabel, par.minVoteScr);
     applyRepLabel(queryGroupInfo, repLabel);
 
     // Use only true edges
@@ -138,29 +137,19 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     queryGroupInfo.clear();
     repLabel.clear();
     if (par.printLog) {
-        mergeTrueRelations(metabuliResult);
-        if (par.minEdgeWeight != 0) {
-            makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
-        } else {
-            makeGroups(132, groupInfo, queryGroupInfo);    
-        }
+        mergeTrueRelations(metabuliResult);        
+        makeGroups(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo);
     } else {
-        if (par.minEdgeWeight != 0) {
-            makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, metabuliResult);
-        } else {
-            makeGroupsFromSubGraphs(132, groupInfo, queryGroupInfo, metabuliResult);    
-        }
+        makeGroupsFromSubGraphs(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo, metabuliResult);
     }
-    getRepLabel(metabuliResult, groupInfo, repLabel, groupScoreThr);
-    applyRepLabel(queryGroupInfo, repLabel, groupScoreThr);
+    getRepLabel(metabuliResult, groupInfo, repLabel, par.minVoteScr);
+    applyRepLabel(queryGroupInfo, repLabel);
 
 }
 
-void GroupGenerator::filterCommonKmers(
-    Buffer<Kmer> & qKmers,
-    Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
-    const string & commonKmerDB
-) {
+void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
+                                       Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
+                                       const string & commonKmerDB) {
     string gtdbListDB;
     std::string diffIdxFileName = commonKmerDB +"/diffIdx";
     std::string diffIdxSplitFileName = commonKmerDB + "/split";
@@ -344,9 +333,7 @@ void GroupGenerator::filterCommonKmers(
     cout << "Filtered k-mer number  : " << queryKmerIdx - blankCnt << endl;
 }
 
-void GroupGenerator::makeGraph(
-    size_t processedReadCnt
-) {
+void GroupGenerator::makeGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
 
@@ -380,8 +367,8 @@ void GroupGenerator::makeGraph(
                 }
             }
             if (minKmer == UINT64_MAX) break;
+            
             currentQueryIds.clear();
-
             for (size_t file = 0; file < this->numOfSplits; ++file) {
                 while (currentKmers[file].value == minKmer) {
                     QueryKmerInfo kmerInfo = currentKmers[file].qInfo; // query ID is stored in taxId field
@@ -470,9 +457,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, RelationIn
     fclose(outFile);
 }
 
-void GroupGenerator::mergeTrueRelations(
-    const vector<MetabuliInfo>& metabuliResult
-) {
+void GroupGenerator::mergeTrueRelations(const vector<MetabuliInfo>& metabuliResult) {
     cout << "Merging only true edges" << endl;
     time_t before = time(nullptr);
     ofstream relationLog(outDir + "/allRelations.txt");
@@ -527,8 +512,8 @@ void GroupGenerator::mergeTrueRelations(
         std::string name2 = metabuliResult[minRelation.id2].name.substr(0, 15);
         if (name1 == name2) {
             relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' 
-            << query1_shared_kmer_end_pos - query1_shared_kmer_start_pos << '\t' 
-            << query2_shared_kmer_end_pos - query2_shared_kmer_start_pos << '\t' 
+            << query1_shared_kmer_end_pos - query1_shared_kmer_start_pos + 12 << '\t' 
+            << query2_shared_kmer_end_pos - query2_shared_kmer_start_pos + 12 << '\t' 
             << totalWeight << '\n';
         }
     }
@@ -541,7 +526,7 @@ void GroupGenerator::mergeTrueRelations(
 }
 
 void GroupGenerator::mergeRelations() {
-    cout << "Merging query relations" << endl;
+    cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
     ofstream relationLog(outDir + "/allRelations.txt");
     if (!relationLog.is_open()) {
@@ -606,13 +591,11 @@ void GroupGenerator::mergeRelations() {
     return;
 }
 
-void GroupGenerator::makeGroupsFromSubGraphs(
-    uint32_t minEdgeWeight,
-    float minOverlapRatio,
-    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-    vector<int> &queryGroupInfo,
-    const vector<MetabuliInfo>& metabuliResult
-) {
+void GroupGenerator::makeGroupsFromSubGraphs(int groupKmerThr,
+                                             float minOverlapRatio,
+                                             unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+                                             vector<int> &queryGroupInfo,
+                                             const vector<MetabuliInfo>& metabuliResult) {
     cout << "Make groups from subgraphs." << endl;
     time_t before = time(nullptr);
     DisjointSet ds;
@@ -649,7 +632,7 @@ void GroupGenerator::makeGroupsFromSubGraphs(
             if (name1 != name2) continue;
         }
         
-        if (totalWeight > minEdgeWeight) {
+        if (totalWeight > static_cast<uint32_t>(groupKmerThr)) {
             if (ds.parent.find(minRelation.id1) == ds.parent.end()) ds.makeSet(minRelation.id1);
             if (ds.parent.find(minRelation.id2) == ds.parent.end()) ds.makeSet(minRelation.id2);
             ds.unionSets(minRelation.id1, minRelation.id2);
@@ -673,8 +656,8 @@ void GroupGenerator::makeGroupsFromSubGraphs(
     cout << "Time spent: " << double(time(nullptr) - before) << " seconds." << endl;
 }
 
-void GroupGenerator::makeGroups(int minEdgeWeight,
-                                float minOverlapRatio,
+void GroupGenerator::makeGroups(int groupKmerThr,
+                                double minOverlapRatio,
                                 unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                                 vector<int> &queryGroupInfo) {
     cout << "Creating groups from relation file..." << endl;
@@ -689,14 +672,20 @@ void GroupGenerator::makeGroups(int minEdgeWeight,
     DisjointSet ds;
 
     uint32_t id1, id2, id1SharedRange, id2SharedRange, weight;
-    float overlapRatio;
+    double overlapRatio;
     while (file >> id1 >> id2 >> id1SharedRange >> id2SharedRange >> weight) {
-        if (id1SharedRange > id2SharedRange) overlapRatio = static_cast<float>(id2SharedRange) / id1SharedRange;
-        else overlapRatio = static_cast<float>(id1SharedRange) / id2SharedRange;
-        if (overlapRatio > minOverlapRatio && weight > minEdgeWeight ) {
+        const double a = static_cast<double>(id1SharedRange);
+        const double b = static_cast<double>(id2SharedRange);
+        overlapRatio = (a > b) ? (b / a) : (a / b);
+
+        // if (overlapRatio >= minOverlapRatio && static_cast<int>(weight) > groupKmerThr) {
+        if (static_cast<int>(weight) > groupKmerThr) {
             if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
             if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
             ds.unionSets(id1, id2);
+        }
+        else if (overlapRatio < minOverlapRatio){
+            cout << overlapRatio << " " << minOverlapRatio << endl;
         }
     }
 
@@ -715,10 +704,9 @@ void GroupGenerator::makeGroups(int minEdgeWeight,
 
 
 
-void GroupGenerator::saveGroupsToFile(
-    const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-    const vector<int> &queryGroupInfo, 
-    const vector<MetabuliInfo>& metabuliResult) {
+void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+                                      const vector<int> &queryGroupInfo, 
+                                      const vector<MetabuliInfo>& metabuliResult) {
     // save group in txt file
     const string& groupInfoFileName = outDir + "/groups";
     ofstream outFile1(groupInfoFileName);
@@ -823,11 +811,10 @@ void GroupGenerator::loadMetabuliResult(vector<MetabuliInfo>& metabuliResult) {
 
 
 
-void GroupGenerator::getRepLabel(
-    vector<MetabuliInfo> &metabuliResult, 
-    const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-    unordered_map<uint32_t, int> &repLabel
-) {
+void GroupGenerator::getRepLabel(vector<MetabuliInfo> &metabuliResult, 
+                                 const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+                                 unordered_map<uint32_t, int> &repLabel,
+                                 const float minScr) {
     cout << "Find query group representative labels..." << endl;    
     time_t beforeSearch = time(nullptr);
 
@@ -843,7 +830,7 @@ void GroupGenerator::getRepLabel(
         for (const auto& queryId : queryIds) {
             int query_label = external2internalTaxId[metabuliResult[queryId].label]; 
             float score = metabuliResult[queryId].score;
-            if (query_label != 0 && score >= par.minVoteScr) {
+            if (query_label != 0 && score >= minScr) {
                 setTaxa.emplace_back(query_label, score, 2); // 2 => vote mode
             }
         }
@@ -951,10 +938,10 @@ void GroupGenerator::applyRepLabel(
                 // LCA successed
                 if (repLabelIt->second != 0) {
                     if (fields[0] == "0") {
-                        fields[0] = "1";
-                        fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
-                        fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
                     }
+                    fields[0] = "1";
+                    fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
+                    fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
                 }
             }
         }
