@@ -55,8 +55,8 @@ LocalParameters::LocalParameters() :
                      "[0-1]"),
         SYNCMER(SYNCMER_ID,
                 "--syncmer",
-                "Using syncmer (k = 8, s = 6)",
-                "Using syncmer (k = 8, s = 6)",
+                "Using syncmer",
+                "Using syncmer",
                 typeid(int),
                 (void *) &syncmer,
                 "[0-1]"),
@@ -214,7 +214,7 @@ LocalParameters::LocalParameters() :
                 "Discard common k-mer's neighbors",
                 typeid(int),
                 (void *) &neighborKmers,
-                "[0-2]"),
+                "[0-4]"),
         TARGET_TAX_ID(TARGET_TAX_ID_ID,
                "--tax-id",
                "Tax. ID of clade to be extracted",
@@ -243,6 +243,13 @@ LocalParameters::LocalParameters() :
                         typeid(int),
                         (void *) &minEdgeWeight,
                         "^[0-9]+$"),
+        MIN_VOTE_SCORE(MIN_VOTE_SCORE_ID,
+                    "--min-vote-score",
+                    "Min. classification score to vote.",
+                    "Min. classification score to vote.",
+                    typeid(float),
+                    (void *) &minVoteScr,
+                    "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         MIN_OVERLAP_RATIO(MIN_OVERLAP_RATIO_ID,
                     "--min-ratio",
                     "Min. shared kmer range ratio between two reads for read grouping",
@@ -250,6 +257,20 @@ LocalParameters::LocalParameters() :
                     typeid(float),
                     (void *) &minOverlapRatio,
                     "^0(\\.[0-9]+)?|1(\\.0+)?$"),
+        SCORE_COL(SCORE_COL_ID,
+                  "--score-col",
+                  "Score column index (1-based).",
+                  "Score column index (1-based).",
+                  typeid(int),
+                  (void *) &scoreCol,
+                  "^[0-9]+$"),
+        WEIGHT_MODE(WEIGHT_MODE_ID,
+                    "--weight-mode",
+                    "Majority LCA weight mode.",
+                    "Majority LCA weight mode. 0:uniform, 1:score, 2:score squared",
+                    typeid(int),
+                    (void *) &weightMode,
+                    "[0-2]"),
         LIBRARY_PATH(LIBRARY_PATH_ID,
                      "--library-path",
                      "Path to library where the FASTA files are stored",
@@ -308,8 +329,8 @@ LocalParameters::LocalParameters() :
                 "^.*$"),
         CDS_INFO(CDS_INFO_ID,
                  "--cds-info",
-                 "List of CDS files",
-                 "List of CDS files",
+                 "List of CDS files. Set 'x' for six-frame translation.",
+                 "List of CDS files. Set 'x' for six-frame translation.",
                  typeid(std::string),
                  (void *) &cdsInfo,
                  "^.*$"),
@@ -369,20 +390,6 @@ LocalParameters::LocalParameters() :
                   typeid(int),
                   (void *) &taxidCol,
                   "^[0-9]+$"),
-        SCORE_COL(SCORE_COL_ID,
-                  "--score-col",
-                  "Column number of score in classification result",
-                  "Column number of score in classification result",
-                  typeid(int),
-                  (void *) &scoreCol,
-                  "^[0-9]+$"),
-        COVERAGE_COL(COVERAGE_COL_ID,
-                     "--coverage-col",
-                     "Column number of coverage in classification result",
-                     "Column number of coverage in classification result",
-                     typeid(int),
-                     (void *) &coverageCol,
-                     "^[0-9]+$"),
         PRINT_COLUMNS(PRINT_COLUMNS_ID,
                       "--print-columns",
                       "CSV of columns to print",
@@ -549,7 +556,6 @@ LocalParameters::LocalParameters() :
     readIdCol = 0;
     taxidCol = 0;
     scoreCol = 0;
-    coverageCol = 0;
     cladeRank = "";
     skipSecondary = 0;
 
@@ -599,6 +605,16 @@ LocalParameters::LocalParameters() :
     build.push_back(&SYNCMER);
     build.push_back(&SMER_LEN);
     build.push_back(&REDUCED_AA);
+
+    createCommonKmerList.push_back(&PARAM_THREADS);
+    createCommonKmerList.push_back(&PARAM_MASK_PROBABILTY);
+    createCommonKmerList.push_back(&PARAM_MASK_RESIDUES);
+    createCommonKmerList.push_back(&RAM_USAGE);
+    createCommonKmerList.push_back(&SYNCMER);
+    createCommonKmerList.push_back(&SMER_LEN);
+    createCommonKmerList.push_back(&GTDB);
+    createCommonKmerList.push_back(&CDS_INFO);
+    createCommonKmerList.push_back(&KMER_FORMAT);
 
 
     // updateDB
@@ -665,14 +681,17 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);    
     groupGeneration.push_back(&PARAM_MASK_RESIDUES);
     groupGeneration.push_back(&PARAM_MASK_PROBABILTY);
-    groupGeneration.push_back(&TIE_RATIO);
-    groupGeneration.push_back(&KMER_FORMAT);
     groupGeneration.push_back(&VALIDATE_INPUT);
     groupGeneration.push_back(&SYNCMER);
     groupGeneration.push_back(&SMER_LEN);
     groupGeneration.push_back(&MIN_EDGE_WEIGHT);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
     groupGeneration.push_back(&PRINT_LOG);
+    groupGeneration.push_back(&PARAM_MAJORITY);
+    groupGeneration.push_back(&MIN_VOTE_SCORE);
+    groupGeneration.push_back(&SCORE_COL);
+    groupGeneration.push_back(&WEIGHT_MODE);
+ 
 
     // filter 
     filter.push_back(&PARAM_THREADS);
@@ -707,7 +726,6 @@ LocalParameters::LocalParameters() :
     grade.push_back(&TAXID_COL);
     grade.push_back(&PARAM_V);
     grade.push_back(&SCORE_COL);
-    grade.push_back(&COVERAGE_COL);
     grade.push_back(&PRINT_COLUMNS);
     grade.push_back(&CLADE_RANK);
     grade.push_back(&SKIP_SECONDARY);

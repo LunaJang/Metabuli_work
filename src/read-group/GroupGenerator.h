@@ -147,6 +147,10 @@ public:
                            Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
                            const string & db="");
 
+    void filterCommonKmers2(Buffer<Kmer>& queryKmerBuffer,
+                           Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
+                           const string & db="");
+
     void makeGraph(size_t processedReadCnt);
     
     void saveSubGraphToFile(const unordered_map<uint64_t, RelationInfo>& pair2info,

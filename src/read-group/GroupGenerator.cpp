@@ -44,7 +44,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     size_t processedReadCnt = 0;
     size_t tries = 0;
     size_t totalSeqCnt = 0;
-    
+
     // Extract k-mers from query sequences and compare them to target k-mer DB
     while (!complete) {
         tries++;
@@ -122,35 +122,47 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     
     // Use all edges
     if (par.printLog) {
-        // mergeRelations();
-        mergeTrueRelations(metabuliResult);
-        if (par.minEdgeWeight != 0) {
-            makeGroups(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo);
-        } else {
-            makeGroups(0, 0, groupInfo, queryGroupInfo);    
-        }
+        mergeRelations();
+        makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
     } else {
-        if (par.minEdgeWeight != 0) {
-            makeGroupsFromSubGraphs(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo, metabuliResult);
-        } else {
-            makeGroupsFromSubGraphs(0, 0, groupInfo, queryGroupInfo, metabuliResult);    
-        }
+        makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, metabuliResult);
     }
-
+    saveGroupsToFile(groupInfo, queryGroupInfo, metabuliResult);
+    unordered_map<uint32_t, int> repLabel; 
     getRepLabel(metabuliResult, groupInfo, repLabel);
     applyRepLabel(queryGroupInfo, repLabel);
 
-    return;
+    // Use only true edges
+    useOnlyTrueRelations = true;
+    groupInfo.clear();
+    queryGroupInfo.clear();
+    repLabel.clear();
+    if (par.printLog) {
+        mergeTrueRelations(metabuliResult);
+        if (par.minEdgeWeight != 0) {
+            makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
+        } else {
+            makeGroups(132, groupInfo, queryGroupInfo);    
+        }
+    } else {
+        if (par.minEdgeWeight != 0) {
+            makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, metabuliResult);
+        } else {
+            makeGroupsFromSubGraphs(132, groupInfo, queryGroupInfo, metabuliResult);    
+        }
+    }
+    getRepLabel(metabuliResult, groupInfo, repLabel, groupScoreThr);
+    applyRepLabel(queryGroupInfo, repLabel, groupScoreThr);
+
 }
 
 void GroupGenerator::filterCommonKmers(
     Buffer<Kmer> & qKmers,
     Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
-    const string & commonKmerDB) {
-    // cout << "Filtering common k-mers from query k-mer buffer... ";
+    const string & commonKmerDB
+) {
     string gtdbListDB;
     std::string diffIdxFileName = commonKmerDB +"/diffIdx";
-    std::string infoFileName    = commonKmerDB + "/info";
     std::string diffIdxSplitFileName = commonKmerDB + "/split";
 
     size_t blankCnt = std::find_if(qKmers.buffer,
@@ -204,17 +216,15 @@ void GroupGenerator::filterCommonKmers(
     #pragma omp parallel default(none), shared(matchBuffer, commonKmerDB, querySplits, qKmers, cout)
     {
         Buffer<std::pair<uint32_t, uint32_t>> localMatches(1024 * 1024 * 2);  // 16 Mb <queryID, pos>
-        DeltaIdxReader * deltaIdxReaders 
-            = new DeltaIdxReader(commonKmerDB + "/diffIdx",
-                                 commonKmerDB + "/info", 
-                                 1024 * 1024, 1024 * 1024);
+        KmerDbReader * kmerDbReader
+            = new KmerDbReader(commonKmerDB + "/diffIdx", 1024 * 1024, 1024 * 1024);
         std::vector<std::pair<uint32_t, uint32_t>> tempMatches;  
         bool hasOverflow = false;
     
         #pragma omp for schedule(dynamic, 1)
         for (size_t i = 0; i < querySplits.size(); i++) {
-            deltaIdxReaders->setReadPosition(querySplits[i].diffIdxSplit);
-            Kmer tKmer = deltaIdxReaders->next();
+            kmerDbReader->setReadPosition(querySplits[i].diffIdxSplit);
+            uint64_t tKmer = kmerDbReader->next();
             Kmer qKmer(UINT64_MAX, 0);
             for (size_t j = querySplits[i].start; j < querySplits[i].end + 1; j++) {
                 // Reuse the AA matches if queries are identical
@@ -239,17 +249,17 @@ void GroupGenerator::filterCommonKmers(
                 qKmer = qKmers.buffer[j];
 
                 // Skip target k-mers lexiocographically smaller
-                while (!deltaIdxReaders->isCompleted() && qKmer.value > tKmer.value) {
-                    tKmer = deltaIdxReaders->next();
+                while (!kmerDbReader->isCompleted() && qKmer.value > tKmer) {
+                    tKmer = kmerDbReader->next();
                 }
 
                 // No match found - skip to the next query
-                if (qKmer.value != tKmer.value) { continue; } 
+                if (qKmer.value != tKmer) { continue; } 
 
                 // Match found - load target k-mers matching at amino acid level
-                while (!deltaIdxReaders->isCompleted() && qKmer.value == tKmer.value) {
+                while (!kmerDbReader->isCompleted() && qKmer.value == tKmer) {
                     tempMatches.emplace_back((uint32_t) qKmer.qInfo.sequenceID, (uint32_t) qKmer.qInfo.pos);
-                    tKmer = deltaIdxReaders->next();                                      
+                    tKmer = kmerDbReader->next();                                      
                 }
 
                 if (unlikely(!localMatches.afford(tempMatches.size()))) {
@@ -458,13 +468,11 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, RelationIn
     sort(relations.begin(), relations.end(), Relation::compare);
     fwrite(relations.data(), sizeof(Relation), relations.size(), outFile);
     fclose(outFile);
-    #pragma omp critical
-    {
-        cout << "Query sub-graph saved to " << subGraphFileName << " successfully." << endl;
-    }
 }
 
-void GroupGenerator::mergeTrueRelations(const vector<MetabuliInfo>& metabuliResult) {
+void GroupGenerator::mergeTrueRelations(
+    const vector<MetabuliInfo>& metabuliResult
+) {
     cout << "Merging only true edges" << endl;
     time_t before = time(nullptr);
     ofstream relationLog(outDir + "/allRelations.txt");
@@ -835,13 +843,12 @@ void GroupGenerator::getRepLabel(
         for (const auto& queryId : queryIds) {
             int query_label = external2internalTaxId[metabuliResult[queryId].label]; 
             float score = metabuliResult[queryId].score;
-            if (query_label != 0) {
+            if (query_label != 0 && score >= par.minVoteScr) {
                 setTaxa.emplace_back(query_label, score, 2); // 2 => vote mode
             }
         }
 
-        // WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, 0.5);
-        WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, 0.5);
+        WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, par.majorityThr);
 
         if (result.taxon != 0 && result.taxon != 1) {
             repLabel[groupId] = result.taxon;

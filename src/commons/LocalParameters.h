@@ -49,6 +49,7 @@ public:
     std::vector<MMseqsParameter*> buildUnirefDb;
     std::vector<MMseqsParameter*> buildUnirefTree;
     std::vector<MMseqsParameter*> assignUniref;
+    std::vector<MMseqsParameter*> createCommonKmerList;
 
     // UniRef
     PARAMETER(UNIREF_NUMBERS)
@@ -94,6 +95,11 @@ public:
 
     // Group generation
     PARAMETER(MIN_EDGE_WEIGHT)
+    PARAMETER(MIN_VOTE_SCORE)
+    PARAMETER(SCORE_COL)
+    PARAMETER(WEIGHT_MODE)
+    int weightMode;
+
     PARAMETER(MIN_OVERLAP_RATIO)
 
     // DB build parameters
@@ -113,13 +119,12 @@ public:
     // DB updated parameters
     PARAMETER(NEW_TAXA)
 
-    // Test parameters
+    //  parameters
     PARAMETER(TEST_RANK)
     PARAMETER(TEST_TYPE)
     PARAMETER(READID_COL)
     PARAMETER(TAXID_COL)
-    PARAMETER(SCORE_COL)
-    PARAMETER(COVERAGE_COL)
+
     PARAMETER(PRINT_COLUMNS)
     PARAMETER(CLADE_RANK)
     PARAMETER(SKIP_SECONDARY)
@@ -177,6 +182,8 @@ public:
     int matchPerKmer;
     int minSSMatch;
     float tieRatio;
+    float thresholdK;
+    float minVoteScr;
     float minOverlapRatio;
     int minEdgeWeight;
     int neighborKmers;
@@ -214,7 +221,6 @@ public:
     int readIdCol;
     int taxidCol;
     int scoreCol;
-    int coverageCol;
     std::string cladeRank;
     int skipSecondary;
 
