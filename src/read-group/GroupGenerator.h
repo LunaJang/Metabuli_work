@@ -105,7 +105,7 @@ public:
     unordered_map<uint32_t, uint32_t> rank;
 };
 
-struct MetabuliInfo {
+struct OrgResult {
     int label;
     float score;
     string name;
@@ -126,9 +126,12 @@ protected:
     QueryIndexer *queryIndexer;
     KmerExtractor *kmerExtractor;
     Reporter *reporter;    
-    // KmerMatcher * kmerMatcher;
     TaxonomyWrapper *taxonomy;
-    // KmerFileHandler *kmerFileHandler;
+
+    // Output
+    string updatedResultFileName;
+    string updatedReportFileName;
+    unordered_map<TaxID, unsigned int> taxCounts;
     
     unordered_map<TaxID, TaxID> taxId2speciesId;
     unordered_map<TaxID, TaxID> taxId2genusId;
@@ -154,7 +157,7 @@ public:
                             const size_t counter_now);
 
     void mergeTrueRelations(
-        const vector<MetabuliInfo>& metabuliResult);
+        const vector<OrgResult>& metabuliResult);
 
     void mergeRelations();
 
@@ -168,20 +171,20 @@ public:
         float minOverlapRatio,
         unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
         vector<int> &queryGroupInfo,
-        const vector<MetabuliInfo>& metabuliResult);
+        const vector<OrgResult>& metabuliResult);
 
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                           const vector<int> &queryGroupInfo,
-                          const vector<MetabuliInfo>& metabuliResult);
+                          const vector<OrgResult>& metabuliResult);
 
     void loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
                        vector<int> &queryGroupInfo,
                        const string &groupFileDir);
 
-    void loadMetabuliResult(vector<MetabuliInfo>& metabuliResult);
+    void loadOrgResult(vector<OrgResult>& metabuliResult);
 
     void getRepLabel(
-        vector<MetabuliInfo>& metabuliResult, 
+        vector<OrgResult>& metabuliResult, 
         const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
         unordered_map<uint32_t, int> &repLabel,
         const float minVoteScr);

@@ -22,7 +22,10 @@ GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     queryIndexer = new QueryIndexer(par);
     queryIndexer->setKmerLen(12);
     kmerExtractor = new KmerExtractor(par, *geneticCode, kmerFormat);
-    reporter = new Reporter(par, taxonomy);
+    updatedResultFileName = outDir + "/updated_classifications.tsv";
+    updatedReportFileName = outDir + "/updated_report.tsv";
+
+    reporter = new Reporter(par, taxonomy, updatedReportFileName);
     // kmerFileHandler = new KmerFileHandler();
 }
 
@@ -112,8 +115,8 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     }   
 
     makeGraph(processedReadCnt);   
-    vector<MetabuliInfo> metabuliResult;       
-    loadMetabuliResult(metabuliResult);
+    vector<OrgResult> orgResult;       
+    loadOrgResult(orgResult);
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<int> queryGroupInfo;
@@ -125,26 +128,28 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         mergeRelations();
         makeGroups(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo);
     } else {
-        makeGroupsFromSubGraphs(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo, metabuliResult);
+        makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, orgResult);
     }
-    saveGroupsToFile(groupInfo, queryGroupInfo, metabuliResult);
-    getRepLabel(metabuliResult, groupInfo, repLabel, par.minVoteScr);
+    // saveGroupsToFile(groupInfo, queryGroupInfo, orgResult);
+    unordered_map<uint32_t, int> repLabel; 
+    getRepLabel(orgResult, groupInfo, repLabel);
     applyRepLabel(queryGroupInfo, repLabel);
+
+    // reporter->writeReportFile(totalSeqCnt, taxCounts, ReportType::Default);
 
     // Use only true edges
-    useOnlyTrueRelations = true;
-    groupInfo.clear();
-    queryGroupInfo.clear();
-    repLabel.clear();
-    if (par.printLog) {
-        mergeTrueRelations(metabuliResult);        
-        makeGroups(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo);
-    } else {
-        makeGroupsFromSubGraphs(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo, metabuliResult);
-    }
-    getRepLabel(metabuliResult, groupInfo, repLabel, par.minVoteScr);
-    applyRepLabel(queryGroupInfo, repLabel);
-
+    // useOnlyTrueRelations = true;
+    // groupInfo.clear();
+    // queryGroupInfo.clear();
+    // repLabel.clear();
+    // if (par.printLog) {
+    //     mergeTrueRelations(orgResult);
+    //     makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
+    // } else {
+    //     makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, orgResult);
+    // }
+    // getRepLabel(orgResult, groupInfo, repLabel);
+    // applyRepLabel(queryGroupInfo, repLabel);
 }
 
 void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
@@ -283,46 +288,40 @@ void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
     // Filter neighbor k-mers
     here = time(nullptr);
     std::cout << "Filtering common k-mers: " << std::flush;
-    size_t queryKmerIdx = blankCnt;
-    int targetKmerPosIdx = 0;
-    size_t queryKmerIdx_copy = blankCnt;
-    while (queryKmerIdx_copy < qKmers.startIndexOfReserve) {
-        if (targetKmerPosIdx < matchBuffer.startIndexOfReserve) {
+    size_t storePos = blankCnt;
+    size_t lookingPos = blankCnt;
+    size_t matchIdx = 0;
+    while (lookingPos < qKmers.startIndexOfReserve) {
+        if (matchIdx < matchBuffer.startIndexOfReserve) {
             // copy
-            if (qKmers.buffer[queryKmerIdx_copy].qInfo.sequenceID < matchBuffer.buffer[targetKmerPosIdx].first){
-                qKmers.buffer[queryKmerIdx] = qKmers.buffer[queryKmerIdx_copy];
-                queryKmerIdx++;
-                queryKmerIdx_copy++;
+            if (qKmers.buffer[lookingPos].qInfo.sequenceID < matchBuffer.buffer[matchIdx].first){
+                qKmers.buffer[storePos++] = qKmers.buffer[lookingPos++];
             }
             // next target check
-            else if(qKmers.buffer[queryKmerIdx_copy].qInfo.sequenceID > matchBuffer.buffer[targetKmerPosIdx].first){
-                targetKmerPosIdx++;
+            else if(qKmers.buffer[lookingPos].qInfo.sequenceID > matchBuffer.buffer[matchIdx].first){
+                matchIdx++;
             }
             // same seq
             else{
                 // copy
-                if (int64_t(qKmers.buffer[queryKmerIdx_copy].qInfo.pos) < int(matchBuffer.buffer[targetKmerPosIdx].second) - par.neighborKmers){
-                    qKmers.buffer[queryKmerIdx] = qKmers.buffer[queryKmerIdx_copy];
-                    queryKmerIdx++;
-                    queryKmerIdx_copy++;
+                if (int64_t(qKmers.buffer[lookingPos].qInfo.pos) < int(matchBuffer.buffer[matchIdx].second) - par.neighborKmers){
+                    qKmers.buffer[storePos++] = qKmers.buffer[lookingPos++];
                 }
                 // next target check
-                else if(int(matchBuffer.buffer[targetKmerPosIdx].second) + par.neighborKmers < int64_t(qKmers.buffer[queryKmerIdx_copy].qInfo.pos)){
-                    targetKmerPosIdx++;
+                else if(int(matchBuffer.buffer[matchIdx].second) + par.neighborKmers < int64_t(qKmers.buffer[lookingPos].qInfo.pos)){
+                    matchIdx++;
                 }
                 // pass
                 else{
-                    queryKmerIdx_copy++;
+                    lookingPos++;
                 }
             }            
         }
         else{
-            qKmers.buffer[queryKmerIdx] = qKmers.buffer[queryKmerIdx_copy];
-            queryKmerIdx++;
-            queryKmerIdx_copy++;
+            qKmers.buffer[storePos++] = qKmers.buffer[lookingPos++];
         }
     }
-    qKmers.startIndexOfReserve = size_t(queryKmerIdx);
+    qKmers.startIndexOfReserve = size_t(storePos);
     cout << double(time(nullptr) - here) << " s" << endl;
     
     // sort buffer by kmer
@@ -330,7 +329,7 @@ void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
     SORT_PARALLEL(qKmers.buffer, qKmers.buffer + qKmers.startIndexOfReserve, Kmer::compareQueryKmer);
     secondSort = time(nullptr) - secondSort;    
     cout << "Query k-mer sorting (2): " << double(secondSort) << " s" << endl;
-    cout << "Filtered k-mer number  : " << queryKmerIdx - blankCnt << endl;
+    cout << "Filtered k-mer number  : " << storePos - blankCnt << endl;
 }
 
 void GroupGenerator::makeGraph(size_t processedReadCnt) {
@@ -423,7 +422,9 @@ void GroupGenerator::makeGraph(size_t processedReadCnt) {
         }
         if (!pair2info.empty()) {
             size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
-            saveSubGraphToFile(pair2info, counter_now);
+            saveSubGraphToFile(pair2weight, counter_now);
+        } else {
+            cout << "Thread " << threadIdx << " has no relations to write." << endl;
         }
         for (size_t file = 0; file < this->numOfSplits; file++) {
             delete deltaIdxInfoReaders[file];
@@ -457,10 +458,13 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, RelationIn
     fclose(outFile);
 }
 
-void GroupGenerator::mergeTrueRelations(const vector<MetabuliInfo>& metabuliResult) {
+void GroupGenerator::mergeTrueRelations(
+    const vector<OrgResult>& metabuliResult
+) {
     cout << "Merging only true edges" << endl;
     time_t before = time(nullptr);
-    ofstream relationLog(outDir + "/allRelations.txt");
+    ofstream relationLog(outDir + "/allRelations_true.txt");
+    ofstream falseEdgeFile(outDir + "/falseEdges.txt");
     if (!relationLog.is_open()) {
         cerr << "Failed to open relation log file." << endl;
         return;
@@ -511,13 +515,13 @@ void GroupGenerator::mergeTrueRelations(const vector<MetabuliInfo>& metabuliResu
         std::string name1 = metabuliResult[minRelation.id1].name.substr(0, 15);
         std::string name2 = metabuliResult[minRelation.id2].name.substr(0, 15);
         if (name1 == name2) {
-            relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' 
-            << query1_shared_kmer_end_pos - query1_shared_kmer_start_pos + 12 << '\t' 
-            << query2_shared_kmer_end_pos - query2_shared_kmer_start_pos + 12 << '\t' 
-            << totalWeight << '\n';
+            relationLog << minRelation.id1 << ' ' << minRelation.id2 << ' ' << totalWeight << '\n';
+        } else {
+            falseEdgeFile << minRelation.id1 << ' ' << minRelation.id2 << ' ' << totalWeight << '\n';
         }
     }
     relationLog.close();
+    falseEdgeFile.close();
     for (size_t i = 0; i < numOfGraph; ++i) {
         delete relationBuffers[i];
     }
@@ -591,11 +595,12 @@ void GroupGenerator::mergeRelations() {
     return;
 }
 
-void GroupGenerator::makeGroupsFromSubGraphs(int groupKmerThr,
-                                             float minOverlapRatio,
-                                             unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                             vector<int> &queryGroupInfo,
-                                             const vector<MetabuliInfo>& metabuliResult) {
+void GroupGenerator::makeGroupsFromSubGraphs(
+    uint32_t groupKmerThr,
+    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+    vector<int> &queryGroupInfo,
+    const vector<OrgResult>& metabuliResult
+) {
     cout << "Make groups from subgraphs." << endl;
     time_t before = time(nullptr);
     DisjointSet ds;
@@ -663,9 +668,16 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     cout << "Creating groups from relation file..." << endl;
     time_t beforeSearch = time(nullptr);
 
-    ifstream file(outDir + "/allRelations.txt");
+    string fileName;
+    if (useOnlyTrueRelations) {
+        fileName = outDir + "/allRelations_true.txt";
+    } else {
+        fileName = outDir + "/allRelations.txt";
+    }
+
+    ifstream file(fileName);
     if (!file.is_open()) {
-        cerr << "Failed to open relation file: " << outDir + "/allRelations.txt" << endl;
+        cerr << "Failed to open relation file: " << fileName << endl;
         return;
     }
 
@@ -704,9 +716,11 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
 
 
-void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                      const vector<int> &queryGroupInfo, 
-                                      const vector<MetabuliInfo>& metabuliResult) {
+void GroupGenerator::saveGroupsToFile(
+    const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+    const vector<int> &queryGroupInfo, 
+    const vector<OrgResult>& metabuliResult
+) {
     // save group in txt file
     const string& groupInfoFileName = outDir + "/groups";
     ofstream outFile1(groupInfoFileName);
@@ -786,32 +800,42 @@ void GroupGenerator::loadGroupsFromFile(unordered_map<uint32_t, unordered_set<ui
 }
 
 
-void GroupGenerator::loadMetabuliResult(vector<MetabuliInfo>& metabuliResult) {
+void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
     ifstream inFile(orgRes);
     if (!inFile.is_open()) {
         cerr << "Error opening file: " << orgRes << endl;
         return;
     }
 
-    string line;
-    while (getline(inFile, line)) {
-        stringstream ss(line);
-        int label, query_label, read_length;
-        float score;
-        string query_name; 
-
-        ss >> label >> query_name >> query_label >> read_length >> score;
-
-        metabuliResult.push_back({query_label, score, query_name});
+    int classificationCol = par.taxidCol - 1; 
+    if (par.weightMode == 0) {
+        string line;
+        while (getline(inFile, line)) {
+            if (line.empty()) continue;
+            if (line.front() == '#') continue;
+            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
+            TaxID taxId = stoi(columns[classificationCol]);
+            orgResults.push_back({taxId, 1.0, columns[1]});
+        }
+    } else {
+        int scoreCol = par.scoreCol - 1; 
+        string line;
+        while (getline(inFile, line)) {
+            if (line.empty()) continue;
+            if (line.front() == '#') continue;
+            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
+            TaxID taxId = stoi(columns[classificationCol]);
+            float score = stof(columns[scoreCol]);
+            orgResults.push_back({taxId, score, columns[1]});
+        }
     }
-
     inFile.close();
     cout << "Original Metabuli result loaded from " << orgRes << " successfully." << endl;
 }
 
 
 
-void GroupGenerator::getRepLabel(vector<MetabuliInfo> &metabuliResult, 
+void GroupGenerator::getRepLabel(vector<OrgResult> &metabuliResult, 
                                  const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
                                  unordered_map<uint32_t, int> &repLabel,
                                  const float minScr) {
@@ -829,9 +853,21 @@ void GroupGenerator::getRepLabel(vector<MetabuliInfo> &metabuliResult,
 
         for (const auto& queryId : queryIds) {
             int query_label = external2internalTaxId[metabuliResult[queryId].label]; 
-            float score = metabuliResult[queryId].score;
-            if (query_label != 0 && score >= minScr) {
-                setTaxa.emplace_back(query_label, score, 2); // 2 => vote mode
+            if (par.weightMode == 0) {
+                float score = 1; 
+                if (query_label != 0) {
+                    setTaxa.emplace_back(query_label, score, 2);
+                }
+            } else if (par.weightMode == 1) {
+                float score = metabuliResult[queryId].score;
+                if (query_label != 0 && score >= par.minVoteScr) {
+                    setTaxa.emplace_back(query_label, score, 2);
+                }
+            } else if (par.weightMode == 2) {
+                float score = metabuliResult[queryId].score;
+                if (query_label != 0 && score >= par.minVoteScr) {
+                    setTaxa.emplace_back(query_label, score * score, 2);
+                }
             }
         }
 
@@ -904,14 +940,12 @@ void GroupGenerator::applyRepLabel(
         return;
     }
 
-
-    string resultFileName = outDir + "/updated_classifications.tsv";
     if (useOnlyTrueRelations) {
-        resultFileName = outDir + "/updated_classifications_true.tsv";
+        updatedResultFileName = outDir + "/updated_classifications_true.tsv";
     }
-    ofstream outFile(resultFileName);
+    ofstream outFile(updatedResultFileName);
     if (!outFile.is_open()) {
-        cerr << "Error opening file: " << resultFileName << endl;
+        cerr << "Error opening file: " << updatedResultFileName << endl;
         return;
     }
 
@@ -1037,8 +1071,8 @@ void GroupGenerator::writeKmers(
         uint64_t lastKmer = 0;
         for (size_t i = startIdx; i < endIdx; i++) {
             queryKmerBuffer.buffer[i].qInfo.sequenceID += processedReadCnt;
-            queryKmerBuffer.buffer[i].qInfo.sequenceID = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID - 1);
-            infoBuffer.write(&queryKmerBuffer.buffer[i].qInfo);
+            uint32_t id = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID - 1);
+            infoBuffer.write(&id);
             IndexCreator::getDiffIdx(lastKmer, queryKmerBuffer.buffer[i].value, diffBuffer);
         }
         infoBuffer.flush();
