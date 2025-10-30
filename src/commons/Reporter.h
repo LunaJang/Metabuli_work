@@ -10,7 +10,7 @@
 #include <cstdint>
 using namespace std;
 
-enum class ReportType { Default, EM, EM_RECLASSIFY };
+enum class ReportType { Default, EM, EM_RECLASSIFY, Grouping };
 class Reporter {
 private:
     const LocalParameters & par;
@@ -64,7 +64,9 @@ public:
 
     // Read by read classification results
     void openReadClassificationFile();
+    void openReadClassificationFile(const std::string fileName);
     void writeReadClassification(const vector<Query> & queryList, bool classifiedOnly = false);
+    void writeReadClassification(const vector<Query> & queryList, const vector<uint32_t>& groupIdList, bool classifiedOnly = false);
     void closeReadClassificationFile();
 
     void freeMappingWriteBuffer() {

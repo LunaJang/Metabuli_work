@@ -122,11 +122,11 @@ protected:
     int kmerFormat;
     
     // Agents    
-    GeneticCode * geneticCode;
-    QueryIndexer *queryIndexer;
-    KmerExtractor *kmerExtractor;
-    Reporter *reporter;    
-    TaxonomyWrapper *taxonomy;
+    GeneticCode * geneticCode = nullptr;
+    QueryIndexer *queryIndexer = nullptr;
+    KmerExtractor *kmerExtractor = nullptr;
+    Reporter *reporter = nullptr;
+    TaxonomyWrapper *taxonomy = nullptr;
 
     // Output
     string updatedResultFileName;
@@ -157,50 +157,50 @@ public:
                             const size_t counter_now);
 
     void mergeTrueRelations(
-        const vector<OrgResult>& metabuliResult);
+        const vector<OrgResult>& orgResults);
 
     void mergeRelations();
 
     void makeGroups(int groupKmerThr,
-                    double minOverlapRatio,
-                    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                    vector<int> &queryGroupInfo);
+                    unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+                    vector<uint32_t> &queryGroupInfo);
 
     void makeGroupsFromSubGraphs(
-        int groupKmerThr,
-        float minOverlapRatio,
-        unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-        vector<int> &queryGroupInfo,
-        const vector<OrgResult>& metabuliResult);
+        uint32_t groupKmerThr,
+        unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+        vector<uint32_t> &queryGroupInfo,
+        const vector<OrgResult>& orgResults);
 
-    void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                          const vector<int> &queryGroupInfo,
-                          const vector<OrgResult>& metabuliResult);
+    void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+                          const vector<uint32_t>& queryGroupInfo,
+                          const vector<OrgResult>& orgResults);
 
-    void loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
-                       vector<int> &queryGroupInfo,
-                       const string &groupFileDir);
+    void loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
+                       vector<uint32_t>& queryGroupInfo,
+                       const string& groupFileDir);
 
-    void loadOrgResult(vector<OrgResult>& metabuliResult);
+    void loadOrgResult(vector<OrgResult>& orgResults);
 
     void getRepLabel(
-        vector<OrgResult>& metabuliResult, 
-        const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-        unordered_map<uint32_t, int> &repLabel,
-        const float minVoteScr);
+        vector<OrgResult>& orgResults, 
+        const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+        unordered_map<uint32_t, uint32_t>& repLabel,
+        std::unordered_map<int, int>& external2internalTaxId);
     
-    void loadRepLabel(std::unordered_map<uint32_t, int> &repLabel);
+    void loadRepLabel(std::unordered_map<uint32_t, uint32_t>& repLabel);
 
     void applyRepLabel( 
-        const vector<int> &queryGroupInfo, 
-        const unordered_map<uint32_t, int> &repLabel);
+        const vector<OrgResult>& orgResults, 
+        const vector<uint32_t>& queryGroupInfo, 
+        const unordered_map<uint32_t, uint32_t>& repLabel,
+        std::unordered_map<int, int>& external2internalTaxId);
 
     void writeKmers(
         Buffer<Kmer>& queryKmerBuffer, 
         size_t processedReadCnt);
 
     std::vector<std::pair<size_t, size_t>> getKmerRanges(
-        const Buffer<Kmer> & kmerBuffer, 
+        const Buffer<Kmer>& kmerBuffer, 
         size_t offset);
 
     ~GroupGenerator();

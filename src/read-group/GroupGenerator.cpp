@@ -25,7 +25,7 @@ GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     updatedResultFileName = outDir + "/updated_classifications.tsv";
     updatedReportFileName = outDir + "/updated_report.tsv";
 
-    reporter = new Reporter(par, taxonomy, updatedReportFileName);
+    reporter = new Reporter(par, taxonomy);
     // kmerFileHandler = new KmerFileHandler();
 }
 
@@ -119,37 +119,23 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     loadOrgResult(orgResult);
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
-    vector<int> queryGroupInfo;
-    queryGroupInfo.resize(processedReadCnt, -1);
-    unordered_map<uint32_t, int> repLabel; 
+    vector<uint32_t> queryGroupInfo;
+    queryGroupInfo.resize(processedReadCnt, 0);
     
     // Use all edges
     if (par.printLog) {
         mergeRelations();
-        makeGroups(par.minEdgeWeight, par.minOverlapRatio, groupInfo, queryGroupInfo);
+        makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
     } else {
         makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, orgResult);
     }
-    // saveGroupsToFile(groupInfo, queryGroupInfo, orgResult);
-    unordered_map<uint32_t, int> repLabel; 
-    getRepLabel(orgResult, groupInfo, repLabel);
-    applyRepLabel(queryGroupInfo, repLabel);
+    saveGroupsToFile(groupInfo, queryGroupInfo, orgResult);
 
-    // reporter->writeReportFile(totalSeqCnt, taxCounts, ReportType::Default);
-
-    // Use only true edges
-    // useOnlyTrueRelations = true;
-    // groupInfo.clear();
-    // queryGroupInfo.clear();
-    // repLabel.clear();
-    // if (par.printLog) {
-    //     mergeTrueRelations(orgResult);
-    //     makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
-    // } else {
-    //     makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, orgResult);
-    // }
-    // getRepLabel(orgResult, groupInfo, repLabel);
-    // applyRepLabel(queryGroupInfo, repLabel);
+    std::unordered_map<int, int> external2internalTaxId;
+    taxonomy->getExternal2internalTaxID(external2internalTaxId);
+    unordered_map<uint32_t, uint32_t> repLabel; 
+    getRepLabel(orgResult, groupInfo, repLabel, external2internalTaxId);
+    applyRepLabel(orgResult, queryGroupInfo, repLabel, external2internalTaxId);
 }
 
 void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
@@ -387,18 +373,7 @@ void GroupGenerator::makeGraph(size_t processedReadCnt) {
             for (size_t i = 0; i < currentQueryIds.size(); ++i) {
                 for (size_t j = i + 1; j < currentQueryIds.size(); ++j) {        
                     if (currentQueryIds[i].first == currentQueryIds[j].first) continue;
-
                     uint64_t pairKey = (static_cast<uint64_t>(currentQueryIds[i].first) << 32) | currentQueryIds[j].first;
-                    if (pair2info[pairKey].query1_shared_kmer_start_pos > currentQueryIds[i].second){
-                        pair2info[pairKey].query1_shared_kmer_start_pos = currentQueryIds[i].second;    
-                    } else if(pair2info[pairKey].query1_shared_kmer_end_pos < currentQueryIds[i].second){
-                        pair2info[pairKey].query1_shared_kmer_end_pos = currentQueryIds[i].second;
-                    }
-                    if (pair2info[pairKey].query2_shared_kmer_start_pos > currentQueryIds[j].second){
-                        pair2info[pairKey].query2_shared_kmer_start_pos = currentQueryIds[j].second;   
-                    } else if(pair2info[pairKey].query2_shared_kmer_end_pos < currentQueryIds[j].second){
-                        pair2info[pairKey].query2_shared_kmer_end_pos = currentQueryIds[j].second;
-                    }
                 }
             }       
 
@@ -422,7 +397,7 @@ void GroupGenerator::makeGraph(size_t processedReadCnt) {
         }
         if (!pair2info.empty()) {
             size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
-            saveSubGraphToFile(pair2weight, counter_now);
+            saveSubGraphToFile(pair2info, counter_now);
         } else {
             cout << "Thread " << threadIdx << " has no relations to write." << endl;
         }
@@ -459,7 +434,7 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, RelationIn
 }
 
 void GroupGenerator::mergeTrueRelations(
-    const vector<OrgResult>& metabuliResult
+    const vector<OrgResult>& orgResults
 ) {
     cout << "Merging only true edges" << endl;
     time_t before = time(nullptr);
@@ -487,33 +462,18 @@ void GroupGenerator::mergeTrueRelations(
         }
         if (minRelation.id1 == UINT32_MAX) break;
 
-        uint32_t query1_shared_kmer_start_pos = UINT32_MAX;
-        uint32_t query1_shared_kmer_end_pos = 0;
-        uint32_t query2_shared_kmer_start_pos = UINT32_MAX;
-        uint32_t query2_shared_kmer_end_pos = 0;
         uint32_t totalWeight = 0;
-
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] == minRelation) {
                 totalWeight += currentRelations[i].info.weight;
-                if (currentRelations[i].info.query1_shared_kmer_start_pos < query1_shared_kmer_start_pos){
-                    query1_shared_kmer_start_pos = currentRelations[i].info.query1_shared_kmer_start_pos;    
-                } else if(currentRelations[i].info.query1_shared_kmer_end_pos > query1_shared_kmer_end_pos){
-                    query1_shared_kmer_end_pos = currentRelations[i].info.query1_shared_kmer_end_pos;
-                }
-                if (currentRelations[i].info.query2_shared_kmer_start_pos < query2_shared_kmer_start_pos){
-                    query2_shared_kmer_start_pos = currentRelations[i].info.query2_shared_kmer_start_pos;    
-                } else if(currentRelations[i].info.query2_shared_kmer_end_pos > query2_shared_kmer_end_pos){
-                    query2_shared_kmer_end_pos = currentRelations[i].info.query2_shared_kmer_end_pos;
-                }
                 currentRelations[i] = relationBuffers[i]->getNext();
                 if (currentRelations[i] == Relation()) {
                     currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX);
                 }
             }
         }
-        std::string name1 = metabuliResult[minRelation.id1].name.substr(0, 15);
-        std::string name2 = metabuliResult[minRelation.id2].name.substr(0, 15);
+        std::string name1 = orgResults[minRelation.id1].name.substr(0, 15);
+        std::string name2 = orgResults[minRelation.id2].name.substr(0, 15);
         if (name1 == name2) {
             relationLog << minRelation.id1 << ' ' << minRelation.id2 << ' ' << totalWeight << '\n';
         } else {
@@ -555,25 +515,11 @@ void GroupGenerator::mergeRelations() {
         }
         if (minRelation.id1 == UINT32_MAX) break;
         
-        uint32_t query1_shared_kmer_start_pos = UINT32_MAX;
-        uint32_t query1_shared_kmer_end_pos = 0;
-        uint32_t query2_shared_kmer_start_pos = UINT32_MAX;
-        uint32_t query2_shared_kmer_end_pos = 0;
         uint32_t totalWeight = 0;
 
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] == minRelation) {
                 totalWeight += currentRelations[i].info.weight;
-                if (currentRelations[i].info.query1_shared_kmer_start_pos < query1_shared_kmer_start_pos){
-                    query1_shared_kmer_start_pos = currentRelations[i].info.query1_shared_kmer_start_pos;    
-                } else if(currentRelations[i].info.query1_shared_kmer_end_pos > query1_shared_kmer_end_pos){
-                    query1_shared_kmer_end_pos = currentRelations[i].info.query1_shared_kmer_end_pos;
-                }
-                if (currentRelations[i].info.query2_shared_kmer_start_pos < query2_shared_kmer_start_pos){
-                    query2_shared_kmer_start_pos = currentRelations[i].info.query2_shared_kmer_start_pos;    
-                } else if(currentRelations[i].info.query2_shared_kmer_end_pos > query2_shared_kmer_end_pos){
-                    query2_shared_kmer_end_pos = currentRelations[i].info.query2_shared_kmer_end_pos;
-                }
                 currentRelations[i] = relationBuffers[i]->getNext();
                 if (currentRelations[i] == Relation()) {
                     currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX);
@@ -581,8 +527,6 @@ void GroupGenerator::mergeRelations() {
             }
         }
         relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' 
-                    << query1_shared_kmer_end_pos - query1_shared_kmer_start_pos << '\t' 
-                    << query2_shared_kmer_end_pos - query2_shared_kmer_start_pos << '\t' 
                     << totalWeight << '\n';
     }
     relationLog.close();
@@ -598,8 +542,8 @@ void GroupGenerator::mergeRelations() {
 void GroupGenerator::makeGroupsFromSubGraphs(
     uint32_t groupKmerThr,
     unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-    vector<int> &queryGroupInfo,
-    const vector<OrgResult>& metabuliResult
+    vector<uint32_t> &queryGroupInfo,
+    const vector<OrgResult>& orgResults
 ) {
     cout << "Make groups from subgraphs." << endl;
     time_t before = time(nullptr);
@@ -632,8 +576,8 @@ void GroupGenerator::makeGroupsFromSubGraphs(
         }
 
         if (useOnlyTrueRelations) { // Only for development purpose
-            std::string name1 = metabuliResult[minRelation.id1].name.substr(0, 15);
-            std::string name2 = metabuliResult[minRelation.id2].name.substr(0, 15);
+            std::string name1 = orgResults[minRelation.id1].name.substr(0, 15);
+            std::string name2 = orgResults[minRelation.id2].name.substr(0, 15);
             if (name1 != name2) continue;
         }
         
@@ -654,7 +598,7 @@ void GroupGenerator::makeGroupsFromSubGraphs(
         if (queryId >= queryGroupInfo.size()) {
             queryGroupInfo.resize(queryId + 1, -1);
         }
-        queryGroupInfo[queryId] = static_cast<int>(groupId);
+        queryGroupInfo[queryId] = groupId;
     }
 
     cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
@@ -662,9 +606,8 @@ void GroupGenerator::makeGroupsFromSubGraphs(
 }
 
 void GroupGenerator::makeGroups(int groupKmerThr,
-                                double minOverlapRatio,
                                 unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                vector<int> &queryGroupInfo) {
+                                vector<uint32_t> &queryGroupInfo) {
     cout << "Creating groups from relation file..." << endl;
     time_t beforeSearch = time(nullptr);
 
@@ -683,21 +626,12 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
     DisjointSet ds;
 
-    uint32_t id1, id2, id1SharedRange, id2SharedRange, weight;
-    double overlapRatio;
-    while (file >> id1 >> id2 >> id1SharedRange >> id2SharedRange >> weight) {
-        const double a = static_cast<double>(id1SharedRange);
-        const double b = static_cast<double>(id2SharedRange);
-        overlapRatio = (a > b) ? (b / a) : (a / b);
-
-        // if (overlapRatio >= minOverlapRatio && static_cast<int>(weight) > groupKmerThr) {
+    uint32_t id1, id2, weight;
+    while (file >> id1 >> id2 >> weight) {
         if (static_cast<int>(weight) > groupKmerThr) {
             if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
             if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
             ds.unionSets(id1, id2);
-        }
-        else if (overlapRatio < minOverlapRatio){
-            cout << overlapRatio << " " << minOverlapRatio << endl;
         }
     }
 
@@ -718,8 +652,8 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
 void GroupGenerator::saveGroupsToFile(
     const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-    const vector<int> &queryGroupInfo, 
-    const vector<OrgResult>& metabuliResult
+    const vector<uint32_t> &queryGroupInfo, 
+    const vector<OrgResult>& orgResults
 ) {
     // save group in txt file
     const string& groupInfoFileName = outDir + "/groups";
@@ -732,7 +666,7 @@ void GroupGenerator::saveGroupsToFile(
     for (const auto& [groupId, queryIds] : groupInfo) {
         outFile1 << groupId << "\t";
         for (const auto& queryId : queryIds) {
-            outFile1 << metabuliResult[queryId].name << "\t";
+            outFile1 << orgResults[queryId].name << "\t";
         }
         outFile1 << endl;
     }
@@ -748,7 +682,7 @@ void GroupGenerator::saveGroupsToFile(
     }
 
     for (size_t i = 0; i < queryGroupInfo.size(); ++i) {
-        outFile2 << metabuliResult[i].name << "\t" << queryGroupInfo[i] << "\n";
+        outFile2 << orgResults[i].name << "\t" << queryGroupInfo[i] << "\n";
     }
     outFile2.close();
     cout << "Query group saved to " << queryGroupInfoFileName << " successfully." << endl;
@@ -757,7 +691,7 @@ void GroupGenerator::saveGroupsToFile(
 }
 
 void GroupGenerator::loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
-                                        vector<int> &queryGroupInfo,
+                                        vector<uint32_t> &queryGroupInfo,
                                         const string &groupFileDir) {
     const string groupInfoFileName = groupFileDir + "/groups";
     const string queryGroupInfoFileName = groupFileDir + "/queryGroupMap";
@@ -808,7 +742,8 @@ void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
     }
 
     int classificationCol = par.taxidCol - 1; 
-    if (par.weightMode == 0) {
+    int scoreCol = par.scoreCol - 1; 
+    if (par.weightMode == 0 || scoreCol < 0) {
         string line;
         while (getline(inFile, line)) {
             if (line.empty()) continue;
@@ -818,7 +753,6 @@ void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
             orgResults.push_back({taxId, 1.0, columns[1]});
         }
     } else {
-        int scoreCol = par.scoreCol - 1; 
         string line;
         while (getline(inFile, line)) {
             if (line.empty()) continue;
@@ -831,19 +765,17 @@ void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
     }
     inFile.close();
     cout << "Original Metabuli result loaded from " << orgRes << " successfully." << endl;
+    cout << "Number of query result in " << orgRes << " " <<orgResults.size() << endl;
 }
 
 
 
-void GroupGenerator::getRepLabel(vector<OrgResult> &metabuliResult, 
+void GroupGenerator::getRepLabel(vector<OrgResult> &orgResults, 
                                  const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                 unordered_map<uint32_t, int> &repLabel,
-                                 const float minScr) {
+                                 unordered_map<uint32_t, uint32_t> &repLabel,
+                                 std::unordered_map<int, int>& external2internalTaxId) {
     cout << "Find query group representative labels..." << endl;    
     time_t beforeSearch = time(nullptr);
-
-    std::unordered_map<int, int> external2internalTaxId;
-    taxonomy->getExternal2internalTaxID(external2internalTaxId);
 
     for (const auto& group : groupInfo) {
         uint32_t groupId = group.first;
@@ -852,19 +784,19 @@ void GroupGenerator::getRepLabel(vector<OrgResult> &metabuliResult,
         vector<WeightedTaxHit> setTaxa;
 
         for (const auto& queryId : queryIds) {
-            int query_label = external2internalTaxId[metabuliResult[queryId].label]; 
+            int query_label = external2internalTaxId[orgResults[queryId].label]; 
             if (par.weightMode == 0) {
                 float score = 1; 
                 if (query_label != 0) {
                     setTaxa.emplace_back(query_label, score, 2);
                 }
             } else if (par.weightMode == 1) {
-                float score = metabuliResult[queryId].score;
+                float score = orgResults[queryId].score;
                 if (query_label != 0 && score >= par.minVoteScr) {
                     setTaxa.emplace_back(query_label, score, 2);
                 }
             } else if (par.weightMode == 2) {
-                float score = metabuliResult[queryId].score;
+                float score = orgResults[queryId].score;
                 if (query_label != 0 && score >= par.minVoteScr) {
                     setTaxa.emplace_back(query_label, score * score, 2);
                 }
@@ -899,7 +831,7 @@ void GroupGenerator::getRepLabel(vector<OrgResult> &metabuliResult,
 }
 
 void GroupGenerator::loadRepLabel(
-    std::unordered_map<uint32_t, int> &repLabel
+    std::unordered_map<uint32_t, uint32_t> &repLabel
 ) {
     const std::string groupRepFileName = outDir + "/groupRep";
     std::ifstream inFile(groupRepFileName);
@@ -929,70 +861,31 @@ void GroupGenerator::loadRepLabel(
 }
 
 void GroupGenerator::applyRepLabel(
-    const vector<int> &queryGroupInfo, 
-    const unordered_map<uint32_t, int> &repLabel) {
+    const vector<OrgResult>& orgResults, 
+    const vector<uint32_t>& queryGroupInfo, 
+    const unordered_map<uint32_t, uint32_t>& repLabel,
+    std::unordered_map<int, int>& external2internalTaxId) {
     cout << "Apply query group representative labels..." << endl;    
     time_t beforeSearch = time(nullptr);
 
-    ifstream inFile(orgRes);
-    if (!inFile.is_open()) {
-        cerr << "Error opening file: " << orgRes << endl;
-        return;
-    }
+    vector<Query> queryList;
 
-    if (useOnlyTrueRelations) {
-        updatedResultFileName = outDir + "/updated_classifications_true.tsv";
-    }
-    ofstream outFile(updatedResultFileName);
-    if (!outFile.is_open()) {
-        cerr << "Error opening file: " << updatedResultFileName << endl;
-        return;
-    }
+    for (int queryIdx = 0; queryIdx < orgResults.size() ; queryIdx++){
+        uint32_t groupId = queryGroupInfo[queryIdx];
+        auto repLabelIt = repLabel.find(groupId);
+        if (repLabelIt != repLabel.end()){
+            queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, repLabelIt->second, orgResults[queryIdx].name));
+        } else{
+            queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, orgResults[queryIdx].label, orgResults[queryIdx].name));           
 
-    string line;
-    uint32_t queryIdx = 0;
-    while (getline(inFile, line)) {
-        stringstream ss(line);
-        vector<string> fields;
-        string field;
-
-        while (getline(ss, field, '\t')) {
-            fields.emplace_back(field);
         }
+    }    
 
-        while (fields.size() < 8) {
-                fields.emplace_back("-");
-        }
-        
-        int groupId = queryGroupInfo[queryIdx];
-        if (groupId != -1){
-            fields[7] = to_string(groupId);
-            auto repLabelIt = repLabel.find(groupId);
-            if (repLabelIt != repLabel.end()){
-                // LCA successed
-                if (repLabelIt->second != 0) {
-                    if (fields[0] == "0") {
-                    }
-                    fields[0] = "1";
-                    fields[2] = to_string(taxonomy->getOriginalTaxID(repLabelIt->second));
-                    fields[5] = taxonomy->getString(taxonomy->taxonNode(repLabelIt->second)->rankIdx);
-                }
-            }
-        }
-        for (size_t i = 0; i < fields.size(); ++i) {
-            outFile << fields[i]; 
-            if (i < fields.size() - 1) {  
-                outFile << "\t";
-            }
-        }
-        outFile << endl;
-        queryIdx++;
-    }
-
-    inFile.close();
-    outFile.close();
+    reporter->openReadClassificationFile(updatedResultFileName);
+    reporter->writeReadClassification(queryList, queryGroupInfo);    
+    reporter->closeReadClassificationFile();
     
-    cout << "Result saved to " << outDir << " successfully." << endl;    
+    cout << "Result saved to " << updatedResultFileName << " successfully." << endl;    
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
@@ -1067,7 +960,7 @@ void GroupGenerator::writeKmers(
         size_t startIdx = queryKmerRanges[threadId].first;
         size_t endIdx = queryKmerRanges[threadId].second;
         WriteBuffer<uint16_t> diffBuffer(this->outDir + "/kmer_delta_" + to_string(this->numOfSplits) + "_" + to_string(threadId), 1024 * 1024);
-        WriteBuffer<QueryKmerInfo> infoBuffer(this->outDir + "/kmer_info_"  + to_string(this->numOfSplits) + "_" + to_string(threadId), 1024 * 1024);
+        WriteBuffer<uint32_t> infoBuffer(this->outDir + "/kmer_info_"  + to_string(this->numOfSplits) + "_" + to_string(threadId), 1024 * 1024);
         uint64_t lastKmer = 0;
         for (size_t i = startIdx; i < endIdx; i++) {
             queryKmerBuffer.buffer[i].qInfo.sequenceID += processedReadCnt;

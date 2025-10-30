@@ -54,17 +54,6 @@ int gradeGroup(int argc, const char **argv, const Command &command) {
         ranks = {"class", "order", "family", "genus", "species"};
     }
 
-    // Parse print columns
-    vector<string> printColumns;
-    vector<size_t> printColumnsIdx;
-    if (!par.printColumns.empty()) {
-        printColumns = Util::split(par.printColumns, ",");
-        // stoi
-        for (const auto &printColumn : printColumns) {
-            printColumnsIdx.push_back(stoi(printColumn));
-        }
-    }
-
     // Load Taxonomy
     string names = taxonomy + "/names.dmp";
     string nodes = taxonomy + "/nodes.dmp";
@@ -119,7 +108,7 @@ int gradeGroup(int argc, const char **argv, const Command &command) {
 #endif
 
 #pragma omp parallel default(none), shared(results, ranks, numberOfFiles, mappingFileNames, groupFileNames,readGroupFileNames,\
-par, cout, printColumnsIdx, cerr, names, nodes, merged)
+par, cout, cerr, names, nodes, merged)
     {
         // Grade each file
         unordered_map<string, int> assacc2taxid;
@@ -178,8 +167,7 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                 if (groupResultLine.empty()) {
                     continue;
                 }
-
-                vector<string> fields = Util::split(groupResultLine, "/t");     
+                vector<string> fields = Util::split(groupResultLine, "\t");  
                 for (int i = 1; i < fields.size(); i++){
                     string id = fields[i];
                     if (par.testType == "gtdb") {
@@ -224,7 +212,7 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                 
                 // Parse grouping result
                 vector<string> fields = Util::split(readGroupResultLine, "\t");    
-                if (stoi(fields[1]) != -1){
+                if (stoi(fields[1]) != 0){
                 string id = fields[0];
                     if (par.testType == "gtdb") {
                         regex_search(id, assacc2, regexName);

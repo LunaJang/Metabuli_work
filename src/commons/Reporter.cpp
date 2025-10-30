@@ -31,6 +31,9 @@ Reporter::Reporter(const LocalParameters &par, TaxonomyWrapper *taxonomy, const 
 void Reporter::openReadClassificationFile() {
     readClassificationFile.open(readClassificationFileName);
 }
+void Reporter::openReadClassificationFile(const std::string fileName) {
+    readClassificationFile.open(fileName);
+}
 
 void Reporter::writeReadClassification(const vector<Query> & queryList, bool classifiedOnly) {
     if (isFirstTime) {
@@ -70,6 +73,64 @@ void Reporter::writeReadClassification(const vector<Query> & queryList, bool cla
                 << queryList[i].queryLength + queryList[i].queryLength2 << "\t"
                 << queryList[i].score << "\t"
                 << "-" << "\t";
+            
+            if (par.printLineage) {
+                readClassificationFile << "-\t";
+            }
+            readClassificationFile << "-\t\n";
+        }
+    }
+}
+
+void Reporter::writeReadClassification(const vector<Query> & queryList, const vector<uint32_t>& groupIdList, bool classifiedOnly) {
+    if (isFirstTime) {
+        readClassificationFile << "#is_classified\tname\ttaxID\tquery_length\tscore\trank\tgroup";
+        if (par.printLineage) {
+            readClassificationFile << "\tlineage";
+        }
+        readClassificationFile << "\ttaxID:match_count\n";
+        isFirstTime = false;
+    }
+    for (size_t i = 0; i < queryList.size(); i++) {
+
+        string groupID;
+        if (groupIdList[i] == 0){
+            groupID = "-";
+        }
+        else{
+            groupID = to_string(groupIdList[i]);
+        }
+
+        if (classifiedOnly && !queryList[i].isClassified) {
+            continue;
+        }
+        if (queryList[i].isClassified != 0) {
+            readClassificationFile 
+                << queryList[i].isClassified << "\t" 
+                << queryList[i].name << "\t"
+                << taxonomy->getOriginalTaxID(queryList[i].classification) << "\t"
+                << queryList[i].queryLength + queryList[i].queryLength2 << "\t"
+                << queryList[i].score << "\t"
+                << taxonomy->getString(taxonomy->taxonNode(queryList[i].classification)->rankIdx) << "\t"
+                << groupID << "\t";
+            
+            if (par.printLineage) {
+                readClassificationFile << taxonomy->taxLineage2(taxonomy->taxonNode(queryList[i].classification)) << "\t";
+            }
+            
+            for (auto it = queryList[i].taxCnt.begin(); it != queryList[i].taxCnt.end(); ++it) {
+                readClassificationFile << taxonomy->getOriginalTaxID(it->first) << ":" << it->second << " ";
+            }
+            readClassificationFile << "\n";
+        } else {
+            readClassificationFile 
+                << queryList[i].isClassified << "\t" 
+                << queryList[i].name << "\t"
+                << taxonomy->getOriginalTaxID(queryList[i].classification) << "\t"
+                << queryList[i].queryLength + queryList[i].queryLength2 << "\t"
+                << queryList[i].score << "\t"
+                << "-" << "\t"
+                << groupID << "\t";
             
             if (par.printLineage) {
                 readClassificationFile << "-\t";

@@ -91,6 +91,7 @@ struct Classification {
     int length;
     double score;
 };
+
 struct Query {
     int queryId;
     int classification;
@@ -119,6 +120,11 @@ struct Query {
 
     Query() : queryId(0), classification(0), score(0), hammingDist(0), queryLength(0),
               queryLength2(0), kmerCnt(0), kmerCnt2(0), isClassified(false), newSpecies(false) {}
+    
+    Query(int classification, float score, bool isClassified, std::string name)
+            : queryId(0), classification(classification), score(score),
+              hammingDist(0), queryLength(0), queryLength2(0), kmerCnt(0), kmerCnt2(0),
+              isClassified(isClassified), newSpecies(false), name(std::move(name)) {}
 };
 
 struct ProteinQuery {
