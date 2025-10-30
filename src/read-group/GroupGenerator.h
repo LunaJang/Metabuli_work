@@ -27,30 +27,30 @@
 #define BufferSize 16'777'216 //16 * 1024 * 1024 // 16 M
 using namespace std;
 
-struct RelationInfo {
-    uint32_t query1_shared_kmer_start_pos;
-    uint32_t query1_shared_kmer_end_pos;
-    uint32_t query2_shared_kmer_start_pos;
-    uint32_t query2_shared_kmer_end_pos;
-    uint32_t weight;
+// struct RelationInfo {
+//     uint32_t query1_shared_kmer_start_pos;
+//     uint32_t query1_shared_kmer_end_pos;
+//     uint32_t query2_shared_kmer_start_pos;
+//     uint32_t query2_shared_kmer_end_pos;
+//     uint32_t weight;
 
-    RelationInfo() : query1_shared_kmer_start_pos(UINT32_MAX), query1_shared_kmer_end_pos(0), 
-                     query2_shared_kmer_start_pos(UINT32_MAX), query2_shared_kmer_end_pos(0), 
-                     weight(0) {}
-    RelationInfo(uint32_t query1_shared_kmer_start_pos, uint32_t query1_shared_kmer_end_pos, 
-                 uint32_t query2_shared_kmer_start_pos, uint32_t query2_shared_kmer_end_pos, 
-                 uint16_t weight) : query1_shared_kmer_start_pos(query1_shared_kmer_start_pos), query1_shared_kmer_end_pos(query1_shared_kmer_end_pos), 
-                                    query2_shared_kmer_start_pos(query2_shared_kmer_start_pos), query2_shared_kmer_end_pos(query2_shared_kmer_end_pos), 
-                                    weight(weight) {}
-};
+//     RelationInfo() : query1_shared_kmer_start_pos(UINT32_MAX), query1_shared_kmer_end_pos(0), 
+//                      query2_shared_kmer_start_pos(UINT32_MAX), query2_shared_kmer_end_pos(0), 
+//                      weight(0) {}
+//     RelationInfo(uint32_t query1_shared_kmer_start_pos, uint32_t query1_shared_kmer_end_pos, 
+//                  uint32_t query2_shared_kmer_start_pos, uint32_t query2_shared_kmer_end_pos, 
+//                  uint16_t weight) : query1_shared_kmer_start_pos(query1_shared_kmer_start_pos), query1_shared_kmer_end_pos(query1_shared_kmer_end_pos), 
+//                                     query2_shared_kmer_start_pos(query2_shared_kmer_start_pos), query2_shared_kmer_end_pos(query2_shared_kmer_end_pos), 
+//                                     weight(weight) {}
+// };
 
 struct Relation {
     uint32_t id1;
     uint32_t id2;
-    RelationInfo info;
+    uint16_t weight;
 
-    Relation(uint32_t a = 0, uint32_t b = 0): id1(a), id2(b), info() {}
-    Relation(uint32_t a, uint32_t b, RelationInfo info): id1(a), id2(b), info(info) {}
+    Relation(uint32_t a = 0, uint32_t b = 0): id1(a), id2(b), weight(0) {}
+    Relation(uint32_t a, uint32_t b, uint16_t w): id1(a), id2(b), weight(w) {}
 
     static bool compare(const Relation& a, const Relation& b) {
         if (a.id1 != b.id1) return a.id1 < b.id1;
@@ -153,7 +153,7 @@ public:
 
     void makeGraph(size_t processedReadCnt);
     
-    void saveSubGraphToFile(const unordered_map<uint64_t, RelationInfo>& pair2info,
+    void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
                             const size_t counter_now);
 
     void mergeTrueRelations(

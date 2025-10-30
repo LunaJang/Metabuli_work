@@ -328,81 +328,69 @@ void GroupGenerator::makeGraph(size_t processedReadCnt) {
     #pragma omp parallel num_threads(par.threads)
     {
         int threadIdx = omp_get_thread_num();
-        std::unordered_map<uint64_t, RelationInfo> pair2info;
-        pair2info.reserve(RELATION_THRESHOLD);
-        std::vector<DeltaIdxInfoReader*> deltaIdxInfoReaders;
+        std::unordered_map<uint64_t, uint16_t> pair2weight;
+        pair2weight.reserve(RELATION_THRESHOLD);
+        std::vector<DeltaIdxReader*> deltaIdxReaders;
         std::vector<Kmer> currentKmers;
         for (size_t i = 0; i < this->numOfSplits; i++) {
             string diffFile = outDir + "/kmer_delta_" + to_string(i) + "_" + to_string(threadIdx);
             string infoFile = outDir + "/kmer_info_"  + to_string(i) + "_" + to_string(threadIdx);
-            DeltaIdxInfoReader* reader = new DeltaIdxInfoReader(diffFile, infoFile, 1024 * 1024, 1024 * 1024);
-            deltaIdxInfoReaders.push_back(reader);
+            DeltaIdxReader* reader = new DeltaIdxReader(diffFile, infoFile, 1024 * 1024, 1024 * 1024);
+            deltaIdxReaders.push_back(reader);
             currentKmers.push_back(reader->next());
         }
 
-        vector<pair<uint32_t, uint32_t>> currentQueryIds;
+        vector<uint32_t> currentQueryIds;
         currentQueryIds.reserve(1024);
 
         while (true) {
             // Find the smallest k-mer
             uint64_t minKmer = UINT64_MAX;
             for (size_t file = 0; file < this->numOfSplits; ++file) {
-                if (!deltaIdxInfoReaders[file]->isCompleted()) {
+                if (!deltaIdxReaders[file]->isCompleted()) {
                     minKmer = min(minKmer, currentKmers[file].value);
                 }
             }
             if (minKmer == UINT64_MAX) break;
-            
+
             currentQueryIds.clear();
             for (size_t file = 0; file < this->numOfSplits; ++file) {
                 while (currentKmers[file].value == minKmer) {
-                    QueryKmerInfo kmerInfo = currentKmers[file].qInfo; // query ID is stored in taxId field
-                    if (kmerInfo.sequenceID != UINT32_MAX && kmerInfo.sequenceID < processedReadCnt) {
-                        currentQueryIds.emplace_back(static_cast<uint32_t>(kmerInfo.sequenceID),
-                                                     static_cast<uint32_t>(kmerInfo.pos));
+                    uint32_t seqId = currentKmers[file].tInfo.taxId; // query ID is stored in taxId field
+                    if (seqId != UINT32_MAX && seqId < processedReadCnt) {
+                        currentQueryIds.emplace_back(seqId);
                     }
-                    currentKmers[file] = deltaIdxInfoReaders[file]->next();
-                    if (deltaIdxInfoReaders[file]->isCompleted()) {
+                    currentKmers[file] = deltaIdxReaders[file]->next();
+                    if (deltaIdxReaders[file]->isCompleted()) {
                         currentKmers[file].value = UINT64_MAX;
                         break;
                     }
                 }
             }
 
-            // Relate query IDs having the same k-mer     
-            for (size_t i = 0; i < currentQueryIds.size(); ++i) {
-                for (size_t j = i + 1; j < currentQueryIds.size(); ++j) {        
-                    if (currentQueryIds[i].first == currentQueryIds[j].first) continue;
-                    uint64_t pairKey = (static_cast<uint64_t>(currentQueryIds[i].first) << 32) | currentQueryIds[j].first;
-                }
-            }       
-
-            std::sort(currentQueryIds.begin(), currentQueryIds.end(),
-                      [](const auto &a, const auto &b) { return a.first < b.first; });
-            auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end(),
-                                    [](const auto &a, const auto &b) { return a.first == b.first; });
+            std::sort(currentQueryIds.begin(), currentQueryIds.end());
+            auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
             currentQueryIds.erase(last, currentQueryIds.end());
             for (size_t i = 0; i < currentQueryIds.size(); ++i) {
                 for (size_t j = i + 1; j < currentQueryIds.size(); ++j) {        
-                    uint64_t pairKey = (static_cast<uint64_t>(currentQueryIds[i].first) << 32) | currentQueryIds[j].first;
-                    pair2info[pairKey].weight++;
+                    uint64_t pairKey = (static_cast<uint64_t>(currentQueryIds[i]) << 32) | currentQueryIds[j];
+                    pair2weight[pairKey]++;
                 }
             }
-                        
-            if (pair2info.size() >= RELATION_THRESHOLD) {
+            if (pair2weight.size() >= RELATION_THRESHOLD) {
                 size_t counter_now = counter.fetch_add(1, memory_order_relaxed);
-                saveSubGraphToFile(pair2info, counter_now);
-                pair2info.clear();
+                saveSubGraphToFile(pair2weight, counter_now);
+                pair2weight.clear();
             }
         }
-        if (!pair2info.empty()) {
+        if (!pair2weight.empty()) {
             size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
-            saveSubGraphToFile(pair2info, counter_now);
+            saveSubGraphToFile(pair2weight, counter_now);
         } else {
             cout << "Thread " << threadIdx << " has no relations to write." << endl;
         }
         for (size_t file = 0; file < this->numOfSplits; file++) {
-            delete deltaIdxInfoReaders[file];
+            delete deltaIdxReaders[file];
         }
     }    
     this->numOfGraph = counter.load(std::memory_order_relaxed);
@@ -411,7 +399,7 @@ void GroupGenerator::makeGraph(size_t processedReadCnt) {
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
-void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, RelationInfo>& pair2info,
+void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
                                         const size_t counter_now) {
     const string subGraphFileName = outDir + "/subGraph_" + to_string(counter_now);
     FILE * outFile = fopen(subGraphFileName.c_str(), "wb");
@@ -422,71 +410,15 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, RelationIn
     
     // Get a sorted vector of relations
     std::vector<Relation> relations;
-    relations.reserve(pair2info.size());
-    for (const auto& [pairKey, info] : pair2info) {
+    relations.reserve(pair2weight.size());
+    for (const auto& [pairKey, weight] : pair2weight) {
         uint32_t id1 = static_cast<uint32_t>(pairKey >> 32);
         uint32_t id2 = static_cast<uint32_t>(pairKey & 0xFFFFFFFF);
-        relations.emplace_back(Relation{id1, id2, info});
+        relations.emplace_back(id1, id2, weight);
     }
     sort(relations.begin(), relations.end(), Relation::compare);
     fwrite(relations.data(), sizeof(Relation), relations.size(), outFile);
     fclose(outFile);
-}
-
-void GroupGenerator::mergeTrueRelations(
-    const vector<OrgResult>& orgResults
-) {
-    cout << "Merging only true edges" << endl;
-    time_t before = time(nullptr);
-    ofstream relationLog(outDir + "/allRelations_true.txt");
-    ofstream falseEdgeFile(outDir + "/falseEdges.txt");
-    if (!relationLog.is_open()) {
-        cerr << "Failed to open relation log file." << endl;
-        return;
-    }
-
-    std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
-    std::vector<Relation> currentRelations(this->numOfGraph);
-        for (size_t i = 0; i < this->numOfGraph; ++i) {
-        string fileName = outDir + "/subGraph_" + to_string(i);
-        relationBuffers[i] = new ReadBuffer<Relation>(fileName, 1024 * 1024);
-        currentRelations[i] = relationBuffers[i]->getNext();
-    } 
-
-    while (true) {
-        Relation minRelation(UINT32_MAX, UINT32_MAX);
-        for (size_t i = 0; i < this->numOfGraph; ++i) {
-            if (currentRelations[i] < minRelation) {
-                minRelation = currentRelations[i];
-            }
-        }
-        if (minRelation.id1 == UINT32_MAX) break;
-
-        uint32_t totalWeight = 0;
-        for (size_t i = 0; i < this->numOfGraph; ++i) {
-            if (currentRelations[i] == minRelation) {
-                totalWeight += currentRelations[i].info.weight;
-                currentRelations[i] = relationBuffers[i]->getNext();
-                if (currentRelations[i] == Relation()) {
-                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX);
-                }
-            }
-        }
-        std::string name1 = orgResults[minRelation.id1].name.substr(0, 15);
-        std::string name2 = orgResults[minRelation.id2].name.substr(0, 15);
-        if (name1 == name2) {
-            relationLog << minRelation.id1 << ' ' << minRelation.id2 << ' ' << totalWeight << '\n';
-        } else {
-            falseEdgeFile << minRelation.id1 << ' ' << minRelation.id2 << ' ' << totalWeight << '\n';
-        }
-    }
-    relationLog.close();
-    falseEdgeFile.close();
-    for (size_t i = 0; i < numOfGraph; ++i) {
-        delete relationBuffers[i];
-    }
-    cout << "Time: " << time(nullptr) - before << " sec" << endl;
-    return;
 }
 
 void GroupGenerator::mergeRelations() {
@@ -507,27 +439,24 @@ void GroupGenerator::mergeRelations() {
     } 
 
     while (true) {
-        Relation minRelation(UINT32_MAX, UINT32_MAX);
+        Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] < minRelation) {
                 minRelation = currentRelations[i];
             }
         }
         if (minRelation.id1 == UINT32_MAX) break;
-        
-        uint32_t totalWeight = 0;
-
+        uint16_t totalWeight = 0;
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] == minRelation) {
-                totalWeight += currentRelations[i].info.weight;
+                totalWeight += currentRelations[i].weight;
                 currentRelations[i] = relationBuffers[i]->getNext();
                 if (currentRelations[i] == Relation()) {
-                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX);
+                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
                 }
             }
         }
-        relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' 
-                    << totalWeight << '\n';
+        relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
     }
     relationLog.close();
 
@@ -557,20 +486,20 @@ void GroupGenerator::makeGroupsFromSubGraphs(
     } 
 
     while (true) {
-        Relation minRelation(UINT32_MAX, UINT32_MAX);
+        Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] < minRelation) {
                 minRelation = currentRelations[i];
             }
         }
         if (minRelation.id1 == UINT32_MAX) break;
-        uint32_t totalWeight = 0;
+        uint16_t totalWeight = 0;
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] == minRelation) {
-                totalWeight += currentRelations[i].info.weight;
+                totalWeight += currentRelations[i].weight;
                 currentRelations[i] = relationBuffers[i]->getNext();
                 if (currentRelations[i] == Relation()) {
-                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX);
+                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
                 }
             }
         }
@@ -581,7 +510,7 @@ void GroupGenerator::makeGroupsFromSubGraphs(
             if (name1 != name2) continue;
         }
         
-        if (totalWeight > static_cast<uint32_t>(groupKmerThr)) {
+        if (totalWeight > static_cast<uint16_t>(groupKmerThr)) {
             if (ds.parent.find(minRelation.id1) == ds.parent.end()) ds.makeSet(minRelation.id1);
             if (ds.parent.find(minRelation.id2) == ds.parent.end()) ds.makeSet(minRelation.id2);
             ds.unionSets(minRelation.id1, minRelation.id2);
@@ -626,7 +555,8 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
     DisjointSet ds;
 
-    uint32_t id1, id2, weight;
+    uint32_t id1, id2;
+    uint16_t weight;
     while (file >> id1 >> id2 >> weight) {
         if (static_cast<int>(weight) > groupKmerThr) {
             if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
@@ -765,7 +695,7 @@ void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
     }
     inFile.close();
     cout << "Original Metabuli result loaded from " << orgRes << " successfully." << endl;
-    cout << "Number of query result in " << orgRes << " " <<orgResults.size() << endl;
+    cout << "Number of query result: " << orgResults.size() << endl;
 }
 
 
@@ -873,7 +803,7 @@ void GroupGenerator::applyRepLabel(
     for (int queryIdx = 0; queryIdx < orgResults.size() ; queryIdx++){
         uint32_t groupId = queryGroupInfo[queryIdx];
         auto repLabelIt = repLabel.find(groupId);
-        if (repLabelIt != repLabel.end()){
+        if (repLabelIt != repLabel.end() && repLabelIt->second != 0){
             queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, repLabelIt->second, orgResults[queryIdx].name));
         } else{
             queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, orgResults[queryIdx].label, orgResults[queryIdx].name));           
