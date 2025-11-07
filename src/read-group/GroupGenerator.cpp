@@ -504,11 +504,11 @@ void GroupGenerator::makeGroupsFromSubGraphs(
             }
         }
 
-        if (useOnlyTrueRelations) { // Only for development purpose
-            std::string name1 = orgResults[minRelation.id1].name.substr(0, 15);
-            std::string name2 = orgResults[minRelation.id2].name.substr(0, 15);
-            if (name1 != name2) continue;
-        }
+        // if (useOnlyTrueRelations) { // Only for development purpose
+        //     std::string name1 = orgResults[minRelation.id1].name.substr(0, 15);
+        //     std::string name2 = orgResults[minRelation.id2].name.substr(0, 15);
+        //     if (name1 != name2) continue;
+        // }
         
         if (totalWeight > static_cast<uint16_t>(groupKmerThr)) {
             if (ds.parent.find(minRelation.id1) == ds.parent.end()) ds.makeSet(minRelation.id1);
