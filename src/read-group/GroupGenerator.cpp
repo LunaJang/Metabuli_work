@@ -114,21 +114,16 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         } 
     }   
 
-    makeGraph(processedReadCnt);   
     vector<OrgResult> orgResult;       
     loadOrgResult(orgResult);
+
+    makeGraph(processedReadCnt);   
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<uint32_t> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, 0);
     
-    // Use all edges
-    if (par.printLog) {
-        mergeRelations();
-        makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
-    } else {
-        makeGroupsFromSubGraphs(par.minEdgeWeight, groupInfo, queryGroupInfo, orgResult);
-    }
+    makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
     saveGroupsToFile(groupInfo, queryGroupInfo, orgResult);
 
     std::unordered_map<int, int> external2internalTaxId;
@@ -318,6 +313,120 @@ void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
     cout << "Filtered k-mer number  : " << storePos - blankCnt << endl;
 }
 
+void GroupGenerator::writeKmers(Buffer<Kmer>& queryKmerBuffer,
+                                size_t processedReadCnt) {
+    size_t blankCnt = std::find_if(queryKmerBuffer.buffer,
+                                   queryKmerBuffer.buffer + queryKmerBuffer.startIndexOfReserve, 
+                                   [](const auto& kmer) { return kmer.qInfo.sequenceID != 0;}
+                                  ) - queryKmerBuffer.buffer;                                        
+    size_t queryKmerNum = queryKmerBuffer.startIndexOfReserve - blankCnt;
+
+    // Make k-mer boundaries based on actual distribution
+    if (!boundariesInitialized) {
+        size_t quotient = queryKmerNum / par.threads;
+        size_t remainder = queryKmerNum % par.threads;
+        size_t idx = blankCnt;
+        for (size_t i = 0; i < par.threads - 1; i++) {
+            idx = idx + quotient - (i == 0);
+            if (remainder > 0) {
+                idx++;
+                remainder--;
+            }
+            if (idx >= queryKmerNum + blankCnt) {
+                std::cout << "Warning: endIdx exceeded queryKmerNum, adjusting to max." << std::endl;
+                idx = queryKmerNum + blankCnt - 1;
+            }
+            kmerBoundaries.emplace_back(queryKmerBuffer.buffer[idx].value);
+        }
+        boundariesInitialized = true;
+    }
+
+    // Make query k-mer ranges for each split
+    std::vector<std::pair<size_t, size_t>> queryKmerRanges = getKmerRanges(queryKmerBuffer, blankCnt);
+    #pragma omp parallel default(none), shared(queryKmerBuffer, queryKmerRanges, processedReadCnt)
+    {
+        size_t threadId = omp_get_thread_num();
+        size_t startIdx = queryKmerRanges[threadId].first;
+        size_t endIdx = queryKmerRanges[threadId].second;
+        WriteBuffer<uint16_t> diffBuffer(this->outDir + "/kmer_delta_" + to_string(this->numOfSplits) + "_" + to_string(threadId), 1024 * 1024);
+        WriteBuffer<uint32_t> infoBuffer(this->outDir + "/kmer_info_"  + to_string(this->numOfSplits) + "_" + to_string(threadId), 1024 * 1024);
+        uint64_t lastKmer = 0;
+        for (size_t i = startIdx; i < endIdx; i++) {
+            queryKmerBuffer.buffer[i].qInfo.sequenceID += processedReadCnt;
+            uint32_t id = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID - 1);
+            infoBuffer.write(&id);
+            IndexCreator::getDiffIdx(lastKmer, queryKmerBuffer.buffer[i].value, diffBuffer);
+        }
+        infoBuffer.flush();
+        diffBuffer.flush();
+    }
+    this->numOfSplits++;
+}
+
+std::vector<std::pair<size_t, size_t>> GroupGenerator::getKmerRanges(const Buffer<Kmer> & kmerBuffer, 
+                                                                     size_t offset) {
+    // Custom comparator to find the first k-mer that IS GREATER THAN the value (>)
+    auto value_less_than_kmer = [](uint64_t val, const Kmer& kmer) {
+        return val < kmer.value;
+    };
+
+    std::vector<std::pair<size_t, size_t>> ranges;
+    size_t startIdx = offset;
+
+    // For every boundary, find the first element > it. This marks the end of the current range.
+    for (const uint64_t& boundary : kmerBoundaries) {
+        // Find the first element that is > boundary.
+        auto it_cut = std::upper_bound(kmerBuffer.buffer + startIdx,
+                                       kmerBuffer.buffer + kmerBuffer.startIndexOfReserve,
+                                       boundary, 
+                                       value_less_than_kmer);
+
+        // The distance gives the index relative to the beginning of the vector
+        size_t cut_idx = std::distance(kmerBuffer.buffer, it_cut);
+
+        ranges.push_back({startIdx, cut_idx});
+        startIdx = cut_idx;
+    }
+
+    // Add the final range for all elements > the last boundary
+    ranges.push_back({startIdx, kmerBuffer.startIndexOfReserve});
+    return ranges;
+}
+
+void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
+    ifstream inFile(orgRes);
+    if (!inFile.is_open()) {
+        cerr << "Error opening file: " << orgRes << endl;
+        return;
+    }
+
+    int classificationCol = par.taxidCol - 1; 
+    int scoreCol = par.scoreCol - 1; 
+    if (par.weightMode == 0 || scoreCol < 0) {
+        string line;
+        while (getline(inFile, line)) {
+            if (line.empty()) continue;
+            if (line.front() == '#') continue;
+            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
+            TaxID taxId = stoi(columns[classificationCol]);
+            orgResults.push_back({taxId, 1.0, columns[1]});
+        }
+    } else {
+        string line;
+        while (getline(inFile, line)) {
+            if (line.empty()) continue;
+            if (line.front() == '#') continue;
+            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
+            TaxID taxId = stoi(columns[classificationCol]);
+            float score = stof(columns[scoreCol]);
+            orgResults.push_back({taxId, score, columns[1]});
+        }
+    }
+    inFile.close();
+    cout << "Original Metabuli result loaded from " << orgRes << " successfully." << endl;
+    cout << "Number of query result: " << orgResults.size() << endl;
+}
+
 void GroupGenerator::makeGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
@@ -421,59 +530,10 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>&
     fclose(outFile);
 }
 
-void GroupGenerator::mergeRelations() {
-    cout << "Merging subgraphs" << endl;
-    time_t before = time(nullptr);
-    ofstream relationLog(outDir + "/allRelations.txt");
-    if (!relationLog.is_open()) {
-        cerr << "Failed to open relation log file." << endl;
-        return;
-    }
-
-    std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
-    std::vector<Relation> currentRelations(this->numOfGraph);
-    for (size_t i = 0; i < this->numOfGraph; ++i) {
-        string fileName = outDir + "/subGraph_" + to_string(i);
-        relationBuffers[i] = new ReadBuffer<Relation>(fileName, 1024 * 1024);
-        currentRelations[i] = relationBuffers[i]->getNext();
-    } 
-
-    while (true) {
-        Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
-        for (size_t i = 0; i < this->numOfGraph; ++i) {
-            if (currentRelations[i] < minRelation) {
-                minRelation = currentRelations[i];
-            }
-        }
-        if (minRelation.id1 == UINT32_MAX) break;
-        uint16_t totalWeight = 0;
-        for (size_t i = 0; i < this->numOfGraph; ++i) {
-            if (currentRelations[i] == minRelation) {
-                totalWeight += currentRelations[i].weight;
-                currentRelations[i] = relationBuffers[i]->getNext();
-                if (currentRelations[i] == Relation()) {
-                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
-                }
-            }
-        }
-        relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
-    }
-    relationLog.close();
-
-    for (size_t i = 0; i < numOfGraph; ++i) {
-        delete relationBuffers[i];
-    }
-    cout << "Query relations created successfully" << endl;
-    cout << "Time spent: " << double(time(nullptr) - before) << " seconds." << endl;
-    return;
-}
-
-void GroupGenerator::makeGroupsFromSubGraphs(
-    uint32_t groupKmerThr,
-    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-    vector<uint32_t> &queryGroupInfo,
-    const vector<OrgResult>& orgResults
-) {
+void GroupGenerator::makeGroups(uint32_t groupKmerThr,
+                                unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+                                vector<uint32_t> &queryGroupInfo, 
+                                const vector<OrgResult>& orgResults) {
     cout << "Make groups from subgraphs." << endl;
     time_t before = time(nullptr);
     DisjointSet ds;
@@ -503,12 +563,6 @@ void GroupGenerator::makeGroupsFromSubGraphs(
                 }
             }
         }
-
-        // if (useOnlyTrueRelations) { // Only for development purpose
-        //     std::string name1 = orgResults[minRelation.id1].name.substr(0, 15);
-        //     std::string name2 = orgResults[minRelation.id2].name.substr(0, 15);
-        //     if (name1 != name2) continue;
-        // }
         
         if (totalWeight > static_cast<uint16_t>(groupKmerThr)) {
             if (ds.parent.find(minRelation.id1) == ds.parent.end()) ds.makeSet(minRelation.id1);
@@ -530,61 +584,6 @@ void GroupGenerator::makeGroupsFromSubGraphs(
         queryGroupInfo[queryId] = groupId;
     }
 
-    cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
-    cout << "Time spent: " << double(time(nullptr) - before) << " seconds." << endl;
-}
-
-void GroupGenerator::makeGroups(int groupKmerThr,
-                                unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                vector<uint32_t> &queryGroupInfo) {
-    cout << "Creating groups from relation file..." << endl;
-    time_t beforeSearch = time(nullptr);
-
-    string fileName;
-    if (useOnlyTrueRelations) {
-        fileName = outDir + "/allRelations_true.txt";
-    } else {
-        fileName = outDir + "/allRelations.txt";
-    }
-
-    ifstream file(fileName);
-    if (!file.is_open()) {
-        cerr << "Failed to open relation file: " << fileName << endl;
-        return;
-    }
-
-    DisjointSet ds;
-
-    uint32_t id1, id2;
-    uint16_t weight;
-    while (file >> id1 >> id2 >> weight) {
-        if (static_cast<int>(weight) > groupKmerThr) {
-            if (ds.parent.find(id1) == ds.parent.end()) ds.makeSet(id1);
-            if (ds.parent.find(id2) == ds.parent.end()) ds.makeSet(id2);
-            ds.unionSets(id1, id2);
-        }
-    }
-
-    for (const auto& [queryId, _] : ds.parent) {
-        uint32_t groupId = ds.find(queryId);
-        groupInfo[groupId].insert(queryId);
-        if (queryId >= queryGroupInfo.size()) {
-            queryGroupInfo.resize(queryId + 1, -1);
-        }
-        queryGroupInfo[queryId] = static_cast<int>(groupId);
-    }
-
-    cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
-    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
-}
-
-
-
-void GroupGenerator::saveGroupsToFile(
-    const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-    const vector<uint32_t> &queryGroupInfo, 
-    const vector<OrgResult>& orgResults
-) {
     // save group in txt file
     const string& groupInfoFileName = outDir + "/groups";
     ofstream outFile1(groupInfoFileName);
@@ -617,88 +616,9 @@ void GroupGenerator::saveGroupsToFile(
     outFile2.close();
     cout << "Query group saved to " << queryGroupInfoFileName << " successfully." << endl;
 
-    return;
+    cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
+    cout << "Time spent: " << double(time(nullptr) - before) << " seconds." << endl;
 }
-
-void GroupGenerator::loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
-                                        vector<uint32_t> &queryGroupInfo,
-                                        const string &groupFileDir) {
-    const string groupInfoFileName = groupFileDir + "/groups";
-    const string queryGroupInfoFileName = groupFileDir + "/queryGroupMap";
-
-    // 1. Load groupInfo
-    ifstream inFile1(groupInfoFileName);
-    if (!inFile1.is_open()) {
-        cerr << "Error opening file: " << groupInfoFileName << endl;
-        return;
-    }
-
-    string line;
-    while (getline(inFile1, line)) {
-        istringstream ss(line);
-        uint32_t groupId;
-        ss >> groupId;
-
-        uint32_t queryId;
-        while (ss >> queryId) {
-            groupInfo[groupId].insert(queryId);
-        }
-    }
-    inFile1.close();
-    cout << "Group info loaded from " << groupInfoFileName << " successfully." << endl;
-
-    // 2. Load queryGroupInfo
-    ifstream inFile2(queryGroupInfoFileName);
-    if (!inFile2.is_open()) {
-        cerr << "Error opening file: " << queryGroupInfoFileName << endl;
-        return;
-    }
-
-    queryGroupInfo.clear();
-    int groupId;
-    while (inFile2 >> groupId) {
-        queryGroupInfo.emplace_back(groupId);
-    }
-    inFile2.close();
-    cout << "Query-to-group map loaded from " << queryGroupInfoFileName << " successfully." << endl;
-}
-
-
-void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
-    ifstream inFile(orgRes);
-    if (!inFile.is_open()) {
-        cerr << "Error opening file: " << orgRes << endl;
-        return;
-    }
-
-    int classificationCol = par.taxidCol - 1; 
-    int scoreCol = par.scoreCol - 1; 
-    if (par.weightMode == 0 || scoreCol < 0) {
-        string line;
-        while (getline(inFile, line)) {
-            if (line.empty()) continue;
-            if (line.front() == '#') continue;
-            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
-            TaxID taxId = stoi(columns[classificationCol]);
-            orgResults.push_back({taxId, 1.0, columns[1]});
-        }
-    } else {
-        string line;
-        while (getline(inFile, line)) {
-            if (line.empty()) continue;
-            if (line.front() == '#') continue;
-            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
-            TaxID taxId = stoi(columns[classificationCol]);
-            float score = stof(columns[scoreCol]);
-            orgResults.push_back({taxId, score, columns[1]});
-        }
-    }
-    inFile.close();
-    cout << "Original Metabuli result loaded from " << orgRes << " successfully." << endl;
-    cout << "Number of query result: " << orgResults.size() << endl;
-}
-
-
 
 void GroupGenerator::getRepLabel(vector<OrgResult> &orgResults, 
                                  const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
@@ -760,41 +680,10 @@ void GroupGenerator::getRepLabel(vector<OrgResult> &orgResults,
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
-void GroupGenerator::loadRepLabel(
-    std::unordered_map<uint32_t, uint32_t> &repLabel
-) {
-    const std::string groupRepFileName = outDir + "/groupRep";
-    std::ifstream inFile(groupRepFileName);
-    if (!inFile.is_open()) {
-        std::cerr << "Error opening file: " << groupRepFileName << std::endl;
-        return;
-    }
-
-    std::string line;
-    while (std::getline(inFile, line)) {
-        std::istringstream ss(line);
-        uint32_t groupId;
-        int groupRep;
-
-        ss >> groupId >> groupRep;
-        if (ss.fail()) {
-            std::cerr << "Warning: failed to parse line: " << line << std::endl;
-            continue;
-        }
-
-        repLabel[groupId] = groupRep;
-    }
-
-    inFile.close();
-
-    std::cout << "Representative labels loaded from " << groupRepFileName << " successfully." << std::endl;
-}
-
-void GroupGenerator::applyRepLabel(
-    const vector<OrgResult>& orgResults, 
-    const vector<uint32_t>& queryGroupInfo, 
-    const unordered_map<uint32_t, uint32_t>& repLabel,
-    std::unordered_map<int, int>& external2internalTaxId) {
+void GroupGenerator::applyRepLabel(const vector<OrgResult>& orgResults, 
+                                   const vector<uint32_t>& queryGroupInfo, 
+                                   const unordered_map<uint32_t, uint32_t>& repLabel,
+                                   std::unordered_map<int, int>& external2internalTaxId) {
     cout << "Apply query group representative labels..." << endl;    
     time_t beforeSearch = time(nullptr);
 
@@ -817,89 +706,4 @@ void GroupGenerator::applyRepLabel(
     
     cout << "Result saved to " << updatedResultFileName << " successfully." << endl;    
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
-}
-
-std::vector<std::pair<size_t, size_t>> GroupGenerator::getKmerRanges(
-    const Buffer<Kmer> & kmerBuffer, 
-    size_t offset
-) {
-    // Custom comparator to find the first k-mer that IS GREATER THAN the value (>)
-    auto value_less_than_kmer = [](uint64_t val, const Kmer& kmer) {
-        return val < kmer.value;
-    };
-
-    std::vector<std::pair<size_t, size_t>> ranges;
-    size_t startIdx = offset;
-
-    // For every boundary, find the first element > it. This marks the end of the current range.
-    for (const uint64_t& boundary : kmerBoundaries) {
-        // Find the first element that is > boundary.
-        auto it_cut = std::upper_bound(kmerBuffer.buffer + startIdx,
-                                       kmerBuffer.buffer + kmerBuffer.startIndexOfReserve,
-                                       boundary, 
-                                       value_less_than_kmer);
-
-        // The distance gives the index relative to the beginning of the vector
-        size_t cut_idx = std::distance(kmerBuffer.buffer, it_cut);
-
-        ranges.push_back({startIdx, cut_idx});
-        startIdx = cut_idx;
-    }
-
-    // Add the final range for all elements > the last boundary
-    ranges.push_back({startIdx, kmerBuffer.startIndexOfReserve});
-    return ranges;
-}
-
-
-void GroupGenerator::writeKmers(
-    Buffer<Kmer>& queryKmerBuffer,
-    size_t processedReadCnt
-) {
-    size_t blankCnt = std::find_if(queryKmerBuffer.buffer,
-                                   queryKmerBuffer.buffer + queryKmerBuffer.startIndexOfReserve, 
-                                   [](const auto& kmer) { return kmer.qInfo.sequenceID != 0;}
-                                  ) - queryKmerBuffer.buffer;                                        
-    size_t queryKmerNum = queryKmerBuffer.startIndexOfReserve - blankCnt;
-
-    // Make k-mer boundaries based on actual distribution
-    if (!boundariesInitialized) {
-        size_t quotient = queryKmerNum / par.threads;
-        size_t remainder = queryKmerNum % par.threads;
-        size_t idx = blankCnt;
-        for (size_t i = 0; i < par.threads - 1; i++) {
-            idx = idx + quotient - (i == 0);
-            if (remainder > 0) {
-                idx++;
-                remainder--;
-            }
-            if (idx >= queryKmerNum + blankCnt) {
-                std::cout << "Warning: endIdx exceeded queryKmerNum, adjusting to max." << std::endl;
-                idx = queryKmerNum + blankCnt - 1;
-            }
-            kmerBoundaries.emplace_back(queryKmerBuffer.buffer[idx].value);
-        }
-        boundariesInitialized = true;
-    }
-
-    // Make query k-mer ranges for each split
-    std::vector<std::pair<size_t, size_t>> queryKmerRanges = getKmerRanges(queryKmerBuffer, blankCnt);
-    #pragma omp parallel default(none), shared(queryKmerBuffer, queryKmerRanges, processedReadCnt)
-    {
-        size_t threadId = omp_get_thread_num();
-        size_t startIdx = queryKmerRanges[threadId].first;
-        size_t endIdx = queryKmerRanges[threadId].second;
-        WriteBuffer<uint16_t> diffBuffer(this->outDir + "/kmer_delta_" + to_string(this->numOfSplits) + "_" + to_string(threadId), 1024 * 1024);
-        WriteBuffer<uint32_t> infoBuffer(this->outDir + "/kmer_info_"  + to_string(this->numOfSplits) + "_" + to_string(threadId), 1024 * 1024);
-        uint64_t lastKmer = 0;
-        for (size_t i = startIdx; i < endIdx; i++) {
-            queryKmerBuffer.buffer[i].qInfo.sequenceID += processedReadCnt;
-            uint32_t id = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID - 1);
-            infoBuffer.write(&id);
-            IndexCreator::getDiffIdx(lastKmer, queryKmerBuffer.buffer[i].value, diffBuffer);
-        }
-        infoBuffer.flush();
-        diffBuffer.flush();
-    }
-    this->numOfSplits++;
 }

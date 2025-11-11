@@ -27,23 +27,6 @@
 #define BufferSize 16'777'216 //16 * 1024 * 1024 // 16 M
 using namespace std;
 
-// struct RelationInfo {
-//     uint32_t query1_shared_kmer_start_pos;
-//     uint32_t query1_shared_kmer_end_pos;
-//     uint32_t query2_shared_kmer_start_pos;
-//     uint32_t query2_shared_kmer_end_pos;
-//     uint32_t weight;
-
-//     RelationInfo() : query1_shared_kmer_start_pos(UINT32_MAX), query1_shared_kmer_end_pos(0), 
-//                      query2_shared_kmer_start_pos(UINT32_MAX), query2_shared_kmer_end_pos(0), 
-//                      weight(0) {}
-//     RelationInfo(uint32_t query1_shared_kmer_start_pos, uint32_t query1_shared_kmer_end_pos, 
-//                  uint32_t query2_shared_kmer_start_pos, uint32_t query2_shared_kmer_end_pos, 
-//                  uint16_t weight) : query1_shared_kmer_start_pos(query1_shared_kmer_start_pos), query1_shared_kmer_end_pos(query1_shared_kmer_end_pos), 
-//                                     query2_shared_kmer_start_pos(query2_shared_kmer_start_pos), query2_shared_kmer_end_pos(query2_shared_kmer_end_pos), 
-//                                     weight(weight) {}
-// };
-
 struct Relation {
     uint32_t id1;
     uint32_t id2;
@@ -150,58 +133,33 @@ public:
                            Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
                            const string & db="");
 
+    void writeKmers(Buffer<Kmer>& queryKmerBuffer, 
+                    size_t processedReadCnt);
+
+    std::vector<std::pair<size_t, size_t>> getKmerRanges(const Buffer<Kmer>& kmerBuffer, 
+                                                         size_t offset);
 
     void makeGraph(size_t processedReadCnt);
     
     void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
                             const size_t counter_now);
 
-    void mergeTrueRelations(
-        const vector<OrgResult>& orgResults);
-
-    void mergeRelations();
-
-    void makeGroups(int groupKmerThr,
+    void makeGroups(uint32_t groupKmerThr,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
-                    vector<uint32_t> &queryGroupInfo);
+                    vector<uint32_t> &queryGroupInfo, 
+                    const vector<OrgResult>& orgResults);
 
-    void makeGroupsFromSubGraphs(
-        uint32_t groupKmerThr,
-        unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
-        vector<uint32_t> &queryGroupInfo,
-        const vector<OrgResult>& orgResults);
-
-    void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
-                          const vector<uint32_t>& queryGroupInfo,
-                          const vector<OrgResult>& orgResults);
-
-    void loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
-                       vector<uint32_t>& queryGroupInfo,
-                       const string& groupFileDir);
-
-    void loadOrgResult(vector<OrgResult>& orgResults);
-
-    void getRepLabel(
-        vector<OrgResult>& orgResults, 
-        const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
-        unordered_map<uint32_t, uint32_t>& repLabel,
-        std::unordered_map<int, int>& external2internalTaxId);
+    void getRepLabel(vector<OrgResult>& orgResults, 
+                     const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+                     unordered_map<uint32_t, uint32_t>& repLabel,
+                     std::unordered_map<int, int>& external2internalTaxId);
     
     void loadRepLabel(std::unordered_map<uint32_t, uint32_t>& repLabel);
 
-    void applyRepLabel( 
-        const vector<OrgResult>& orgResults, 
-        const vector<uint32_t>& queryGroupInfo, 
-        const unordered_map<uint32_t, uint32_t>& repLabel,
-        std::unordered_map<int, int>& external2internalTaxId);
-
-    void writeKmers(
-        Buffer<Kmer>& queryKmerBuffer, 
-        size_t processedReadCnt);
-
-    std::vector<std::pair<size_t, size_t>> getKmerRanges(
-        const Buffer<Kmer>& kmerBuffer, 
-        size_t offset);
+    void applyRepLabel(const vector<OrgResult>& orgResults, 
+                       const vector<uint32_t>& queryGroupInfo, 
+                       const unordered_map<uint32_t, uint32_t>& repLabel,
+                       std::unordered_map<int, int>& external2internalTaxId);
 
     ~GroupGenerator();
 };
