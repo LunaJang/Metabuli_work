@@ -690,6 +690,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&PARAM_MAJORITY);
     groupGeneration.push_back(&MIN_VOTE_SCORE);
     groupGeneration.push_back(&SCORE_COL);
+    groupGeneration.push_back(&READID_COL);
     groupGeneration.push_back(&TAXID_COL);
     groupGeneration.push_back(&WEIGHT_MODE);
 

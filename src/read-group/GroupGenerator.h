@@ -52,12 +52,16 @@ struct Relation {
 
 class DisjointSet {
 public:
-    DisjointSet() {}
+    std::vector<uint32_t> parent;
+    std::vector<uint32_t> rank;
+    std::vector<bool> grouped;
 
-    void makeSet(uint32_t element) {
-        if (parent.find(element) == parent.end()) {
-            parent[element] = element;
-            rank[element] = 0;
+    DisjointSet(size_t numQuery) 
+        : parent(numQuery), rank(numQuery), grouped(numQuery) {
+        for (size_t i = 0; i < numQuery; ++i) {
+            parent[i] = i;
+            rank[i] = 0;
+            grouped[i] = false;
         }
     }
 
@@ -72,20 +76,45 @@ public:
         uint32_t root1 = find(elem1);
         uint32_t root2 = find(elem2);
 
+        grouped[elem1] = true;
+        grouped[elem2] = true;
+
         if (root1 != root2) {
             if (rank[root1] < rank[root2]) {
                 parent[root1] = root2;
             } else if (rank[root1] > rank[root2]) {
                 parent[root2] = root1;
             } else {
-                parent[root2] = root1;
-                rank[root1]++;
+                if (root1 < root2) {
+                    parent[root2] = root1;
+                    rank[root1]++;
+                }
+                else{
+                    parent[root1] = root2;
+                    rank[root2]++;
+                }
             }
         }
     }
 
-    unordered_map<uint32_t, uint32_t> parent;
-    unordered_map<uint32_t, uint32_t> rank;
+    void flatten() {
+        for (size_t i = 0; i < parent.size(); ++i) {
+            parent[i] = find(i);
+        }
+    }
+
+    DisjointSet& operator+=(const DisjointSet& rhs) {
+        for (size_t i = 0; i < parent.size(); ++i) {
+            uint32_t p = rhs.parent[i];
+            if (p != i) unionSets(i, p);
+        }
+        return *this;
+    }
+
+    friend DisjointSet operator+(DisjointSet lhs, const DisjointSet& rhs) {
+        lhs += rhs;
+        return lhs;
+    }
 };
 
 struct OrgResult {
@@ -139,15 +168,19 @@ public:
     std::vector<std::pair<size_t, size_t>> getKmerRanges(const Buffer<Kmer>& kmerBuffer, 
                                                          size_t offset);
 
-    void makeGraph(size_t processedReadCnt);
+    void loadOrgResult(vector<OrgResult>& orgResults);
+
+    void makeSubGraph(size_t processedReadCnt);
     
     void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
                             const size_t counter_now);
 
-    void makeGroups(uint32_t groupKmerThr,
+    void mergeGraph(size_t processedReadCnt);
+
+    void makeGroups(int groupKmerThr,
+                    size_t processedReadCnt,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
-                    vector<uint32_t> &queryGroupInfo, 
-                    const vector<OrgResult>& orgResults);
+                    vector<uint32_t> &queryGroupInfo);
 
     void getRepLabel(vector<OrgResult>& orgResults, 
                      const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 

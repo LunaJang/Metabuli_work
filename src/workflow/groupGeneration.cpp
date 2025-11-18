@@ -19,6 +19,7 @@ void setGroupGenerationDefaults(LocalParameters & par){
     par.matchPerKmer = 4;
     par.majorityThr = 0.5;   
     par.scoreCol = 5;
+    par.readIdCol = 2;
     par.taxidCol = 3;
     par.weightMode = 1; // 0: uniform, 1: score, 2: score^2
     par.minVoteScr = 0.15;

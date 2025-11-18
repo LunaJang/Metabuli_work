@@ -117,14 +117,14 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     vector<OrgResult> orgResult;       
     loadOrgResult(orgResult);
 
-    makeGraph(processedReadCnt);   
+    makeSubGraph(processedReadCnt);   
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<uint32_t> queryGroupInfo;
     queryGroupInfo.resize(processedReadCnt, 0);
     
-    makeGroups(par.minEdgeWeight, groupInfo, queryGroupInfo);
-    saveGroupsToFile(groupInfo, queryGroupInfo, orgResult);
+    mergeGraph(processedReadCnt);
+    makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
 
     std::unordered_map<int, int> external2internalTaxId;
     taxonomy->getExternal2internalTaxID(external2internalTaxId);
@@ -402,6 +402,7 @@ void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
 
     int classificationCol = par.taxidCol - 1; 
     int scoreCol = par.scoreCol - 1; 
+    int readNameCol = par.readIdCol - 1; 
     if (par.weightMode == 0 || scoreCol < 0) {
         string line;
         while (getline(inFile, line)) {
@@ -409,7 +410,7 @@ void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
             if (line.front() == '#') continue;
             std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
             TaxID taxId = stoi(columns[classificationCol]);
-            orgResults.push_back({taxId, 1.0, columns[1]});
+            orgResults.push_back({taxId, 1.0, columns[readNameCol]});
         }
     } else {
         string line;
@@ -419,7 +420,7 @@ void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
             std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
             TaxID taxId = stoi(columns[classificationCol]);
             float score = stof(columns[scoreCol]);
-            orgResults.push_back({taxId, score, columns[1]});
+            orgResults.push_back({taxId, score, columns[readNameCol]});
         }
     }
     inFile.close();
@@ -427,7 +428,7 @@ void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
     cout << "Number of query result: " << orgResults.size() << endl;
 }
 
-void GroupGenerator::makeGraph(size_t processedReadCnt) {
+void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
 
@@ -530,20 +531,24 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>&
     fclose(outFile);
 }
 
-void GroupGenerator::makeGroups(uint32_t groupKmerThr,
-                                unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                vector<uint32_t> &queryGroupInfo, 
-                                const vector<OrgResult>& orgResults) {
-    cout << "Make groups from subgraphs." << endl;
+void GroupGenerator::mergeGraph(size_t processedReadCnt) {
+    cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
-    DisjointSet ds;
+
+    std::vector<std::ofstream> relationLogs;
+    relationLogs.reserve(par.threads * 2 + 1);
+    for (size_t i = 0; i < par.threads * 2 + 1; ++i) {
+        relationLogs.emplace_back(outDir + "/relations_" + std::to_string(i) + ".txt");
+    }
+
     std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
     std::vector<Relation> currentRelations(this->numOfGraph);
     for (size_t i = 0; i < this->numOfGraph; ++i) {
-        string fileName = outDir + "/subGraph_" + to_string(i);
-        relationBuffers[i] = new ReadBuffer<Relation>(fileName, 1024 * 1024);
+        relationBuffers[i] = new ReadBuffer<Relation>(outDir + "/subGraph_" + to_string(i), 1024 * 1024);
         currentRelations[i] = relationBuffers[i]->getNext();
     } 
+
+    size_t range_size = (processedReadCnt > par.threads)?(processedReadCnt / static_cast<size_t>(par.threads)):(processedReadCnt);
 
     while (true) {
         Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
@@ -563,11 +568,15 @@ void GroupGenerator::makeGroups(uint32_t groupKmerThr,
                 }
             }
         }
-        
-        if (totalWeight > static_cast<uint16_t>(groupKmerThr)) {
-            if (ds.parent.find(minRelation.id1) == ds.parent.end()) ds.makeSet(minRelation.id1);
-            if (ds.parent.find(minRelation.id2) == ds.parent.end()) ds.makeSet(minRelation.id2);
-            ds.unionSets(minRelation.id1, minRelation.id2);
+
+        if (minRelation.id1 % par.threads == minRelation.id2 % par.threads){
+            relationLogs[(minRelation.id1 % par.threads)] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
+        } 
+        else if (minRelation.id1 / range_size == minRelation.id2 / range_size){
+            relationLogs[(minRelation.id1 / range_size) + par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
+        } 
+        else{
+            relationLogs[par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';            
         }
     }
 
@@ -575,49 +584,86 @@ void GroupGenerator::makeGroups(uint32_t groupKmerThr,
         delete relationBuffers[i];
     }
 
-    for (const auto& [queryId, _] : ds.parent) {
-        uint32_t groupId = ds.find(queryId);
-        groupInfo[groupId].insert(queryId);
-        if (queryId >= queryGroupInfo.size()) {
-            queryGroupInfo.resize(queryId + 1, -1);
+    cout << "Query relation graph merged successfully" << endl;
+    cout << "Time spent: " << double(time(nullptr) - before) << " seconds." << endl;
+    return;
+}
+
+void GroupGenerator::makeGroups(int groupKmerThr,
+                                size_t processedReadCnt,
+                                unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+                                vector<uint32_t> &queryGroupInfo) {
+    cout << "Creating groups from relation file..." << endl;
+    time_t beforeSearch = time(nullptr);
+
+    DisjointSet ds(processedReadCnt);
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+        ifstream relationLog(outDir + "/relations_" + std::to_string(threadIdx) + ".txt");
+        uint32_t id1, id2;
+        uint16_t weight;
+        while (relationLog >> id1 >> id2 >> weight) {
+            if (static_cast<int>(weight) > groupKmerThr) {
+                subDs.unionSets(id1, id2);
+            }
         }
-        queryGroupInfo[queryId] = groupId;
-    }
+        relationLog.close();
+        subDs.flatten();
 
-    // save group in txt file
-    const string& groupInfoFileName = outDir + "/groups";
-    ofstream outFile1(groupInfoFileName);
-    if (!outFile1.is_open()) {
-        cerr << "Error opening file: " << groupInfoFileName << endl;
-        return;
-    }
-
-    for (const auto& [groupId, queryIds] : groupInfo) {
-        outFile1 << groupId << "\t";
-        for (const auto& queryId : queryIds) {
-            outFile1 << orgResults[queryId].name << "\t";
+        #pragma omp critical
+        {
+            ds += subDs;
         }
-        outFile1 << endl;
-    }
-    outFile1.close();
-    cout << "Query group saved to " << groupInfoFileName << " successfully." << endl;
-    
-
-    const string& queryGroupInfoFileName = outDir + "/queryGroupMap";
-    ofstream outFile2(queryGroupInfoFileName);
-    if (!outFile2.is_open()) {
-        cerr << "Error opening file: " << queryGroupInfoFileName << endl;
-        return;
     }
 
-    for (size_t i = 0; i < queryGroupInfo.size(); ++i) {
-        outFile2 << orgResults[i].name << "\t" << queryGroupInfo[i] << "\n";
+    #pragma omp parallel num_threads(par.threads)
+    {
+        DisjointSet subDs(processedReadCnt);
+        #pragma omp critical
+        {
+            subDs = ds;
+        }
+
+        int threadIdx = omp_get_thread_num();
+        ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt");
+        uint32_t id1, id2;
+        uint16_t weight;
+        while (relationLog >> id1 >> id2 >> weight) {
+            if (static_cast<int>(weight) > groupKmerThr) {
+                subDs.unionSets(id1, id2);
+            }
+        }
+        relationLog.close();
+        subDs.flatten();
+
+        #pragma omp critical
+        {
+            ds += subDs;
+        }
     }
-    outFile2.close();
-    cout << "Query group saved to " << queryGroupInfoFileName << " successfully." << endl;
+
+    ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
+    uint32_t id1, id2;
+    uint16_t weight;
+    while (relationLog >> id1 >> id2 >> weight) {
+        if (static_cast<int>(weight) > groupKmerThr) {
+            ds.unionSets(id1, id2);
+        }
+    }
+    relationLog.close();
+
+    for (uint32_t queryId = 0; queryId < ds.parent.size(); queryId++) {
+        if (ds.grouped[queryId]){
+            uint32_t groupId = ds.find(queryId);
+            groupInfo[groupId].insert(queryId);
+            queryGroupInfo[queryId] = groupId;
+        }
+    }
 
     cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
-    cout << "Time spent: " << double(time(nullptr) - before) << " seconds." << endl;
+    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
 void GroupGenerator::getRepLabel(vector<OrgResult> &orgResults, 
