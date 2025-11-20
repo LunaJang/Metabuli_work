@@ -1,32 +1,28 @@
-#include "GroupGenerator.h"
+#include "GroupApplier.h"
 #include "Parameters.h"
 #include "LocalParameters.h"
 #include "FileUtil.h"
 #include "common.h"
 
-void setGroupGenerationDefaults(LocalParameters & par){    
-    par.neighborKmers = 0;
-    par.minEdgeWeight = 10;
-    par.syncmer = 1;
-    par.smerLen = 5;
+void setGroupApplicationDefaults(LocalParameters & par){    
     par.seqMode = 2;    
-    par.verbosity = 3;
     par.ramUsage = 128;
-    par.printLog = 0;
-    par.maskMode = 0;
-    par.maskProb = 0.9;
-    par.matchPerKmer = 4; 
+    par.scoreCol = 5;
+    par.readIdCol = 2;
+    par.taxidCol = 3;
+    par.weightMode = 1; // 0: uniform, 1: score, 2: score^2
+    par.minVoteScr = 0.15;
 }
 
-int groupGeneration(int argc, const char **argv, const Command& command)
+int groupApplication(int argc, const char **argv, const Command& command)
 {
     LocalParameters & par = LocalParameters::getLocalInstance();
-    setGroupGenerationDefaults(par);
+    setGroupApplicationDefaults(par);
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_ALLOW_EMPTY, 0);
-    if (par.syncmer == 0) {
-        par.kmerFormat = 3;
-    } else {
-        par.kmerFormat = 5;
+
+    if (par.weightMode != 0) {
+        cout << "Warning: --weight-mode " << par.weightMode << " requires classification scores." << endl;
+        cout << "         Make sure that score column is correctly set using --score-col." << endl;
     }
 
     if (par.seqMode == 2) {
@@ -57,8 +53,8 @@ int groupGeneration(int argc, const char **argv, const Command& command)
 #ifdef OPENMP
     omp_set_num_threads(par.threads);
 #endif    
-    GroupGenerator * groupGenerator = new GroupGenerator(par);
-    groupGenerator->startGroupGeneration(par);
-    delete groupGenerator;
+    GroupApplier * groupApplier = new GroupApplier(par);
+    groupApplier->startGroupApplication(par);
+    delete groupApplier;
     return 0;
 }

@@ -250,13 +250,6 @@ LocalParameters::LocalParameters() :
                     typeid(float),
                     (void *) &minVoteScr,
                     "^0(\\.[0-9]+)?|1(\\.0+)?$"),
-        MIN_OVERLAP_RATIO(MIN_OVERLAP_RATIO_ID,
-                    "--min-ratio",
-                    "Min. shared kmer range ratio between two reads for read grouping",
-                    "Min. shared kmer range ratio between two reads for read grouping",
-                    typeid(float),
-                    (void *) &minOverlapRatio,
-                    "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         SCORE_COL(SCORE_COL_ID,
                   "--score-col",
                   "Score column index (1-based).",
@@ -677,8 +670,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&PARAM_THREADS);
     groupGeneration.push_back(&SEQ_MODE);
     groupGeneration.push_back(&RAM_USAGE);
-    groupGeneration.push_back(&MATCH_PER_KMER);
-    groupGeneration.push_back(&MIN_OVERLAP_RATIO);    
+    groupGeneration.push_back(&MATCH_PER_KMER);  
     groupGeneration.push_back(&PARAM_MASK_RESIDUES);
     groupGeneration.push_back(&PARAM_MASK_PROBABILTY);
     groupGeneration.push_back(&VALIDATE_INPUT);
@@ -686,13 +678,16 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&SMER_LEN);
     groupGeneration.push_back(&MIN_EDGE_WEIGHT);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
-    groupGeneration.push_back(&PRINT_LOG);
-    groupGeneration.push_back(&PARAM_MAJORITY);
-    groupGeneration.push_back(&MIN_VOTE_SCORE);
-    groupGeneration.push_back(&SCORE_COL);
-    groupGeneration.push_back(&READID_COL);
-    groupGeneration.push_back(&TAXID_COL);
-    groupGeneration.push_back(&WEIGHT_MODE);
+
+    //groupApplication
+    groupApplication.push_back(&SEQ_MODE);
+    groupApplication.push_back(&RAM_USAGE);
+    groupApplication.push_back(&PARAM_THREADS);
+    groupApplication.push_back(&MIN_VOTE_SCORE);
+    groupApplication.push_back(&SCORE_COL);
+    groupApplication.push_back(&READID_COL);
+    groupApplication.push_back(&TAXID_COL);
+    groupApplication.push_back(&WEIGHT_MODE);
 
 
     // filter 

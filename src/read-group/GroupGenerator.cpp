@@ -6,36 +6,20 @@
 
 GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     commonKmerDB = par.filenames[1 + (par.seqMode == 2)];
-    taxDbDir     = par.filenames[2 + (par.seqMode == 2)];
-    orgRes       = par.filenames[3 + (par.seqMode == 2)];
-    outDir       = par.filenames[4 + (par.seqMode == 2)];
+    outDir       = par.filenames[2 + (par.seqMode == 2)];
     matchPerKmer = par.matchPerKmer;
     kmerFormat = par.kmerFormat;
-    
-    taxonomy = new TaxonomyWrapper(
-                    taxDbDir + "/names.dmp",
-                    taxDbDir + "/nodes.dmp",
-                    taxDbDir + "/merged.dmp",
-                    true);
     
     geneticCode = new GeneticCode(par.reducedAA == 1);
     queryIndexer = new QueryIndexer(par);
     queryIndexer->setKmerLen(12);
     kmerExtractor = new KmerExtractor(par, *geneticCode, kmerFormat);
-    updatedResultFileName = outDir + "/updated_classifications.tsv";
-    updatedReportFileName = outDir + "/updated_report.tsv";
-
-    reporter = new Reporter(par, taxonomy);
-    // kmerFileHandler = new KmerFileHandler();
 }
 
 GroupGenerator::~GroupGenerator() {
-    delete taxonomy;
     delete queryIndexer;
     delete kmerExtractor;
-    delete reporter;
     delete geneticCode;
-    // delete kmerFileHandler;
 }
 
 void GroupGenerator::startGroupGeneration(const LocalParameters &par) {  
@@ -114,9 +98,6 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         } 
     }   
 
-    vector<OrgResult> orgResult;       
-    loadOrgResult(orgResult);
-
     makeSubGraph(processedReadCnt);   
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
@@ -125,12 +106,6 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     
     mergeGraph(processedReadCnt);
     makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
-
-    std::unordered_map<int, int> external2internalTaxId;
-    taxonomy->getExternal2internalTaxID(external2internalTaxId);
-    unordered_map<uint32_t, uint32_t> repLabel; 
-    getRepLabel(orgResult, groupInfo, repLabel, external2internalTaxId);
-    applyRepLabel(orgResult, queryGroupInfo, repLabel, external2internalTaxId);
 }
 
 void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
@@ -393,41 +368,6 @@ std::vector<std::pair<size_t, size_t>> GroupGenerator::getKmerRanges(const Buffe
     return ranges;
 }
 
-void GroupGenerator::loadOrgResult(vector<OrgResult>& orgResults) {
-    ifstream inFile(orgRes);
-    if (!inFile.is_open()) {
-        cerr << "Error opening file: " << orgRes << endl;
-        return;
-    }
-
-    int classificationCol = par.taxidCol - 1; 
-    int scoreCol = par.scoreCol - 1; 
-    int readNameCol = par.readIdCol - 1; 
-    if (par.weightMode == 0 || scoreCol < 0) {
-        string line;
-        while (getline(inFile, line)) {
-            if (line.empty()) continue;
-            if (line.front() == '#') continue;
-            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
-            TaxID taxId = stoi(columns[classificationCol]);
-            orgResults.push_back({taxId, 1.0, columns[readNameCol]});
-        }
-    } else {
-        string line;
-        while (getline(inFile, line)) {
-            if (line.empty()) continue;
-            if (line.front() == '#') continue;
-            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
-            TaxID taxId = stoi(columns[classificationCol]);
-            float score = stof(columns[scoreCol]);
-            orgResults.push_back({taxId, score, columns[readNameCol]});
-        }
-    }
-    inFile.close();
-    cout << "Original Metabuli result loaded from " << orgRes << " successfully." << endl;
-    cout << "Number of query result: " << orgResults.size() << endl;
-}
-
 void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
@@ -666,90 +606,39 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
-void GroupGenerator::getRepLabel(vector<OrgResult> &orgResults, 
-                                 const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
-                                 unordered_map<uint32_t, uint32_t> &repLabel,
-                                 std::unordered_map<int, int>& external2internalTaxId) {
-    cout << "Find query group representative labels..." << endl;    
-    time_t beforeSearch = time(nullptr);
-
-    for (const auto& group : groupInfo) {
-        uint32_t groupId = group.first;
-        const unordered_set<uint32_t>& queryIds = group.second;
-
-        vector<WeightedTaxHit> setTaxa;
-
-        for (const auto& queryId : queryIds) {
-            int query_label = external2internalTaxId[orgResults[queryId].label]; 
-            if (par.weightMode == 0) {
-                float score = 1; 
-                if (query_label != 0) {
-                    setTaxa.emplace_back(query_label, score, 2);
-                }
-            } else if (par.weightMode == 1) {
-                float score = orgResults[queryId].score;
-                if (query_label != 0 && score >= par.minVoteScr) {
-                    setTaxa.emplace_back(query_label, score, 2);
-                }
-            } else if (par.weightMode == 2) {
-                float score = orgResults[queryId].score;
-                if (query_label != 0 && score >= par.minVoteScr) {
-                    setTaxa.emplace_back(query_label, score * score, 2);
-                }
-            }
-        }
-
-        WeightedTaxResult result = taxonomy->weightedMajorityLCA(setTaxa, par.majorityThr);
-
-        if (result.taxon != 0 && result.taxon != 1) {
-            repLabel[groupId] = result.taxon;
-        }
-        else{
-            repLabel[groupId] = 0;
-        }
-    }
-
-    const string& groupRepFileName = outDir + "/groupRep";
-    ofstream outFile(groupRepFileName);
-    if (!outFile.is_open()) {
-        cerr << "Error opening file: " << groupRepFileName << endl;
+void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
+                                      const vector<uint32_t> &queryGroupInfo) {
+    // save group in txt file
+    const string& groupInfoFileName = outDir + "/groups";
+    ofstream outFile1(groupInfoFileName);
+    if (!outFile1.is_open()) {
+        cerr << "Error opening file: " << groupInfoFileName << endl;
         return;
     }
 
-    for (const auto& [groupId, groupRep] : repLabel) {
-        outFile << groupId << "\t" << taxonomy->getOriginalTaxID(groupRep) << "\n";
+    for (const auto& [groupId, queryIds] : groupInfo) {
+        outFile1 << groupId << "\t";
+        for (const auto& queryId : queryIds) {
+            outFile1 << queryId << "\t";
+        }
+        outFile1 << endl;
+    }
+    outFile1.close();
+    cout << "Query group saved to " << groupInfoFileName << " successfully." << endl;
+    
+
+    const string& queryGroupInfoFileName = outDir + "/queryGroupMap";
+    ofstream outFile2(queryGroupInfoFileName);
+    if (!outFile2.is_open()) {
+        cerr << "Error opening file: " << queryGroupInfoFileName << endl;
+        return;
     }
 
-    outFile.close();
+    for (size_t i = 0; i < queryGroupInfo.size(); ++i) {
+        outFile2 << i << "\t" << queryGroupInfo[i] << "\n";
+    }
+    outFile2.close();
+    cout << "Query group saved to " << queryGroupInfoFileName << " successfully." << endl;
 
-    cout << "Query group representative label saved to " << groupRepFileName << " successfully." << endl;    
-    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
-}
-
-void GroupGenerator::applyRepLabel(const vector<OrgResult>& orgResults, 
-                                   const vector<uint32_t>& queryGroupInfo, 
-                                   const unordered_map<uint32_t, uint32_t>& repLabel,
-                                   std::unordered_map<int, int>& external2internalTaxId) {
-    cout << "Apply query group representative labels..." << endl;    
-    time_t beforeSearch = time(nullptr);
-
-    vector<Query> queryList;
-
-    for (int queryIdx = 0; queryIdx < orgResults.size() ; queryIdx++){
-        uint32_t groupId = queryGroupInfo[queryIdx];
-        auto repLabelIt = repLabel.find(groupId);
-        if (repLabelIt != repLabel.end() && repLabelIt->second != 0){
-            queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, repLabelIt->second, orgResults[queryIdx].name));
-        } else{
-            queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, orgResults[queryIdx].label, orgResults[queryIdx].name));           
-
-        }
-    }    
-
-    reporter->openReadClassificationFile(updatedResultFileName);
-    reporter->writeReadClassification(queryList, queryGroupInfo);    
-    reporter->closeReadClassificationFile();
-    
-    cout << "Result saved to " << updatedResultFileName << " successfully." << endl;    
-    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
+    return;
 }

@@ -23,6 +23,7 @@ public:
 
     std::vector<MMseqsParameter*> classify;
     std::vector<MMseqsParameter*> groupGeneration;
+    std::vector<MMseqsParameter*> groupApplication;
     std::vector<MMseqsParameter*> extract;
     std::vector<MMseqsParameter*> filter;
     std::vector<MMseqsParameter*> exclusiontest_hiv;
@@ -86,21 +87,20 @@ public:
     PARAMETER(PRINT_LINEAGE)
     PARAMETER(MAX_SHIFT)
     PARAMETER(EM)
-    PARAMETER(NEIGHBOR_KMERS)
-
+    
     // extract
     PARAMETER(TARGET_TAX_ID)
     PARAMETER(EXTRACT_MODE)
     PARAMETER(PARAM_OUTDIR)
-
+    
     // Group generation
+    PARAMETER(NEIGHBOR_KMERS)
     PARAMETER(MIN_EDGE_WEIGHT)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
+    PARAMETER(READID_COL)
+    PARAMETER(TAXID_COL)
     PARAMETER(WEIGHT_MODE)
-    int weightMode;
-
-    PARAMETER(MIN_OVERLAP_RATIO)
 
     // DB build parameters
     PARAMETER(LIBRARY_PATH)
@@ -122,8 +122,6 @@ public:
     //  parameters
     PARAMETER(TEST_RANK)
     PARAMETER(TEST_TYPE)
-    PARAMETER(READID_COL)
-    PARAMETER(TAXID_COL)
 
     PARAMETER(PRINT_COLUMNS)
     PARAMETER(CLADE_RANK)
@@ -182,19 +180,25 @@ public:
     int matchPerKmer;
     int minSSMatch;
     float tieRatio;
-    float thresholdK;
-    float minVoteScr;
-    float minOverlapRatio;
-    int minEdgeWeight;
-    int neighborKmers;
     int printLineage;
     int maxShift;
     bool em;
-
+    
     // Extract
     int targetTaxId;
     int extractMode;
     std::string outputDir;
+    
+    // Group generation
+    int minEdgeWeight;
+    int neighborKmers;
+
+    // Group application
+    int scoreCol;
+    int readIdCol;
+    int taxidCol;   
+    int weightMode;
+    float minVoteScr;
 
     // Database creation
     std::string tinfoPath;
@@ -218,9 +222,6 @@ public:
     std::string testRank;
     std::string testType;
     std::string printColumns;
-    int readIdCol;
-    int taxidCol;
-    int scoreCol;
     std::string cladeRank;
     int skipSecondary;
 

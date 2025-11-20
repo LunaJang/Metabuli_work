@@ -6,6 +6,7 @@ extern int build(int argc, const char **argv, const Command& command);
 extern int updateDB(int argc, const char **argv, const Command& command);
 extern int classify(int argc, const char **argv, const Command& command);
 extern int groupGeneration(int argc, const char **argv, const Command& command);
+extern int groupApplication(int argc, const char **argv, const Command& command);
 extern int filter(int argc, const char **argv, const Command& command);
 extern int grade(int argc, const char **argv, const Command& command);
 extern int gradeGroup(int argc, const char **argv, const Command& command);

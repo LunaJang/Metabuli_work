@@ -15,8 +15,6 @@
 #include "QueryIndexer.h"
 #include "ReducedKmerMatcher.h"
 #include "KmerExtractor.h"
-#include "Taxonomer.h"
-#include "Reporter.h"
 #include "KSeqWrapper.h"
 #include "DeltaIdxReader.h"
 #include <set>
@@ -117,18 +115,10 @@ public:
     }
 };
 
-struct OrgResult {
-    int label;
-    float score;
-    string name;
-};
-
 class GroupGenerator {
 protected:
     const LocalParameters & par;
     string commonKmerDB;
-    string taxDbDir;
-    string orgRes;
     string outDir;
     size_t matchPerKmer;
     int kmerFormat;
@@ -137,16 +127,7 @@ protected:
     GeneticCode * geneticCode = nullptr;
     QueryIndexer *queryIndexer = nullptr;
     KmerExtractor *kmerExtractor = nullptr;
-    Reporter *reporter = nullptr;
-    TaxonomyWrapper *taxonomy = nullptr;
 
-    // Output
-    string updatedResultFileName;
-    string updatedReportFileName;
-    unordered_map<TaxID, unsigned int> taxCounts;
-    
-    unordered_map<TaxID, TaxID> taxId2speciesId;
-    unordered_map<TaxID, TaxID> taxId2genusId;
     size_t numOfSplits = 0;
     size_t numOfGraph = 0;
     std::vector<uint64_t> kmerBoundaries;
@@ -155,6 +136,8 @@ protected:
 
 public:
     GroupGenerator(LocalParameters & par);
+
+    ~GroupGenerator();
 
     void startGroupGeneration(const LocalParameters & par);
     
@@ -168,8 +151,6 @@ public:
     std::vector<std::pair<size_t, size_t>> getKmerRanges(const Buffer<Kmer>& kmerBuffer, 
                                                          size_t offset);
 
-    void loadOrgResult(vector<OrgResult>& orgResults);
-
     void makeSubGraph(size_t processedReadCnt);
     
     void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
@@ -181,20 +162,9 @@ public:
                     size_t processedReadCnt,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
                     vector<uint32_t> &queryGroupInfo);
-
-    void getRepLabel(vector<OrgResult>& orgResults, 
-                     const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
-                     unordered_map<uint32_t, uint32_t>& repLabel,
-                     std::unordered_map<int, int>& external2internalTaxId);
     
-    void loadRepLabel(std::unordered_map<uint32_t, uint32_t>& repLabel);
-
-    void applyRepLabel(const vector<OrgResult>& orgResults, 
-                       const vector<uint32_t>& queryGroupInfo, 
-                       const unordered_map<uint32_t, uint32_t>& repLabel,
-                       std::unordered_map<int, int>& external2internalTaxId);
-
-    ~GroupGenerator();
+    void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+                          const vector<uint32_t>& queryGroupInfo);
 };
 
 
