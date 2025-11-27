@@ -288,7 +288,7 @@ std::vector<Command> metabuliCommands = {
                 "Generate read groups based on k-mer sharing between reads",
                 nullptr,
                 "Luna Sung-eun Jang <jse9512@gmail.com>",
-                "<i:query file(s)> <i:common k-mer database> <i: taxonomy directory> <i: read-by-read result> <o: output directory>",
+                "<i:query file(s)> <i:common k-mer database> <o: output directory>",
                 CITATION_SPACEPHARER,
                 {{"FASTA/Q", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA | DbType::VARIADIC, &DbValidator::flatfile},
                  {"common k-mer database", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::directory},

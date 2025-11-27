@@ -55,8 +55,8 @@ public:
     std::vector<bool> grouped;
 
     DisjointSet(size_t numQuery) 
-        : parent(numQuery), rank(numQuery), grouped(numQuery) {
-        for (size_t i = 0; i < numQuery; ++i) {
+        : parent(numQuery + 1), rank(numQuery + 1), grouped(numQuery + 1) {
+        for (size_t i = 1; i <= numQuery; ++i) {
             parent[i] = i;
             rank[i] = 0;
             grouped[i] = false;
@@ -96,13 +96,13 @@ public:
     }
 
     void flatten() {
-        for (size_t i = 0; i < parent.size(); ++i) {
+        for (size_t i = 1; i < parent.size(); ++i) {
             parent[i] = find(i);
         }
     }
 
     DisjointSet& operator+=(const DisjointSet& rhs) {
-        for (size_t i = 0; i < parent.size(); ++i) {
+        for (size_t i = 1; i < parent.size(); ++i) {
             uint32_t p = rhs.parent[i];
             if (p != i) unionSets(i, p);
         }

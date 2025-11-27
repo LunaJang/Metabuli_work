@@ -84,15 +84,15 @@ void Reporter::writeReadClassification(const vector<Query> & queryList, bool cla
 
 void Reporter::writeReadClassification(const vector<Query> & queryList, const vector<uint32_t>& groupIdList, bool classifiedOnly) {
     if (isFirstTime) {
-        readClassificationFile << "#is_classified\tname\ttaxID\tquery_length\tscore\trank";
+        readClassificationFile << "#is_classified\tname\ttaxID\tquery_length\tscore\trank\tgroup";
         if (par.printLineage) {
             readClassificationFile << "\tlineage";
         }
-        readClassificationFile << "\ttaxID:match_count\tgroup\n";
+        readClassificationFile << "\ttaxID:match_count\n";
         isFirstTime = false;
     }
-    for (size_t i = 0; i < queryList.size(); i++) {
 
+    for (size_t i = 0; i < queryList.size(); i++) {
         string groupID;
         if (groupIdList[i] == 0){
             groupID = "-";
@@ -100,7 +100,6 @@ void Reporter::writeReadClassification(const vector<Query> & queryList, const ve
         else{
             groupID = to_string(groupIdList[i]);
         }
-
         if (classifiedOnly && !queryList[i].isClassified) {
             continue;
         }

@@ -223,8 +223,6 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                 if (!isdigit(fields[par.taxidCol][0])) {
                     continue;
                 }
-
-      
                 
                 string id = fields[par.readIdCol];
                 string fullId = id;

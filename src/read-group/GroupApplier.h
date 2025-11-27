@@ -51,9 +51,10 @@ public:
 
     void loadOrgResult(vector<OrgResult>& orgResults, size_t& processedReadCnt);
 
-    void loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
-                    vector<uint32_t>& queryGroupInfo,
-                    const string& groupFileDir);
+    void loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
+                                        vector<uint32_t> &groupMappingInfo,
+                                        const string &groupInfoFileName,
+                                        const string &groupMappingInfoFileName);
     
     void getRepLabel(vector<OrgResult>& orgResults, 
                      const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 

@@ -102,10 +102,11 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<uint32_t> queryGroupInfo;
-    queryGroupInfo.resize(processedReadCnt, 0);
+    queryGroupInfo.resize(processedReadCnt + 1, 0);
     
     mergeGraph(processedReadCnt);
     makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
+    saveGroupsToFile(groupInfo, queryGroupInfo);
 }
 
 void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
@@ -328,7 +329,7 @@ void GroupGenerator::writeKmers(Buffer<Kmer>& queryKmerBuffer,
         uint64_t lastKmer = 0;
         for (size_t i = startIdx; i < endIdx; i++) {
             queryKmerBuffer.buffer[i].qInfo.sequenceID += processedReadCnt;
-            uint32_t id = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID - 1);
+            uint32_t id = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID);
             infoBuffer.write(&id);
             IndexCreator::getDiffIdx(lastKmer, queryKmerBuffer.buffer[i].value, diffBuffer);
         }
@@ -407,7 +408,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             for (size_t file = 0; file < this->numOfSplits; ++file) {
                 while (currentKmers[file].value == minKmer) {
                     uint32_t seqId = currentKmers[file].tInfo.taxId; // query ID is stored in taxId field
-                    if (seqId != UINT32_MAX && seqId < processedReadCnt) {
+                    if (seqId != UINT32_MAX && seqId <= processedReadCnt) {
                         currentQueryIds.emplace_back(seqId);
                     }
                     currentKmers[file] = deltaIdxReaders[file]->next();
@@ -594,7 +595,7 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     }
     relationLog.close();
 
-    for (uint32_t queryId = 0; queryId < ds.parent.size(); queryId++) {
+    for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]){
             uint32_t groupId = ds.find(queryId);
             groupInfo[groupId].insert(queryId);
@@ -627,14 +628,14 @@ void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_se
     cout << "Query group saved to " << groupInfoFileName << " successfully." << endl;
     
 
-    const string& queryGroupInfoFileName = outDir + "/queryGroupMap";
+    const string& queryGroupInfoFileName = outDir + "/groupMap";
     ofstream outFile2(queryGroupInfoFileName);
     if (!outFile2.is_open()) {
         cerr << "Error opening file: " << queryGroupInfoFileName << endl;
         return;
     }
 
-    for (size_t i = 0; i < queryGroupInfo.size(); ++i) {
+    for (size_t i = 1; i < queryGroupInfo.size(); ++i) {
         outFile2 << i << "\t" << queryGroupInfo[i] << "\n";
     }
     outFile2.close();

@@ -3,11 +3,11 @@
 #include "common.h"
 #include "Kmer.h"
 GroupApplier::GroupApplier(LocalParameters & par) : par(par) {
-    groupFileDir    = par.filenames[1 + (par.seqMode == 2)];
-    groupmapFileDir = par.filenames[2 + (par.seqMode == 2)];
-    taxDbDir        = par.filenames[3 + (par.seqMode == 2)];
-    orgRes          = par.filenames[4 + (par.seqMode == 2)];
-    outDir          = par.filenames[5 + (par.seqMode == 2)];
+    groupFileDir    = par.filenames[0];
+    groupmapFileDir = par.filenames[1];
+    taxDbDir        = par.filenames[2];
+    orgRes          = par.filenames[3];
+    outDir          = par.filenames[4];
     
     taxonomy = new TaxonomyWrapper(
                     taxDbDir + "/names.dmp",
@@ -42,7 +42,7 @@ void GroupApplier::startGroupApplication(const LocalParameters &par) {
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<uint32_t> groupMappingInfo;
     groupMappingInfo.resize(processedReadCnt, 0);
-    loadGroupsFromFile(groupInfo, groupMappingInfo, outDir);
+    loadGroupsFromFile(groupInfo, groupMappingInfo, groupFileDir, groupmapFileDir);
 
     std::unordered_map<int, int> external2internalTaxId;
     taxonomy->getExternal2internalTaxID(external2internalTaxId);
@@ -91,10 +91,8 @@ void GroupApplier::loadOrgResult(vector<OrgResult>& orgResults, size_t& processe
 
 void GroupApplier::loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
                                         vector<uint32_t> &groupMappingInfo,
-                                        const string &groupFileDir) {
-    const string groupInfoFileName = groupFileDir + "/groups";
-    const string groupMappingInfoFileName = groupFileDir + "/groupsMapping";
-
+                                        const string &groupInfoFileName,
+                                        const string &groupMappingInfoFileName) {
     // 1. Load groupInfo
     ifstream inFile1(groupInfoFileName);
     if (!inFile1.is_open()) {
@@ -110,7 +108,7 @@ void GroupApplier::loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint
 
         uint32_t queryId;
         while (ss >> queryId) {
-            groupInfo[groupId].insert(queryId);
+            groupInfo[groupId].insert(queryId - 1); // convert to 0-based index
         }
     }
     inFile1.close();
@@ -125,7 +123,8 @@ void GroupApplier::loadGroupsFromFile(unordered_map<uint32_t, unordered_set<uint
 
     groupMappingInfo.clear();
     int groupId;
-    while (inFile2 >> groupId) {
+    string readId;
+    while (inFile2 >> readId >> groupId) {
         groupMappingInfo.emplace_back(groupId);
     }
     inFile2.close();
@@ -205,15 +204,22 @@ void GroupApplier::applyRepLabel(const vector<OrgResult>& orgResults,
         uint32_t groupId = groupMappingInfo[queryIdx];
         auto repLabelIt = repLabel.find(groupId);
         if (repLabelIt != repLabel.end() && repLabelIt->second != 0){
-            queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, repLabelIt->second, orgResults[queryIdx].name));
+            queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, true, orgResults[queryIdx].name));
         } else{
-            queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, orgResults[queryIdx].label, orgResults[queryIdx].name));           
-
+            if (orgResults[queryIdx].label == 0){
+                queryList.emplace_back(Query(0, orgResults[queryIdx].score, false, orgResults[queryIdx].name));  
+            } else{
+                queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, true, orgResults[queryIdx].name)); 
+            }  
         }
     }    
 
+    cout << "Writing updated classification file..." << endl;
+
     reporter->openReadClassificationFile(updatedResultFileName);
+    cout << "file opened " << queryList.size() << " queryList " << groupMappingInfo.size() << " groupMappingInfo" << endl;
     reporter->writeReadClassification(queryList, groupMappingInfo);    
+    cout << "writing done" << endl;
     reporter->closeReadClassificationFile();
     
     cout << "Result saved to " << updatedResultFileName << " successfully." << endl;    
