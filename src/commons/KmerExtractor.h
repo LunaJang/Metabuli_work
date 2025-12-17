@@ -52,13 +52,11 @@ private:
     void processSequence(
         size_t count,
         size_t processedQueryNum,
-        const vector<string> & reads,
-        const vector<bool> & emptyReads,
-        char *seq,
-        char *maskedSeq,
-        size_t & maxReadLength,
-        Buffer<Kmer> &kmerBuffer,
-        const vector<Query> & queryList,
+        const vector<string>& reads,
+        const vector<bool>& emptyReads,
+        std::vector<char>& maskedSeq,
+        Buffer<Kmer>& kmerBuffer,
+        const vector<Query>& queryList,
         bool isReverse);
 
     void fillQueryKmerBuffer(

@@ -84,13 +84,13 @@ void KmerExtractor::fillQueryKmerBufferParallel(KSeqWrapper *kseq,
                                                 Buffer<Kmer> &kmerBuffer,
                                                 std::vector<Query> &queryList,
                                                 const QuerySplit &currentSplit,
-                                                const LocalParameters &par) {   
+                                                const LocalParameters &par) {
     size_t readLength = 1000;
     size_t processedQueryNum = 0;
     size_t chunkSize = 1000;
- 
+
     // Reserve memory for each read of the chunk for each thread
-    std::vector<std::vector<string>> chunkReads_thread(par.threads);
+    std::vector<std::vector<std::string>> chunkReads_thread(par.threads);
     for (int i = 0; i < par.threads; ++i) {
         chunkReads_thread[i].resize(chunkSize);
         for (size_t j = 0; j < chunkSize; ++j) {
@@ -101,52 +101,46 @@ void KmerExtractor::fillQueryKmerBufferParallel(KSeqWrapper *kseq,
     // Vector to check empty reads
     std::vector<std::vector<bool>> emptyReads(par.threads);
     for (int i = 0; i < par.threads; ++i) {
-        emptyReads[i].resize(chunkSize);
-        for (size_t j = 0; j < chunkSize; ++j) {
-            emptyReads[i][j] = false;
-        }
+        emptyReads[i].resize(chunkSize, false);
     }
 
     // Initialize atomic variable for active tasks
-    std::vector<atomic<bool>> busyThreads(par.threads);
+    std::vector<std::atomic<bool>> busyThreads(par.threads);
     for (int i = 0; i < par.threads; ++i) {
-        busyThreads[i].store(false);
+        busyThreads[i].store(false, std::memory_order_relaxed);
     }
 
-    // OpenMP parallel region with tasks
 #pragma omp parallel default(none) shared(par, readLength, kmerBuffer, \
 queryList, currentSplit, processedQueryNum, kseq, chunkSize, chunkReads_thread, busyThreads, emptyReads)
     {
-        char *maskedSeq = new char[readLength];
-        char *seq = nullptr;     
-#pragma omp single nowait
+#pragma omp single
         {
             int masterThread = 0;
-            #ifdef OPENMP
-               masterThread = omp_get_thread_num();
-            #endif
-            size_t count = 0;
+#ifdef OPENMP
+            masterThread = omp_get_thread_num();
+#endif
+
             while (processedQueryNum < currentSplit.readCnt) {
-                // Find an idle thread
+                // Find an idle "worker id" (your own scheduling logic)
                 int threadId;
                 if (par.threads == 1) {
                     threadId = 0;
                 } else {
                     for (threadId = 0; threadId < par.threads; ++threadId) {
                         if (threadId == masterThread) { continue; }
-                        if (!busyThreads[threadId].load()) {
-                            busyThreads[threadId].store(true);
+                        if (!busyThreads[threadId].load(std::memory_order_relaxed)) {
+                            busyThreads[threadId].store(true, std::memory_order_relaxed);
                             break;
                         }
                     }
                 }
-                
+
                 if (threadId == par.threads) {
                     continue;
                 }
 
-                size_t chunkEnd = min(processedQueryNum + chunkSize, currentSplit.readCnt);
-                count = 0;
+                size_t chunkEnd = std::min(processedQueryNum + chunkSize, currentSplit.readCnt);
+                size_t count = 0;
 
                 loadChunkOfReads(kseq,
                                  queryList,
@@ -159,18 +153,44 @@ queryList, currentSplit, processedQueryNum, kseq, chunkSize, chunkReads_thread, 
                                  false);
 
                 if (par.threads == 1) {
-                    processSequence(count, processedQueryNum, chunkReads_thread[threadId], emptyReads[threadId], seq, maskedSeq, readLength, kmerBuffer, queryList, false);
+                    // Single-thread path: still use vector-based masked buffer
+                    std::vector<char> maskedSeq;
+                    maskedSeq.reserve(readLength);
+
+                    processSequence(count,
+                                    processedQueryNum,
+                                    chunkReads_thread[threadId],
+                                    emptyReads[threadId],
+                                    maskedSeq,
+                                    kmerBuffer,
+                                    queryList,
+                                    false);
+
+                    busyThreads[threadId].store(false, std::memory_order_relaxed);
                 } else {
-                    #pragma omp task firstprivate(count, processedQueryNum, threadId)
+#pragma omp task firstprivate(count, processedQueryNum, threadId)
                     {
-                        processSequence(count, processedQueryNum, chunkReads_thread[threadId], emptyReads[threadId], seq, maskedSeq, readLength, kmerBuffer, queryList, false);
-                        busyThreads[threadId].store(false);
+                        std::vector<char> maskedSeq;
+                        maskedSeq.reserve(1024);
+
+                        processSequence(count,
+                                        processedQueryNum,
+                                        chunkReads_thread[threadId],
+                                        emptyReads[threadId],
+                                        maskedSeq,
+                                        kmerBuffer,
+                                        queryList,
+                                        false);
+
+                        busyThreads[threadId].store(false, std::memory_order_relaxed);
                     }
-                }  
-            }
-        }
-        delete[] maskedSeq;
-    }
+                }
+            } // while
+
+            // Ensure all tasks complete before leaving single/parallel region
+#pragma omp taskwait
+        } // single
+    } // parallel
 }
 
 void KmerExtractor::fillQueryKmerBufferParallel_paired(KSeqWrapper *kseq1,
@@ -212,129 +232,122 @@ void KmerExtractor::fillQueryKmerBufferParallel_paired(KSeqWrapper *kseq1,
 #pragma omp parallel default(none) shared(par, readLength, \
 kmerBuffer, queryList, currentSplit, processedQueryNum, kseq1, kseq2, \
 chunkSize, chunkReads1_thread, chunkReads2_thread, busyThreads, cout, emptyReads)
-    {
-        size_t maxReadLength1 = 1000;
-        size_t maxReadLength2 = 1000;
-        char *maskedSeq1 = new char[maxReadLength1];
-        char *maskedSeq2 = new char[maxReadLength2];   
-        char *seq1 = nullptr;
-        char *seq2 = nullptr;  
+{
 #pragma omp single
-        {
-            int masterThread = 0;
-            #ifdef OPENMP
-               masterThread = omp_get_thread_num();
-            #endif
-           
-            while (processedQueryNum < currentSplit.readCnt) {
-                // Find an idle thread
-                int threadId;
-                if (par.threads == 1) {
-                    threadId = 0;
-                } else {
-                    for (threadId = 0; threadId < par.threads; ++threadId) {
-                        if (threadId == masterThread) { continue; }
-                        if (!busyThreads[threadId].load()) {
-                            busyThreads[threadId].store(true);
-                            break;
-                        }
+    {
+        int masterThread = 0;
+#ifdef OPENMP
+        masterThread = omp_get_thread_num();
+#endif
+
+        while (processedQueryNum < currentSplit.readCnt) {
+            int threadId;
+
+            if (par.threads == 1) {
+                threadId = 0;
+            } else {
+                for (threadId = 0; threadId < par.threads; ++threadId) {
+                    if (threadId == masterThread) continue;
+                    if (!busyThreads[threadId].load(std::memory_order_relaxed)) {
+                        busyThreads[threadId].store(true, std::memory_order_relaxed);
+                        break;
                     }
                 }
-                if (threadId == par.threads) {
-                    continue;
+            }
+            if (threadId == par.threads) continue;
+
+            size_t chunkEnd = min(processedQueryNum + chunkSize, currentSplit.readCnt);
+
+            size_t count = 0;
+            size_t processedQueryNumCopy = processedQueryNum;
+
+            loadChunkOfReads(kseq1, queryList, processedQueryNum, chunkSize, chunkEnd,
+                             chunkReads1_thread[threadId], emptyReads[threadId], count, false);
+
+            count = 0;
+            processedQueryNum = processedQueryNumCopy;
+
+            loadChunkOfReads(kseq2, queryList, processedQueryNum, chunkSize, chunkEnd,
+                             chunkReads2_thread[threadId], emptyReads[threadId], count, true);
+
+            if (par.threads == 1) {
+                std::vector<char> masked1, masked2;
+                masked1.reserve(1024);
+                masked2.reserve(1024);
+
+                processSequence(count, processedQueryNum,
+                                chunkReads1_thread[threadId], emptyReads[threadId],
+                                masked1, kmerBuffer, queryList, false);
+
+                processSequence(count, processedQueryNum,
+                                chunkReads2_thread[threadId], emptyReads[threadId],
+                                masked2, kmerBuffer, queryList, true);
+
+                busyThreads[threadId].store(false, std::memory_order_relaxed);
+            } else {
+#pragma omp task firstprivate(count, processedQueryNum, threadId)
+                {
+                    std::vector<char> masked1, masked2;
+                    masked1.reserve(1024);
+                    masked2.reserve(1024);
+
+                    processSequence(count, processedQueryNum,
+                                    chunkReads1_thread[threadId], emptyReads[threadId],
+                                    masked1, kmerBuffer, queryList, false);
+
+                    processSequence(count, processedQueryNum,
+                                    chunkReads2_thread[threadId], emptyReads[threadId],
+                                    masked2, kmerBuffer, queryList, true);
+
+                    busyThreads[threadId].store(false, std::memory_order_relaxed);
                 }
+            }
+        } 
 
-                size_t chunkEnd = min(processedQueryNum + chunkSize, currentSplit.readCnt);
-                
-                size_t count = 0;
-                size_t processedQueryNumCopy = processedQueryNum;
-                loadChunkOfReads(kseq1,
-                                 queryList,
-                                 processedQueryNum,
-                                 chunkSize,
-                                 chunkEnd,
-                                 chunkReads1_thread[threadId],
-                                 emptyReads[threadId],
-                                 count,
-                                 false);
-
-                count = 0;
-                processedQueryNum = processedQueryNumCopy;
-                loadChunkOfReads(kseq2,
-                                 queryList,
-                                 processedQueryNum,
-                                 chunkSize,
-                                 chunkEnd,
-                                 chunkReads2_thread[threadId],
-                                 emptyReads[threadId],
-                                 count,
-                                 true);
-
-                if (par.threads == 1) {
-                    processSequence(count, processedQueryNum, chunkReads1_thread[threadId], emptyReads[threadId], seq1, maskedSeq1, maxReadLength1, kmerBuffer, queryList, false);
-                    processSequence(count, processedQueryNum, chunkReads2_thread[threadId], emptyReads[threadId], seq2, maskedSeq2, maxReadLength2, kmerBuffer, queryList, true);
-                } 
-                else {
-                    #pragma omp task firstprivate(count, processedQueryNum, threadId)
-                    {
-                        processSequence(count, processedQueryNum, chunkReads1_thread[threadId], emptyReads[threadId], seq1, maskedSeq1, maxReadLength1, kmerBuffer, queryList, false);
-                        processSequence(count, processedQueryNum, chunkReads2_thread[threadId], emptyReads[threadId], seq2, maskedSeq2, maxReadLength2, kmerBuffer, queryList, true);
-                        busyThreads[threadId].store(false);
-                    }
-                }   
-            }   
-        }   
-        delete[] maskedSeq1;
-        delete[] maskedSeq2;
-    }
+#pragma omp taskwait
+    } 
+} 
 }
 
 void KmerExtractor::processSequence(
     size_t count,
     size_t processedQueryNum,
-    const vector<string> & reads,
-    const vector<bool> & emptyReads,
-    char *seq,
-    char *maskedSeq,
-    size_t & maxReadLength,
-    Buffer<Kmer> &kmerBuffer,
-    const vector<Query> & queryList,
-    bool isReverse) 
+    const vector<string>& reads,
+    const vector<bool>& emptyReads,
+    std::vector<char>& maskedSeq,
+    Buffer<Kmer>& kmerBuffer,
+    const vector<Query>& queryList,
+    bool isReverse)
 {
     for (size_t i = 0; i < count; ++i) {
-        size_t queryIdx = processedQueryNum - count + i;
-        if (emptyReads[i]) { continue; }
-        // Get masked sequence
+        size_t queryIdx = processedQueryNum - count + i;   // ✅ 복원
+        if (emptyReads[i]) continue;
+
+        const char* seq = nullptr;
+
         if (maskMode) {
-            if (maxReadLength < reads[i].length() + 1) {
-                maxReadLength = reads[i].length() + 1;
-                delete[] maskedSeq;
-                maskedSeq = new char[maxReadLength];
-            }
-            SeqIterator::maskLowComplexityRegions((unsigned char *) reads[i].c_str(), (unsigned char *) maskedSeq, *probMatrix, maskProb, subMat);
-            seq = maskedSeq;
+            maskedSeq.resize(reads[i].size() + 1);
+            SeqIterator::maskLowComplexityRegions(
+                (unsigned char*)reads[i].c_str(),
+                (unsigned char*)maskedSeq.data(),
+                *probMatrix, maskProb, subMat);
+            seq = maskedSeq.data();
         } else {
-            seq = const_cast<char *>(reads[i].c_str());
+            seq = reads[i].c_str();
         }
 
         size_t posToWrite = 0;
         if (isReverse) {
             posToWrite = kmerBuffer.reserveMemory(queryList[queryIdx].kmerCnt2);
-            fillQueryKmerBuffer(
-                seq,
-                (int) reads[i].length(),
-                kmerBuffer,
-                posToWrite, 
-                (uint32_t) queryIdx+1,
-                queryList[queryIdx].queryLength+3);
+            fillQueryKmerBuffer(seq, (int)reads[i].length(),
+                                kmerBuffer, posToWrite,
+                                (uint32_t)queryIdx + 1,
+                                queryList[queryIdx].queryLength + 3);
         } else {
             posToWrite = kmerBuffer.reserveMemory(queryList[queryIdx].kmerCnt);
-            fillQueryKmerBuffer(
-                seq, 
-                (int) reads[i].length(), 
-                kmerBuffer, 
-                posToWrite, 
-                (uint32_t) queryIdx+1);                             
+            fillQueryKmerBuffer(seq, (int)reads[i].length(),
+                                kmerBuffer, posToWrite,
+                                (uint32_t)queryIdx + 1);
         }
     }
 }
