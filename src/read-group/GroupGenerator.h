@@ -122,6 +122,7 @@ protected:
     string outDir;
     size_t matchPerKmer;
     int kmerFormat;
+    int printLog;
     
     // Agents    
     GeneticCode * geneticCode = nullptr;
@@ -157,6 +158,8 @@ public:
                             const size_t counter_now);
 
     void mergeGraph(size_t processedReadCnt);
+
+    void mergeGraph_one(size_t processedReadCnt);
 
     void makeGroups(int groupKmerThr,
                     size_t processedReadCnt,

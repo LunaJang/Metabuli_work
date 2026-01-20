@@ -9,6 +9,7 @@ GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     outDir       = par.filenames[2 + (par.seqMode == 2)];
     matchPerKmer = par.matchPerKmer;
     kmerFormat = par.kmerFormat;
+    printLog = par.printLog;
     
     geneticCode = new GeneticCode(par.reducedAA == 1);
     queryIndexer = new QueryIndexer(par);
@@ -102,11 +103,15 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<uint32_t> queryGroupInfo;
-    queryGroupInfo.resize(processedReadCnt + 1, 0);
-    
-    mergeGraph(processedReadCnt);
-    makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
-    saveGroupsToFile(groupInfo, queryGroupInfo);
+    queryGroupInfo.resize(processedReadCnt + 1, 0); 
+
+    if (printLog) {
+        mergeGraph_one(processedReadCnt);
+    } else {
+        mergeGraph(processedReadCnt);
+        makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
+        saveGroupsToFile(groupInfo, queryGroupInfo);
+    }
 }
 
 void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
@@ -519,6 +524,50 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt) {
         else{
             relationLogs[par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';            
         }
+    }
+
+    for (size_t i = 0; i < numOfGraph; ++i) {
+        delete relationBuffers[i];
+    }
+
+    cout << "Query relation graph merged successfully" << endl;
+    cout << "Time spent: " << double(time(nullptr) - before) << " seconds." << endl;
+    return;
+}
+
+void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
+    cout << "Merging subgraphs" << endl;
+    time_t before = time(nullptr);
+
+    std::ofstream relationLog(outDir + "/relations.txt");
+
+    std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
+    std::vector<Relation> currentRelations(this->numOfGraph);
+    for (size_t i = 0; i < this->numOfGraph; ++i) {
+        relationBuffers[i] = new ReadBuffer<Relation>(outDir + "/subGraph_" + to_string(i), 1024 * 1024);
+        currentRelations[i] = relationBuffers[i]->getNext();
+    } 
+
+    while (true) {
+        Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
+        for (size_t i = 0; i < this->numOfGraph; ++i) {
+            if (currentRelations[i] < minRelation) {
+                minRelation = currentRelations[i];
+            }
+        }
+        if (minRelation.id1 == UINT32_MAX) break;
+        uint16_t totalWeight = 0;
+        for (size_t i = 0; i < this->numOfGraph; ++i) {
+            if (currentRelations[i] == minRelation) {
+                totalWeight += currentRelations[i].weight;
+                currentRelations[i] = relationBuffers[i]->getNext();
+                if (currentRelations[i] == Relation()) {
+                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
+                }
+            }
+        }
+
+        relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
     }
 
     for (size_t i = 0; i < numOfGraph; ++i) {

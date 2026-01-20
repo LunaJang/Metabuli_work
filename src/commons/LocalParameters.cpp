@@ -678,6 +678,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&SMER_LEN);
     groupGeneration.push_back(&MIN_EDGE_WEIGHT);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
+    groupGeneration.push_back(&PRINT_LOG);
 
     //groupApplication
     groupApplication.push_back(&SEQ_MODE);
