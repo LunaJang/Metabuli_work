@@ -579,6 +579,109 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     return;
 }
 
+
+void GroupGenerator::makeGroupsAdaptive(
+    const std::vector<uint16_t>& nodeThr,
+    size_t processedReadCnt,
+    std::vector<uint32_t>& queryGroupInfo,
+    std::vector<uint32_t>& degree
+) {
+    cout << "Creating groups (adaptive thresholds)..." << endl;
+    time_t beforeSearch = time(nullptr);
+
+    DisjointSet ds(processedReadCnt);
+
+    // degree는 kept edge 기준으로 새로 계산 (iteration마다 초기화)
+    degree.assign(processedReadCnt + 1, 0);
+
+    auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
+        std::ifstream relationLog(fname);
+        uint32_t id1, id2;
+        uint16_t w;
+        while (relationLog >> id1 >> id2 >> w) {
+            if (id1 == 0 || id2 == 0) continue;
+            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+
+            uint16_t t1 = nodeThr[id1];
+            uint16_t t2 = nodeThr[id2];
+
+            if (keepEdgeGeo(w, t1, t2)) {
+                subDs.unionSets(id1, id2);
+
+                #pragma omp atomic
+                degree[id1]++;
+
+                #pragma omp atomic
+                degree[id2]++;
+            }
+        }
+    };
+
+    // 1) relations_[0 .. threads-1]
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".txt", subDs);
+
+        subDs.flatten();
+        #pragma omp critical
+        { ds += subDs; }
+    }
+
+    // 2) relations_[threads .. 2*threads-1]
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+
+        DisjointSet subDs(processedReadCnt);
+        #pragma omp critical
+        { subDs = ds; } // 기존 코드 스타일 유지
+
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
+
+        subDs.flatten();
+        #pragma omp critical
+        { ds += subDs; }
+    }
+
+    // 3) relations_[2*threads]
+    {
+        std::ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
+        uint32_t id1, id2;
+        uint16_t w;
+        while (relationLog >> id1 >> id2 >> w) {
+            if (id1 == 0 || id2 == 0) continue;
+            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+
+            uint16_t t1 = nodeThr[id1];
+            uint16_t t2 = nodeThr[id2];
+
+            if (keepEdgeGeo(w, t1, t2)) {
+                ds.unionSets(id1, id2);
+
+                degree[id1]++; // single-thread
+                degree[id2]++;
+            }
+        }
+    }
+
+    ds.flatten();
+
+    // queryGroupInfo 갱신
+    queryGroupInfo.assign(processedReadCnt + 1, 0);
+    for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
+        if (ds.grouped[queryId]) {
+            uint32_t groupId = ds.parent[queryId];
+            queryGroupInfo[queryId] = groupId;
+        }
+    }
+
+    cout << "Adaptive grouping done." << endl;
+    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
+}
+
 void GroupGenerator::makeGroups(int groupKmerThr,
                                 size_t processedReadCnt,
                                 unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 

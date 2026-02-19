@@ -115,6 +115,12 @@ public:
     }
 };
 
+static inline bool keepEdgeGeo(uint16_t w, uint16_t tu, uint16_t tv) {
+    // w >= sqrt(tu*tv)  <=>  w*w >= tu*tv
+    return (uint64_t)w * (uint64_t)w >= (uint64_t)tu * (uint64_t)tv;
+}
+
+
 class GroupGenerator {
 protected:
     const LocalParameters & par;
@@ -161,13 +167,35 @@ public:
 
     void mergeGraph_one(size_t processedReadCnt);
 
+    void computeGroupMedianDegree(const std::vector<uint32_t>& queryGroupInfo,
+                                  const std::vector<uint32_t>& degree,
+                                  std::unordered_map<uint32_t, uint32_t>& groupMedianDeg);
+    
+    void makeGroupsAdaptive(const vector<uint16_t>& nodeThr,
+                            size_t processedReadCnt,
+                            vector<uint32_t>& queryGroupInfo,
+                            vector<uint32_t>& degree);         
+
     void makeGroups(int groupKmerThr,
                     size_t processedReadCnt,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
                     vector<uint32_t> &queryGroupInfo);
-    
+                    
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
                           const vector<uint32_t>& queryGroupInfo);
+    
+    uint16_t degreeToThr(uint32_t medDeg) const {
+        // medDeg in [0, 5)   -> thr 5
+        // medDeg in [5, 20)  -> thr 10
+        // medDeg in [20, 100)-> thr 20
+        // medDeg >= 100      -> thr 30
+
+        if (medDeg < 5)   return 5;
+        if (medDeg < 20)  return 10;
+        if (medDeg < 100) return 20;
+        return 30;
+    }
+
 };
 
 
