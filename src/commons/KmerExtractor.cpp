@@ -401,18 +401,18 @@ void KmerExtractor::extractKmer_dna2aa(
     for (int frame = 0; frame < 6; frame++) {
         bool isForward = frame < 3;
         int begin = 0;
+        int end = 0;
         if (isForward) {
-            begin = frame % 3;
+            begin = frame;
+            end = seqLen - 1;
         } else {
-            begin = (seqLen % 3) - (frame % 3);
-            if (begin < 0) {
-                begin += 3;
-            }
+            begin = 0;
+            end = seqLen - 1 - (frame % 3);
         }
-        kmerScanners[threadID]->initScanner(seq, begin, begin + seqLen - 1, isForward);
+        kmerScanners[threadID]->initScanner(seq, begin, end, isForward);
         Kmer kmer;
         while ((kmer = kmerScanners[threadID]->next()).value != UINT64_MAX) {
-            kmerBuffer.buffer[posToWrite++] = {kmer.value, seqId1, seqId2};
+            kmerBuffer.buffer[posToWrite++] = {kmer.value, static_cast<TaxID>(seqId1), static_cast<TaxID>(seqId2)};
         }
     }
 }
