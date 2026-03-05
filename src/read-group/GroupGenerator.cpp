@@ -110,6 +110,40 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     } else {
         mergeGraph(processedReadCnt);
         makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
+        
+        // Step 2: Iterative adaptive refinement
+        std::vector<uint16_t> nodeThr(processedReadCnt + 1, par.minEdgeWeight);
+        std::vector<uint32_t> degree;
+        std::unordered_map<uint32_t, uint32_t> groupMedianDeg;
+        
+        computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
+        int maxIter = par.groupingIter; 
+        for (int iter = 0; iter < maxIter; iter++) {
+            cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
+
+            computeGroupMedianDegree(queryGroupInfo, degree, groupMedianDeg);
+
+            for (uint32_t i = 1; i <= processedReadCnt; i++) {
+                uint32_t groupId = queryGroupInfo[i];
+                if (groupId == 0) {
+                    nodeThr[i] = static_cast<uint16_t>(par.minEdgeWeight);
+                } else {
+                    uint32_t medDeg = groupMedianDeg.count(groupId) ? groupMedianDeg[groupId] : 0;
+                    nodeThr[i] = degreeToThr(medDeg);
+                }
+            }
+
+            groupInfo.clear();
+            makeGroupsAdaptive(nodeThr, processedReadCnt, queryGroupInfo, degree);
+
+            groupInfo.clear();
+            for (uint32_t i = 1; i <= processedReadCnt; i++) {
+                if (queryGroupInfo[i] != 0) {
+                    groupInfo[queryGroupInfo[i]].insert(i);
+                }
+            }
+        }
+
         saveGroupsToFile(groupInfo, queryGroupInfo);
     }
 }
@@ -579,6 +613,53 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     return;
 }
 
+void GroupGenerator::computeNodeDegree(
+    int threshold,
+    size_t processedReadCnt,
+    std::vector<uint32_t>& degree)
+{
+    degree.assign(processedReadCnt + 1, 0);
+
+    auto processFile = [&](const std::string& fname) {
+        std::ifstream f(fname);
+        uint32_t id1, id2;
+        uint16_t w;
+        while (f >> id1 >> id2 >> w) {
+            if (id1 == 0 || id2 == 0) continue;
+            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+            if (w > threshold) {
+                degree[id1]++;
+                degree[id2]++;
+            }
+        }
+    };
+
+    for (int i = 0; i < par.threads * 2 + 1; i++) {
+        processFile(outDir + "/relations_" + std::to_string(i) + ".txt");
+    }
+}
+
+void GroupGenerator::computeGroupMedianDegree(
+    const std::vector<uint32_t>& queryGroupInfo,
+    const std::vector<uint32_t>& degree,
+    std::unordered_map<uint32_t, uint32_t>& groupMedianDeg)
+{
+    std::unordered_map<uint32_t, std::vector<uint32_t>> groupDegrees;
+
+    for (uint32_t i = 1; i < queryGroupInfo.size(); i++) {
+        uint32_t groupId = queryGroupInfo[i];
+        if (groupId == 0) continue; // skip ungrouped node
+        groupDegrees[groupId].push_back(degree[i]);
+    }
+
+    groupMedianDeg.clear();
+    for (auto& [groupId, degrees] : groupDegrees) {
+        size_t n = degrees.size();
+        std::nth_element(degrees.begin(), degrees.begin() + n / 2, degrees.end());
+        uint32_t median = degrees[n / 2];
+        groupMedianDeg[groupId] = median;
+    }
+}
 
 void GroupGenerator::makeGroupsAdaptive(
     const std::vector<uint16_t>& nodeThr,

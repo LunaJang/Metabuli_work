@@ -166,7 +166,11 @@ public:
     void mergeGraph(size_t processedReadCnt);
 
     void mergeGraph_one(size_t processedReadCnt);
-
+    
+    void computeNodeDegree(int groupKmerThr, 
+                           size_t processedReadCnt, 
+                           std::vector<uint32_t>& degree);
+                           
     void computeGroupMedianDegree(const std::vector<uint32_t>& queryGroupInfo,
                                   const std::vector<uint32_t>& degree,
                                   std::unordered_map<uint32_t, uint32_t>& groupMedianDeg);

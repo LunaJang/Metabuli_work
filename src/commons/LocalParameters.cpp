@@ -215,6 +215,13 @@ LocalParameters::LocalParameters() :
                 typeid(int),
                 (void *) &neighborKmers,
                 "[0-4]"),
+        NUM_ITERATION(NUM_ITERATION_ID,
+                "--num-iteration",
+                "Number of iterations for grouping",
+                "Number of iterations for grouping",
+                typeid(int),
+                (void *) &groupingIter,
+                "[1-10]"),
         TARGET_TAX_ID(TARGET_TAX_ID_ID,
                "--tax-id",
                "Tax. ID of clade to be extracted",
@@ -678,6 +685,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&SMER_LEN);
     groupGeneration.push_back(&MIN_EDGE_WEIGHT);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
+    groupGeneration.push_back(&NUM_ITERATION);
     groupGeneration.push_back(&PRINT_LOG);
 
     //groupApplication

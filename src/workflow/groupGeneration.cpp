@@ -6,6 +6,7 @@
 
 void setGroupGenerationDefaults(LocalParameters & par){    
     par.neighborKmers = 0;
+    par.groupingIter = 1;
     par.minEdgeWeight = 10;
     par.syncmer = 1;
     par.smerLen = 5;
