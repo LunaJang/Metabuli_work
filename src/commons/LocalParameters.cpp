@@ -221,7 +221,7 @@ LocalParameters::LocalParameters() :
                 "Number of iterations for grouping",
                 typeid(int),
                 (void *) &groupingIter,
-                "[1-10]"),
+                "^(0|[1-9]|1[0-5])$"),
         TARGET_TAX_ID(TARGET_TAX_ID_ID,
                "--tax-id",
                "Tax. ID of clade to be extracted",

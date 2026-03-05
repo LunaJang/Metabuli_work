@@ -672,7 +672,6 @@ void GroupGenerator::makeGroupsAdaptive(
 
     DisjointSet ds(processedReadCnt);
 
-    // degree는 kept edge 기준으로 새로 계산 (iteration마다 초기화)
     degree.assign(processedReadCnt + 1, 0);
 
     auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
@@ -683,10 +682,7 @@ void GroupGenerator::makeGroupsAdaptive(
             if (id1 == 0 || id2 == 0) continue;
             if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
 
-            uint16_t t1 = nodeThr[id1];
-            uint16_t t2 = nodeThr[id2];
-
-            if (keepEdgeGeo(w, t1, t2)) {
+            if (keepEdgeGeo(w, nodeThr[id1], nodeThr[id2])) {
                 subDs.unionSets(id1, id2);
 
                 #pragma omp atomic
@@ -698,7 +694,6 @@ void GroupGenerator::makeGroupsAdaptive(
         }
     };
 
-    // 1) relations_[0 .. threads-1]
     #pragma omp parallel num_threads(par.threads)
     {
         int threadIdx = omp_get_thread_num();
@@ -711,14 +706,13 @@ void GroupGenerator::makeGroupsAdaptive(
         { ds += subDs; }
     }
 
-    // 2) relations_[threads .. 2*threads-1]
     #pragma omp parallel num_threads(par.threads)
     {
         int threadIdx = omp_get_thread_num();
 
         DisjointSet subDs(processedReadCnt);
         #pragma omp critical
-        { subDs = ds; } // 기존 코드 스타일 유지
+        { subDs = ds; }
 
         processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
 
@@ -726,36 +720,23 @@ void GroupGenerator::makeGroupsAdaptive(
         #pragma omp critical
         { ds += subDs; }
     }
+    
+    std::ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
+    uint32_t id1, id2;
+    uint16_t w;
+    while (relationLog >> id1 >> id2 >> w) {
+        if (keepEdgeGeo(w, nodeThr[id1], nodeThr[id2])) {
+            ds.unionSets(id1, id2);
 
-    // 3) relations_[2*threads]
-    {
-        std::ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
-        uint32_t id1, id2;
-        uint16_t w;
-        while (relationLog >> id1 >> id2 >> w) {
-            if (id1 == 0 || id2 == 0) continue;
-            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
-
-            uint16_t t1 = nodeThr[id1];
-            uint16_t t2 = nodeThr[id2];
-
-            if (keepEdgeGeo(w, t1, t2)) {
-                ds.unionSets(id1, id2);
-
-                degree[id1]++; // single-thread
-                degree[id2]++;
-            }
+            degree[id1]++; // single-thread
+            degree[id2]++;
         }
     }
+    relationLog.close();    
 
-    ds.flatten();
-
-    // queryGroupInfo 갱신
-    queryGroupInfo.assign(processedReadCnt + 1, 0);
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]) {
-            uint32_t groupId = ds.parent[queryId];
-            queryGroupInfo[queryId] = groupId;
+            queryGroupInfo[queryId] = ds.parent[queryId];
         }
     }
 
@@ -771,19 +752,29 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     time_t beforeSearch = time(nullptr);
 
     DisjointSet ds(processedReadCnt);
-    #pragma omp parallel num_threads(par.threads)
-    {
-        int threadIdx = omp_get_thread_num();
-        DisjointSet subDs(processedReadCnt);
-        ifstream relationLog(outDir + "/relations_" + std::to_string(threadIdx) + ".txt");
+
+    auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
+        std::ifstream relationLog(fname);
         uint32_t id1, id2;
         uint16_t weight;
         while (relationLog >> id1 >> id2 >> weight) {
             if (static_cast<int>(weight) > groupKmerThr) {
+                if (id1 == 0 || id2 == 0) continue;
+                if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
                 subDs.unionSets(id1, id2);
             }
         }
         relationLog.close();
+    };
+    
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".txt", subDs);
+
         subDs.flatten();
 
         #pragma omp critical
@@ -794,28 +785,17 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
     #pragma omp parallel num_threads(par.threads)
     {
+        int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
         #pragma omp critical
-        {
-            subDs = ds;
-        }
+        { subDs = ds;}
 
-        int threadIdx = omp_get_thread_num();
-        ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt");
-        uint32_t id1, id2;
-        uint16_t weight;
-        while (relationLog >> id1 >> id2 >> weight) {
-            if (static_cast<int>(weight) > groupKmerThr) {
-                subDs.unionSets(id1, id2);
-            }
-        }
-        relationLog.close();
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
+        
         subDs.flatten();
 
         #pragma omp critical
-        {
-            ds += subDs;
-        }
+        { ds += subDs; }
     }
 
     ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
@@ -826,7 +806,6 @@ void GroupGenerator::makeGroups(int groupKmerThr,
             ds.unionSets(id1, id2);
         }
     }
-    relationLog.close();
 
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]){
