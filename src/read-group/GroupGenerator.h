@@ -193,9 +193,10 @@ public:
         // medDeg in [20, 100)-> thr 20
         // medDeg >= 100      -> thr 30
 
-        if (medDeg < 5)   return 5;
-        if (medDeg < 20)  return 10;
-        if (medDeg < 100) return 20;
+        if (medDeg < 5)  return 10;
+        if (medDeg < 15) return 40;
+        if (medDeg < 30) return 70;
+        if (medDeg < 60) return 130;
         return 30;
     }
 
