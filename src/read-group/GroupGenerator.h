@@ -177,8 +177,7 @@ public:
     
     void makeGroupsAdaptive(const vector<uint16_t>& nodeThr,
                             size_t processedReadCnt,
-                            vector<uint32_t>& queryGroupInfo,
-                            vector<uint32_t>& degree);         
+                            vector<uint32_t>& queryGroupInfo);         
 
     void makeGroups(int groupKmerThr,
                     size_t processedReadCnt,

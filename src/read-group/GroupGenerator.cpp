@@ -134,7 +134,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             }
 
             groupInfo.clear();
-            makeGroupsAdaptive(nodeThr, processedReadCnt, queryGroupInfo, degree);
+            makeGroupsAdaptive(nodeThr, processedReadCnt, queryGroupInfo);
 
             groupInfo.clear();
             for (uint32_t i = 1; i <= processedReadCnt; i++) {
@@ -664,15 +664,12 @@ void GroupGenerator::computeGroupMedianDegree(
 void GroupGenerator::makeGroupsAdaptive(
     const std::vector<uint16_t>& nodeThr,
     size_t processedReadCnt,
-    std::vector<uint32_t>& queryGroupInfo,
-    std::vector<uint32_t>& degree
+    std::vector<uint32_t>& queryGroupInfo
 ) {
     cout << "Creating groups (adaptive thresholds)..." << endl;
     time_t beforeSearch = time(nullptr);
 
     DisjointSet ds(processedReadCnt);
-
-    degree.assign(processedReadCnt + 1, 0);
 
     auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
         std::ifstream relationLog(fname);
@@ -684,12 +681,6 @@ void GroupGenerator::makeGroupsAdaptive(
 
             if (keepEdgeGeo(w, nodeThr[id1], nodeThr[id2])) {
                 subDs.unionSets(id1, id2);
-
-                #pragma omp atomic
-                degree[id1]++;
-
-                #pragma omp atomic
-                degree[id2]++;
             }
         }
     };
@@ -727,9 +718,6 @@ void GroupGenerator::makeGroupsAdaptive(
     while (relationLog >> id1 >> id2 >> w) {
         if (keepEdgeGeo(w, nodeThr[id1], nodeThr[id2])) {
             ds.unionSets(id1, id2);
-
-            degree[id1]++; // single-thread
-            degree[id2]++;
         }
     }
     relationLog.close();    
