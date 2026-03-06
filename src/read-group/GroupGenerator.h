@@ -187,9 +187,20 @@ public:
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
                           const vector<uint32_t>& queryGroupInfo);
     
-    uint16_t degreeToThr(uint32_t medDeg) const {
-        uint32_t thr = 35 + ((medDeg - 28) / 12 + 1) * 10;
-        return (uint16_t)std::min(thr, (uint32_t)155);
+    uint16_t degreeToThr(uint32_t medDeg) const {        
+        // medDeg in [0, 5)   -> thr 5
+        // medDeg in [5, 20)  -> thr 10
+        // medDeg in [20, 100)-> thr 20
+        // medDeg >= 100      -> thr 30
+
+        if (medDeg < 1)  return 1;   // cov ~0.1
+        if (medDeg < 5)  return 5;   // cov ~0.1
+        if (medDeg < 10) return 15;  // cov 0.5~3
+        if (medDeg < 20) return 30;  // cov ~5
+        if (medDeg < 35) return 50;  // cov ~5
+        if (medDeg < 55) return 75;  // cov ~5
+        if (medDeg < 80) return 100;  // cov ~5
+        return 120;                   // cov ~10
     }
 
 };
