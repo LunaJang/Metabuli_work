@@ -188,16 +188,10 @@ public:
                           const vector<uint32_t>& queryGroupInfo);
     
     uint16_t degreeToThr(uint32_t medDeg) const {
-        // medDeg in [0, 5)   -> thr 5
-        // medDeg in [5, 20)  -> thr 10
-        // medDeg in [20, 100)-> thr 20
-        // medDeg >= 100      -> thr 30
-
-        if (medDeg < 5)  return 10;
-        if (medDeg < 15) return 40;
-        if (medDeg < 30) return 70;
-        if (medDeg < 60) return 130;
-        return 30;
+        if (medDeg < 2)  return 5;   // cov ~0.1
+        if (medDeg < 8)  return 15;  // cov 0.5~3
+        if (medDeg < 16) return 25;  // cov ~5
+        return 35;                   // cov ~10
     }
 
 };
