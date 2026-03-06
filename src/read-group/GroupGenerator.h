@@ -188,10 +188,8 @@ public:
                           const vector<uint32_t>& queryGroupInfo);
     
     uint16_t degreeToThr(uint32_t medDeg) const {
-        if (medDeg < 2)  return 5;   // cov ~0.1
-        if (medDeg < 8)  return 15;  // cov 0.5~3
-        if (medDeg < 16) return 25;  // cov ~5
-        return 35;                   // cov ~10
+        uint32_t thr = 35 + ((medDeg - 28) / 12 + 1) * 10;
+        return (uint16_t)std::min(thr, (uint32_t)155);
     }
 
 };
