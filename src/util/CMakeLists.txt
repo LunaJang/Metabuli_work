@@ -4,6 +4,8 @@ set(util_source_files
         util/database-report.cpp
         util/mapping2taxon.cpp
         util/gradeByCladeSize.cpp
+        util/gradeByCoverage.cpp
+        util/gradeGroupByCoverage.cpp
         util/expand_diffidx.cpp
         util/makeAAoffset.cpp
         util/printinfo.cpp

@@ -114,22 +114,22 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         // Step 2: Iterative adaptive refinement
         std::vector<uint16_t> nodeThr(processedReadCnt + 1, par.minEdgeWeight);
         std::vector<uint32_t> degree;
-        std::unordered_map<uint32_t, uint32_t> groupMedianDeg;
+        std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
         
         computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
         int maxIter = par.groupingIter; 
         for (int iter = 0; iter < maxIter; iter++) {
             cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
 
-            computeGroupMedianDegree(queryGroupInfo, degree, groupMedianDeg);
+            computeGroupQuarterDegree(queryGroupInfo, degree, groupQuarterDeg);
 
             for (uint32_t i = 1; i <= processedReadCnt; i++) {
                 uint32_t groupId = queryGroupInfo[i];
                 if (groupId == 0) {
                     nodeThr[i] = static_cast<uint16_t>(par.minEdgeWeight);
                 } else {
-                    uint32_t medDeg = groupMedianDeg.count(groupId) ? groupMedianDeg[groupId] : 0;
-                    nodeThr[i] = degreeToThr(medDeg);
+                    uint32_t quarterDegree = groupQuarterDeg.count(groupId) ? groupQuarterDeg[groupId] : 0;
+                    nodeThr[i] = degreeToThr(quarterDegree);
                 }
             }
 
@@ -639,10 +639,10 @@ void GroupGenerator::computeNodeDegree(
     }
 }
 
-void GroupGenerator::computeGroupMedianDegree(
+void GroupGenerator::computeGroupQuarterDegree(
     const std::vector<uint32_t>& queryGroupInfo,
     const std::vector<uint32_t>& degree,
-    std::unordered_map<uint32_t, uint32_t>& groupMedianDeg)
+    std::unordered_map<uint32_t, uint32_t>& groupQuarterDeg)
 {
     std::unordered_map<uint32_t, std::vector<uint32_t>> groupDegrees;
 
@@ -652,12 +652,12 @@ void GroupGenerator::computeGroupMedianDegree(
         groupDegrees[groupId].push_back(degree[i]);
     }
 
-    groupMedianDeg.clear();
+    groupQuarterDeg.clear();
     for (auto& [groupId, degrees] : groupDegrees) {
         size_t n = degrees.size();
-        std::nth_element(degrees.begin(), degrees.begin() + n / 2, degrees.end());
-        uint32_t median = degrees[n / 2];
-        groupMedianDeg[groupId] = median;
+        std::nth_element(degrees.begin(), degrees.begin() + n / 4, degrees.end());
+        uint32_t p25 = degrees[n / 4];
+        groupQuarterDeg[groupId] = p25;
     }
 }
 
