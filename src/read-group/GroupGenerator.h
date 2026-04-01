@@ -190,7 +190,7 @@ public:
     uint16_t degreeToThr(uint32_t quarterDegree) const {
         float predCoverage = quarterDegree * 0.5f;
         float thr = predCoverage * 3.5f;
-        return static_cast<uint16_t>(std::max(3.0f, std::min(thr, 150.0f))); 
+        return static_cast<uint16_t>(std::max(1.0f, std::min(thr, 150.0f))); 
     }
 
 };
