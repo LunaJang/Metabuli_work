@@ -171,9 +171,9 @@ public:
                            size_t processedReadCnt, 
                            std::vector<uint32_t>& degree);
                            
-    void computeGroupMedianDegree(const std::vector<uint32_t>& queryGroupInfo,
+    void computeGroupQuarterDegree(const std::vector<uint32_t>& queryGroupInfo,
                                   const std::vector<uint32_t>& degree,
-                                  std::unordered_map<uint32_t, uint32_t>& groupMedianDeg);
+                                  std::unordered_map<uint32_t, uint32_t>& groupQuarterDeg);
     
     void makeGroupsAdaptive(const vector<uint16_t>& nodeThr,
                             size_t processedReadCnt,
@@ -187,16 +187,10 @@ public:
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
                           const vector<uint32_t>& queryGroupInfo);
     
-    uint16_t degreeToThr(uint32_t medDeg) const {
-        // medDeg in [0, 5)   -> thr 5
-        // medDeg in [5, 20)  -> thr 10
-        // medDeg in [20, 100)-> thr 20
-        // medDeg >= 100      -> thr 30
-
-        if (medDeg < 5)   return 5;
-        if (medDeg < 20)  return 10;
-        if (medDeg < 100) return 20;
-        return 30;
+    uint16_t degreeToThr(uint32_t quarterDegree) const {
+        float predCoverage = quarterDegree * 0.5f;
+        float thr = predCoverage * 3.5f;
+        return static_cast<uint16_t>(std::max(1.0f, std::min(thr, 150.0f))); 
     }
 
 };

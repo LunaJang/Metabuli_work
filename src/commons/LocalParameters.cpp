@@ -222,6 +222,13 @@ LocalParameters::LocalParameters() :
                 typeid(int),
                 (void *) &groupingIter,
                 "^(0|[1-9]|1[0-5])$"),
+        CONVERGENCE_THRESHOLD(CONVERGENCE_THRESHOLD_ID,
+                "--convergence-thr",
+                "Convergence threshold for adaptive grouping",
+                "Stop adaptive grouping when membership change ratio falls below this value (0.0-1.0)",
+                typeid(float),
+                (void *) &convergenceThreshold,
+                "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         TARGET_TAX_ID(TARGET_TAX_ID_ID,
                "--tax-id",
                "Tax. ID of clade to be extracted",
@@ -686,6 +693,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MIN_EDGE_WEIGHT);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
     groupGeneration.push_back(&NUM_ITERATION);
+    groupGeneration.push_back(&CONVERGENCE_THRESHOLD);
     groupGeneration.push_back(&PRINT_LOG);
 
     //groupApplication
