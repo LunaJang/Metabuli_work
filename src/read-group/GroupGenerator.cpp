@@ -117,7 +117,9 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
         
         computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
-        int maxIter = par.groupingIter; 
+        int maxIter = par.groupingIter;
+        float prevChangeRatio = 1.0f;
+
         for (int iter = 0; iter < maxIter; iter++) {
             cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
 
@@ -133,15 +135,53 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                 }
             }
 
+            // Snapshot before adaptive regrouping
+            std::vector<uint32_t> prevGroupInfo(queryGroupInfo);
+
             groupInfo.clear();
             makeGroupsAdaptive(nodeThr, processedReadCnt, queryGroupInfo);
 
+            // Count membership changes
+            size_t changedCount = 0;
+            size_t totalGroupedReads = 0;
+            for (uint32_t i = 1; i <= processedReadCnt; i++) {
+                if (queryGroupInfo[i] != 0 || prevGroupInfo[i] != 0) {
+                    totalGroupedReads++;
+                    if (queryGroupInfo[i] != prevGroupInfo[i]) {
+                        changedCount++;
+                    }
+                }
+            }
+
+            float changeRatio = (totalGroupedReads > 0)
+                ? static_cast<float>(changedCount) / static_cast<float>(totalGroupedReads)
+                : 0.0f;
+
+            cout << "  Iteration " << iter + 1
+                 << ": " << changedCount << " / " << totalGroupedReads
+                 << " reads changed group (" << (changeRatio * 100.0f) << "%)" << endl;
+
+            // Rebuild groupInfo (existing logic)
             groupInfo.clear();
             for (uint32_t i = 1; i <= processedReadCnt; i++) {
                 if (queryGroupInfo[i] != 0) {
                     groupInfo[queryGroupInfo[i]].insert(i);
                 }
             }
+
+            // Convergence check (skip first iteration)
+            if (iter > 0 && changeRatio <= par.convergenceThreshold) {
+                cout << "Converged at iteration " << iter + 1 << endl;
+                break;
+            }
+
+            // Oscillation detection
+            if (iter > 0 && changeRatio >= prevChangeRatio * 0.95f) {
+                cout << "Change ratio not decreasing (prev=" << (prevChangeRatio * 100.0f)
+                     << "%, curr=" << (changeRatio * 100.0f) << "%), stopping." << endl;
+                break;
+            }
+            prevChangeRatio = changeRatio;
         }
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
