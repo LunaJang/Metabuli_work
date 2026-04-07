@@ -582,6 +582,12 @@ LocalParameters::LocalParameters() :
     rank = "";
     higherRankFile = 0;
 
+    // Group generation
+    neighborKmers = 1;
+    minEdgeWeight = 1;
+    convergenceThreshold = 0.001;
+    groupingIter = 15;
+
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
     buildUnirefDb.push_back(&TAXONOMY_PATH);
