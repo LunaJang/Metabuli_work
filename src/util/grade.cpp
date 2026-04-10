@@ -183,9 +183,12 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
             ifstream map;
             map.open(mappingFile);
             if (map.is_open()) {
-                while (getline(map, key, '\t')) {
-                    getline(map, value, '\n');
-                    // remove version number
+                string line;
+                while (getline(map, line)) {
+                    if (line.empty()) continue;
+                    istringstream iss(line);
+                    if (!(iss >> key >> value)) continue;
+                    
                     size_t pos = key.find('.');
                     if (pos != string::npos) {
                         key = key.substr(0, pos);
