@@ -183,12 +183,16 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
             ifstream map;
             map.open(mappingFile);
             if (map.is_open()) {
-                string line;
-                while (getline(map, line)) {
-                    if (line.empty()) continue;
-                    istringstream iss(line);
-                    if (!(iss >> key >> value)) continue;
+                while (getline(map, key, '\t')) {
+                    getline(map, value, '\n');
                     
+                    // 개행문자 제거 (Windows \r\n 대비)
+                    if (!value.empty() && value.back() == '\r') {
+                        value.pop_back();
+                    }
+                    
+                    if (key.empty() || value.empty()) continue;
+
                     size_t pos = key.find('.');
                     if (pos != string::npos) {
                         key = key.substr(0, pos);
