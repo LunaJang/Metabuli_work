@@ -145,7 +145,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             size_t changedCount = 0;
             size_t totalGroupedReads = 0;
             for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                if (queryGroupInfo[i] != 0 || prevGroupInfo[i] != 0) {
+                if (queryGroupInfo[i] != 0) {
                     totalGroupedReads++;
                     if (queryGroupInfo[i] != prevGroupInfo[i]) {
                         changedCount++;
@@ -158,8 +158,8 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                 : 0.0f;
 
             cout << "  Iteration " << iter + 1
-                 << ": " << changedCount << " / " << totalGroupedReads
-                 << " reads changed group (" << (changeRatio * 100.0f) << "%)" << endl;
+                << ": " << changedCount << " / " << totalGroupedReads
+                << " reads changed group (" << (changeRatio * 100.0f) << "%)" << endl;
 
             // Rebuild groupInfo (existing logic)
             groupInfo.clear();
@@ -167,6 +167,14 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                 if (queryGroupInfo[i] != 0) {
                     groupInfo[queryGroupInfo[i]].insert(i);
                 }
+            }
+            // Early stopping
+            const float convergenceThreshold = 0.01f; // 1%
+            if (changeRatio < convergenceThreshold) {
+                cout << "  Converged at iteration " << iter + 1
+                    << " (change ratio " << (changeRatio * 100.0f) << "% < "
+                    << (convergenceThreshold * 100.0f) << "%)" << endl;
+                break;
             }
 
             // Convergence check (skip first iteration)
