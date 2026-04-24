@@ -120,6 +120,33 @@ static inline bool keepEdgeGeo(uint16_t w, uint16_t tu, uint16_t tv) {
     return (uint64_t)w * (uint64_t)w >= (uint64_t)tu * (uint64_t)tv;
 }
 
+size_t getRelationThreshold(int numThreads) {
+    size_t availableBytes;
+
+#if defined(__linux__)
+    struct sysinfo info;
+    sysinfo(&info);
+    availableBytes = info.freeram * info.mem_unit;
+#elif defined(__APPLE__)
+    int64_t freeMemory;
+    size_t len = sizeof(freeMemory);
+    sysctlbyname("hw.memsize", &freeMemory, &len, nullptr, 0);
+    availableBytes = (size_t)freeMemory; // 근사치
+#else
+    availableBytes = 8ULL * 1024 * 1024 * 1024; // fallback 8GB
+#endif
+
+    const double safetyFactor = 0.6;
+    const size_t bytesPerEntry = 48; // unordered_map node overhead
+    
+    size_t threshold = (size_t)(availableBytes * safetyFactor) 
+                       / (numThreads * bytesPerEntry);
+    
+    // 최소/최대 clamp
+    const size_t MIN_THRESHOLD = 1'000'000;
+    const size_t MAX_THRESHOLD = 200'000'000;
+    return std::clamp(threshold, MIN_THRESHOLD, MAX_THRESHOLD);
+}
 
 class GroupGenerator {
 protected:

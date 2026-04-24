@@ -452,7 +452,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
 
-    const size_t RELATION_THRESHOLD = 50'000'000;  // relation 크기 제한
+    const size_t RELATION_THRESHOLD = getRelationThreshold(par.threads);
     std::atomic<int> counter(0);
 
     #pragma omp parallel num_threads(par.threads)
