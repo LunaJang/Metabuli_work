@@ -144,10 +144,9 @@ size_t getRelationThreshold(int numThreads) {
     size_t threshold = (size_t)(availableBytes * safetyFactor) 
                        / (numThreads * bytesPerEntry);
     
-    // 최소/최대 clamp
     const size_t MIN_THRESHOLD = 1'000'000;
     const size_t MAX_THRESHOLD = 200'000'000;
-    return std::clamp(threshold, MIN_THRESHOLD, MAX_THRESHOLD);
+    return std::max(MIN_THRESHOLD, std::min(threshold, MAX_THRESHOLD));
 }
 
 class GroupGenerator {
