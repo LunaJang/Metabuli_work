@@ -8,6 +8,12 @@
 #include <string>
 #include <iostream>
 #include <fstream>
+#include <set>
+#include <cassert>
+#include <thread>
+#include <atomic>
+#include <sys/sysinfo.h> 
+#include <algorithm> 
 #include "IndexCreator.h"
 #include "SeqIterator.h"
 #include "NcbiTaxonomy.h"
@@ -17,10 +23,6 @@
 #include "KmerExtractor.h"
 #include "KSeqWrapper.h"
 #include "DeltaIdxReader.h"
-#include <set>
-#include <cassert>
-#include <thread>
-#include <atomic>
 
 #define BufferSize 16'777'216 //16 * 1024 * 1024 // 16 M
 using namespace std;
