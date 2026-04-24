@@ -122,7 +122,7 @@ static inline bool keepEdgeGeo(uint16_t w, uint16_t tu, uint16_t tv) {
     return (uint64_t)w * (uint64_t)w >= (uint64_t)tu * (uint64_t)tv;
 }
 
-size_t getRelationThreshold(int numThreads) {
+inline size_t getRelationThreshold(int numThreads) {
     size_t availableBytes;
 
 #if defined(__linux__)
