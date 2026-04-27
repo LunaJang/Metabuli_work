@@ -110,6 +110,88 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     } else {
         mergeGraph(processedReadCnt);
         makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
+        
+        // Step 2: Iterative adaptive refinement
+        std::vector<uint16_t> nodeThr(processedReadCnt + 1, par.minEdgeWeight);
+        std::vector<uint32_t> degree;
+        std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
+        
+        computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
+        int maxIter = par.groupingIter;
+        float prevChangeRatio = 1.0f;
+
+        for (int iter = 0; iter < maxIter; iter++) {
+            cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
+
+            computeGroupQuarterDegree(queryGroupInfo, degree, groupQuarterDeg);
+
+            for (uint32_t i = 1; i <= processedReadCnt; i++) {
+                uint32_t groupId = queryGroupInfo[i];
+                if (groupId == 0) {
+                    nodeThr[i] = static_cast<uint16_t>(par.minEdgeWeight);
+                } else {
+                    uint32_t quarterDegree = groupQuarterDeg.count(groupId) ? groupQuarterDeg[groupId] : 0;
+                    nodeThr[i] = degreeToThr(quarterDegree);
+                }
+            }
+
+            // Snapshot before adaptive regrouping
+            std::vector<uint32_t> prevGroupInfo(queryGroupInfo);
+
+            groupInfo.clear();
+            makeGroupsAdaptive(nodeThr, processedReadCnt, queryGroupInfo);
+
+            // Count membership changes
+            size_t changedCount = 0;
+            size_t totalGroupedReads = 0;
+            for (uint32_t i = 1; i <= processedReadCnt; i++) {
+                if (queryGroupInfo[i] != 0) {
+                    totalGroupedReads++;
+                    if (queryGroupInfo[i] != prevGroupInfo[i]) {
+                        changedCount++;
+                    }
+                }
+            }
+
+            float changeRatio = (totalGroupedReads > 0)
+                ? static_cast<float>(changedCount) / static_cast<float>(totalGroupedReads)
+                : 0.0f;
+
+            cout << "  Iteration " << iter + 1
+                << ": " << changedCount << " / " << totalGroupedReads
+                << " reads changed group (" << (changeRatio * 100.0f) << "%)" << endl;
+
+            // Rebuild groupInfo (existing logic)
+            groupInfo.clear();
+            for (uint32_t i = 1; i <= processedReadCnt; i++) {
+                if (queryGroupInfo[i] != 0) {
+                    groupInfo[queryGroupInfo[i]].insert(i);
+                }
+            }
+            // Early stopping
+            const float convergenceThreshold = 0.01f; // 1%
+            if (changeRatio < convergenceThreshold) {
+                cout << "  Converged at iteration " << iter + 1
+                    << " (change ratio " << (changeRatio * 100.0f) << "% < "
+                    << (convergenceThreshold * 100.0f) << "%)" << endl;
+                break;
+            }
+
+            // Convergence check (skip first iteration)
+            if (iter > 0 && changeRatio <= par.convergenceThreshold) {
+                cout << "Converged at iteration " << iter + 1 << endl;
+                break;
+            }
+
+            // Oscillation detection
+            if (iter > 0 && changeRatio >= prevChangeRatio * 0.95f) {
+                cout << "Change ratio not decreasing (prev=" << (prevChangeRatio * 100.0f)
+                     << "%, curr=" << (changeRatio * 100.0f) << "%), stopping." << endl;
+                break;
+            }
+            prevChangeRatio = changeRatio;
+        }
+
         saveGroupsToFile(groupInfo, queryGroupInfo);
     }
 }
@@ -378,7 +460,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
 
-    const size_t RELATION_THRESHOLD = 50'000'000;  // relation 크기 제한
+    const size_t RELATION_THRESHOLD = getRelationThreshold(par.threads);
     std::atomic<int> counter(0);
 
     #pragma omp parallel num_threads(par.threads)
@@ -579,6 +661,125 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     return;
 }
 
+void GroupGenerator::computeNodeDegree(
+    int threshold,
+    size_t processedReadCnt,
+    std::vector<uint32_t>& degree)
+{
+    degree.assign(processedReadCnt + 1, 0);
+
+    auto processFile = [&](const std::string& fname) {
+        std::ifstream f(fname);
+        uint32_t id1, id2;
+        uint16_t w;
+        while (f >> id1 >> id2 >> w) {
+            if (id1 == 0 || id2 == 0) continue;
+            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+            if (w > threshold) {
+                degree[id1]++;
+                degree[id2]++;
+            }
+        }
+    };
+
+    for (int i = 0; i < par.threads * 2 + 1; i++) {
+        processFile(outDir + "/relations_" + std::to_string(i) + ".txt");
+    }
+}
+
+void GroupGenerator::computeGroupQuarterDegree(
+    const std::vector<uint32_t>& queryGroupInfo,
+    const std::vector<uint32_t>& degree,
+    std::unordered_map<uint32_t, uint32_t>& groupQuarterDeg)
+{
+    std::unordered_map<uint32_t, std::vector<uint32_t>> groupDegrees;
+
+    for (uint32_t i = 1; i < queryGroupInfo.size(); i++) {
+        uint32_t groupId = queryGroupInfo[i];
+        if (groupId == 0) continue; // skip ungrouped node
+        groupDegrees[groupId].push_back(degree[i]);
+    }
+
+    groupQuarterDeg.clear();
+    for (auto& [groupId, degrees] : groupDegrees) {
+        size_t n = degrees.size();
+        std::nth_element(degrees.begin(), degrees.begin() + n / 4, degrees.end());
+        uint32_t p25 = degrees[n / 4];
+        groupQuarterDeg[groupId] = p25;
+    }
+}
+
+void GroupGenerator::makeGroupsAdaptive(
+    const std::vector<uint16_t>& nodeThr,
+    size_t processedReadCnt,
+    std::vector<uint32_t>& queryGroupInfo
+) {
+    cout << "Creating groups (adaptive thresholds)..." << endl;
+    time_t beforeSearch = time(nullptr);
+
+    DisjointSet ds(processedReadCnt);
+
+    auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
+        std::ifstream relationLog(fname);
+        uint32_t id1, id2;
+        uint16_t w;
+        while (relationLog >> id1 >> id2 >> w) {
+            if (id1 == 0 || id2 == 0) continue;
+            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+
+            if (keepEdgeGeo(w, nodeThr[id1], nodeThr[id2])) {
+                subDs.unionSets(id1, id2);
+            }
+        }
+    };
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".txt", subDs);
+
+        subDs.flatten();
+        #pragma omp critical
+        { ds += subDs; }
+    }
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+
+        DisjointSet subDs(processedReadCnt);
+        #pragma omp critical
+        { subDs = ds; }
+
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
+
+        subDs.flatten();
+        #pragma omp critical
+        { ds += subDs; }
+    }
+    
+    std::ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
+    uint32_t id1, id2;
+    uint16_t w;
+    while (relationLog >> id1 >> id2 >> w) {
+        if (keepEdgeGeo(w, nodeThr[id1], nodeThr[id2])) {
+            ds.unionSets(id1, id2);
+        }
+    }
+    relationLog.close();    
+
+    for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
+        if (ds.grouped[queryId]) {
+            queryGroupInfo[queryId] = ds.parent[queryId];
+        }
+    }
+
+    cout << "Adaptive grouping done." << endl;
+    cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
+}
+
 void GroupGenerator::makeGroups(int groupKmerThr,
                                 size_t processedReadCnt,
                                 unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
@@ -587,19 +788,29 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     time_t beforeSearch = time(nullptr);
 
     DisjointSet ds(processedReadCnt);
-    #pragma omp parallel num_threads(par.threads)
-    {
-        int threadIdx = omp_get_thread_num();
-        DisjointSet subDs(processedReadCnt);
-        ifstream relationLog(outDir + "/relations_" + std::to_string(threadIdx) + ".txt");
+
+    auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
+        std::ifstream relationLog(fname);
         uint32_t id1, id2;
         uint16_t weight;
         while (relationLog >> id1 >> id2 >> weight) {
             if (static_cast<int>(weight) > groupKmerThr) {
+                if (id1 == 0 || id2 == 0) continue;
+                if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
                 subDs.unionSets(id1, id2);
             }
         }
         relationLog.close();
+    };
+    
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".txt", subDs);
+
         subDs.flatten();
 
         #pragma omp critical
@@ -610,28 +821,17 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
     #pragma omp parallel num_threads(par.threads)
     {
+        int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
         #pragma omp critical
-        {
-            subDs = ds;
-        }
+        { subDs = ds;}
 
-        int threadIdx = omp_get_thread_num();
-        ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt");
-        uint32_t id1, id2;
-        uint16_t weight;
-        while (relationLog >> id1 >> id2 >> weight) {
-            if (static_cast<int>(weight) > groupKmerThr) {
-                subDs.unionSets(id1, id2);
-            }
-        }
-        relationLog.close();
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
+        
         subDs.flatten();
 
         #pragma omp critical
-        {
-            ds += subDs;
-        }
+        { ds += subDs; }
     }
 
     ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
@@ -642,7 +842,6 @@ void GroupGenerator::makeGroups(int groupKmerThr,
             ds.unionSets(id1, id2);
         }
     }
-    relationLog.close();
 
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]){

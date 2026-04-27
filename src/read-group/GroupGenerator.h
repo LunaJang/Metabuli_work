@@ -8,6 +8,12 @@
 #include <string>
 #include <iostream>
 #include <fstream>
+#include <set>
+#include <cassert>
+#include <thread>
+#include <atomic>
+#include <sys/sysinfo.h> 
+#include <algorithm> 
 #include "IndexCreator.h"
 #include "SeqIterator.h"
 #include "NcbiTaxonomy.h"
@@ -17,10 +23,6 @@
 #include "KmerExtractor.h"
 #include "KSeqWrapper.h"
 #include "DeltaIdxReader.h"
-#include <set>
-#include <cassert>
-#include <thread>
-#include <atomic>
 
 #define BufferSize 16'777'216 //16 * 1024 * 1024 // 16 M
 using namespace std;
@@ -115,6 +117,38 @@ public:
     }
 };
 
+static inline bool keepEdgeGeo(uint16_t w, uint16_t tu, uint16_t tv) {
+    // w >= sqrt(tu*tv)  <=>  w*w >= tu*tv
+    return (uint64_t)w * (uint64_t)w >= (uint64_t)tu * (uint64_t)tv;
+}
+
+inline size_t getRelationThreshold(int numThreads) {
+    size_t availableBytes;
+
+#if defined(__linux__)
+    struct sysinfo info;
+    sysinfo(&info);
+    availableBytes = info.freeram * info.mem_unit;
+#elif defined(__APPLE__)
+    int64_t freeMemory;
+    size_t len = sizeof(freeMemory);
+    sysctlbyname("hw.memsize", &freeMemory, &len, nullptr, 0);
+    availableBytes = (size_t)freeMemory; // 근사치
+#else
+    availableBytes = 8ULL * 1024 * 1024 * 1024; // fallback 8GB
+#endif
+
+    const double safetyFactor = 0.6;
+    const size_t bytesPerEntry = 48; // unordered_map node overhead
+    
+    size_t threshold = (size_t)(availableBytes * safetyFactor) 
+                       / (numThreads * bytesPerEntry);
+    
+    const size_t MIN_THRESHOLD = 1'000'000;
+    const size_t MAX_THRESHOLD = 200'000'000;
+    return std::max(MIN_THRESHOLD, std::min(threshold, MAX_THRESHOLD));
+}
+
 class GroupGenerator {
 protected:
     const LocalParameters & par;
@@ -160,14 +194,33 @@ public:
     void mergeGraph(size_t processedReadCnt);
 
     void mergeGraph_one(size_t processedReadCnt);
+    
+    void computeNodeDegree(int groupKmerThr, 
+                           size_t processedReadCnt, 
+                           std::vector<uint32_t>& degree);
+                           
+    void computeGroupQuarterDegree(const std::vector<uint32_t>& queryGroupInfo,
+                                  const std::vector<uint32_t>& degree,
+                                  std::unordered_map<uint32_t, uint32_t>& groupQuarterDeg);
+    
+    void makeGroupsAdaptive(const vector<uint16_t>& nodeThr,
+                            size_t processedReadCnt,
+                            vector<uint32_t>& queryGroupInfo);         
 
     void makeGroups(int groupKmerThr,
                     size_t processedReadCnt,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
                     vector<uint32_t> &queryGroupInfo);
-    
+                    
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
                           const vector<uint32_t>& queryGroupInfo);
+    
+    uint16_t degreeToThr(uint32_t quarterDegree) const {
+        float predCoverage = quarterDegree * 0.5f;
+        float thr = predCoverage * 3.5f;
+        return static_cast<uint16_t>(std::max(1.0f, std::min(thr, 150.0f))); 
+    }
+
 };
 
 

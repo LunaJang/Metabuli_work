@@ -192,6 +192,7 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                     }
                     assacc2taxid[key] = stoi(value);
                 }
+                cout << "Answer file loaded" << endl;
             } else {
                 cout << "Cannot open file for answer" << endl;
             }
