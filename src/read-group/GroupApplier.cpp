@@ -203,7 +203,7 @@ void GroupApplier::applyRepLabel(const vector<OrgResult>& orgResults,
     for (int queryIdx = 0; queryIdx < orgResults.size() ; queryIdx++){
         uint32_t groupId = groupMappingInfo[queryIdx];
         auto repLabelIt = repLabel.find(groupId);
-        if (repLabelIt != repLabel.end() && repLabelIt->second != 0){
+        if (repLabelIt != repLabel.end() && repLabelIt->second != 0 && orgResults[queryIdx].label == 0){
             queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, true, orgResults[queryIdx].name));
         } else{
             if (orgResults[queryIdx].label == 0){
