@@ -509,6 +509,10 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             std::sort(currentQueryIds.begin(), currentQueryIds.end());
             auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
             currentQueryIds.erase(last, currentQueryIds.end());
+            if (par.maxKmerFreqRatio > 0.0f &&
+                currentQueryIds.size() > static_cast<size_t>(static_cast<double>(processedReadCnt) * par.maxKmerFreqRatio)) {
+                continue;
+            }
             for (size_t i = 0; i < currentQueryIds.size(); ++i) {
                 for (size_t j = i + 1; j < currentQueryIds.size(); ++j) {        
                     uint64_t pairKey = (static_cast<uint64_t>(currentQueryIds[i]) << 32) | currentQueryIds[j];

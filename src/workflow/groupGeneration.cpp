@@ -9,6 +9,7 @@ void setGroupGenerationDefaults(LocalParameters & par){
     par.groupingIter = 10;
     par.minEdgeWeight = 10;
     par.convergenceThreshold = 0.01f;
+    par.maxKmerFreqRatio = 0.0f;
     par.syncmer = 1;
     par.smerLen = 5;
     par.seqMode = 2;    
