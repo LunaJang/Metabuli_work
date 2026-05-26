@@ -3,6 +3,35 @@
 #include "QueryIndexer.h"
 #include "common.h"
 #include "Kmer.h"
+#include <sys/stat.h>
+
+// Human-readable byte size for disk-usage logs.
+static std::string humanBytes(uint64_t bytes) {
+    const char* unit[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = static_cast<double>(bytes);
+    int i = 0;
+    while (v >= 1024.0 && i < 4) { v /= 1024.0; ++i; }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f %s", v, unit[i]);
+    return std::string(buf);
+}
+
+// Sum sizes of existing files in `paths`, log "<label>: N files, X freed", then remove them.
+// Non-existent paths are skipped (not counted).
+static void reportAndRemoveFiles(const std::vector<std::string>& paths, const std::string& label) {
+    uint64_t total = 0;
+    size_t count = 0;
+    for (const std::string& p : paths) {
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0) {
+            total += static_cast<uint64_t>(st.st_size);
+            ++count;
+            std::remove(p.c_str());
+        }
+    }
+    std::cout << "[disk] " << label << ": " << count << " files, "
+              << humanBytes(total) << " freed" << std::endl;
+}
 
 // Deterministic 64-bit integer hash (murmur3 finalizer). No runtime randomness:
 // the same k-mer value always maps to the same hash, independent of input order.
@@ -217,6 +246,14 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         }
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
+
+        // relations_*.txt are reparsed every refinement iteration but are no longer
+        // needed once grouping is saved. Indices: relations_0 .. relations_{2*threads}.
+        std::vector<std::string> relationFiles;
+        for (int i = 0; i <= par.threads * 2; i++) {
+            relationFiles.push_back(outDir + "/relations_" + std::to_string(i) + ".txt");
+        }
+        reportAndRemoveFiles(relationFiles, "relations");
     }
 }
 
@@ -607,8 +644,21 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         for (size_t file = 0; file < this->numOfSplits; file++) {
             delete deltaIdxReaders[file];
         }
-    }    
+    }
     this->numOfGraph = counter.load(std::memory_order_relaxed);
+
+    // k-mer files are fully consumed by the merge above; report + remove to free disk.
+    {
+        std::vector<std::string> deltaFiles, infoFiles;
+        for (size_t i = 0; i < this->numOfSplits; i++) {
+            for (int t = 0; t < par.threads; t++) {
+                deltaFiles.push_back(outDir + "/kmer_delta_" + to_string(i) + "_" + to_string(t));
+                infoFiles.push_back(outDir + "/kmer_info_"  + to_string(i) + "_" + to_string(t));
+            }
+        }
+        reportAndRemoveFiles(deltaFiles, "kmer_delta");
+        reportAndRemoveFiles(infoFiles, "kmer_info");
+    }
 
     cout << "Relations generated from files successfully." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
@@ -681,12 +731,21 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt) {
             relationLogs[(minRelation.id1 / range_size) + par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
         } 
         else{
-            relationLogs[par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';            
+            relationLogs[par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
         }
     }
 
     for (size_t i = 0; i < numOfGraph; ++i) {
         delete relationBuffers[i];
+    }
+
+    // subGraph_* are fully merged into relations_*; report + remove to free disk.
+    {
+        std::vector<std::string> subGraphFiles;
+        for (size_t i = 0; i < this->numOfGraph; ++i) {
+            subGraphFiles.push_back(outDir + "/subGraph_" + to_string(i));
+        }
+        reportAndRemoveFiles(subGraphFiles, "subGraph");
     }
 
     cout << "Query relation graph merged successfully" << endl;
