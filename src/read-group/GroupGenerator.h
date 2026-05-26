@@ -169,6 +169,10 @@ protected:
     bool boundariesInitialized = false;
     bool useOnlyTrueRelations = false; // for debug
 
+    // center-star (Step 1): index = 1-based global read id; pack(length, contentHash).
+    // Larger key wins center selection (length first, content min-hash tie-break).
+    std::vector<uint64_t> centerKey;
+
 public:
     GroupGenerator(LocalParameters & par);
 
@@ -180,10 +184,16 @@ public:
                            Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
                            const string & db="");
 
-    void writeKmers(Buffer<Kmer>& queryKmerBuffer, 
+    void writeKmers(Buffer<Kmer>& queryKmerBuffer,
                     size_t processedReadCnt);
 
-    std::vector<std::pair<size_t, size_t>> getKmerRanges(const Buffer<Kmer>& kmerBuffer, 
+    // center-star (Step 1): accumulate per-read center key (length + content min-hash)
+    // for this split into the global centerKey array. Deterministic, order/thread independent.
+    void accumulateCenterKeys(const Buffer<Kmer>& queryKmerBuffer,
+                              const std::vector<Query>& queryList,
+                              size_t processedReadCnt);
+
+    std::vector<std::pair<size_t, size_t>> getKmerRanges(const Buffer<Kmer>& kmerBuffer,
                                                          size_t offset);
 
     void makeSubGraph(size_t processedReadCnt);

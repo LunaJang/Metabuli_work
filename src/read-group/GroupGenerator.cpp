@@ -4,6 +4,24 @@
 #include "common.h"
 #include "Kmer.h"
 
+// Deterministic 64-bit integer hash (murmur3 finalizer). No runtime randomness:
+// the same k-mer value always maps to the same hash, independent of input order.
+static inline uint64_t mixHash64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+// Pack center key: length in high 24 bits (larger length preferred as center),
+// content min-hash in low 40 bits (deterministic tie-break by content).
+static inline uint64_t packCenterKey(uint32_t pairedLength, uint64_t contentHash) {
+    return (static_cast<uint64_t>(pairedLength & 0xFFFFFFu) << 40)
+         | (contentHash & 0xFFFFFFFFFFULL);
+}
+
 GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     commonKmerDB = par.filenames[1 + (par.seqMode == 2)];
     outDir       = par.filenames[2 + (par.seqMode == 2)];
@@ -50,6 +68,8 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             cout << "Done" << endl;
             cout << "Total number of sequences: " << queryIndexer->getReadNum_1() << endl;
             cout << "Total read length: " << queryIndexer->getTotalReadLength() <<  "nt" << endl;
+            // center-star (Step 1): 1-based global read id -> center key. Sized once.
+            centerKey.assign(totalSeqCnt + 1, 0);
         }
 
         // Set up kseq
@@ -80,8 +100,12 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                                              queryReadSplit[splitIdx],
                                              par,
                                              kseq1,
-                                             kseq2); 
-                                                        
+                                             kseq2);
+
+            // center-star (Step 1): compute per-read center key from the freshly
+            // extracted k-mers (before common-kmer filtering reorders the buffer).
+            accumulateCenterKeys(queryKmerBuffer, queryList, processedReadCnt);
+
             filterCommonKmers(queryKmerBuffer, matchBuffer, commonKmerDB);
             time_t t = time(nullptr);
             writeKmers(queryKmerBuffer, processedReadCnt);
@@ -456,6 +480,42 @@ std::vector<std::pair<size_t, size_t>> GroupGenerator::getKmerRanges(const Buffe
     return ranges;
 }
 
+void GroupGenerator::accumulateCenterKeys(const Buffer<Kmer>& queryKmerBuffer,
+                                          const std::vector<Query>& queryList,
+                                          size_t processedReadCnt) {
+    // Local read ids in this split are 1-based (seqID = queryIdx + 1, KmerExtractor.cpp).
+    // queryList index for local id lid is (lid - 1); global id is (lid + processedReadCnt),
+    // matching writeKmers' "sequenceID += processedReadCnt" and the 1-based downstream queryId.
+    const size_t splitReadCnt = queryList.size();
+    if (splitReadCnt == 0) {
+        return;
+    }
+
+    // Content min-hash per local read: min over its k-mers of mixHash64(value).
+    // min is commutative and idempotent => deterministic and independent of k-mer order.
+    std::vector<uint64_t> localHash(splitReadCnt + 1, UINT64_MAX);
+    for (size_t i = 0; i < queryKmerBuffer.startIndexOfReserve; ++i) {
+        const uint32_t lid = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID);
+        if (lid == 0 || lid > splitReadCnt) {
+            continue; // blank/reserved slots have sequenceID 0
+        }
+        const uint64_t h = mixHash64(queryKmerBuffer.buffer[i].value);
+        if (h < localHash[lid]) {
+            localHash[lid] = h;
+        }
+    }
+
+    for (size_t lid = 1; lid <= splitReadCnt; ++lid) {
+        const Query& q = queryList[lid - 1];
+        uint32_t pairedLength = static_cast<uint32_t>(q.queryLength);
+        if (par.seqMode == 2) {
+            pairedLength += static_cast<uint32_t>(q.queryLength2);
+        }
+        const uint64_t contentHash = (localHash[lid] == UINT64_MAX) ? 0 : localHash[lid];
+        centerKey[lid + processedReadCnt] = packCenterKey(pairedLength, contentHash);
+    }
+}
+
 void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
@@ -513,9 +573,22 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 currentQueryIds.size() > static_cast<size_t>(static_cast<double>(processedReadCnt) * par.maxKmerFreqRatio)) {
                 continue;
             }
-            for (size_t i = 0; i < currentQueryIds.size(); ++i) {
-                for (size_t j = i + 1; j < currentQueryIds.size(); ++j) {        
-                    uint64_t pairKey = (static_cast<uint64_t>(currentQueryIds[i]) << 32) | currentQueryIds[j];
+            // center-star (Step 2): reduce the C(m,2) clique to an (m-1)-edge star.
+            // center = read with the largest centerKey (length first, content min-hash
+            // tie-break) -> content-based, order/thread independent. Ties (same length +
+            // 40-bit hash) are effectively identical reads, so the choice is partition-invariant.
+            if (currentQueryIds.size() >= 2) {
+                uint32_t center = currentQueryIds[0];
+                uint64_t bestKey = centerKey[center];
+                for (uint32_t id : currentQueryIds) {
+                    uint64_t k = centerKey[id];
+                    if (k > bestKey) { bestKey = k; center = id; }
+                }
+                for (uint32_t member : currentQueryIds) {
+                    if (member == center) { continue; }
+                    uint32_t a = std::min(center, member);
+                    uint32_t b = std::max(center, member);
+                    uint64_t pairKey = (static_cast<uint64_t>(a) << 32) | b;
                     pair2weight[pairKey]++;
                 }
             }
