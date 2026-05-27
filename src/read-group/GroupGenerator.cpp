@@ -247,11 +247,11 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
 
-        // relations_*.txt are reparsed every refinement iteration but are no longer
+        // relations_*.bin are reparsed every refinement iteration but are no longer
         // needed once grouping is saved. Indices: relations_0 .. relations_{2*threads}.
         std::vector<std::string> relationFiles;
         for (int i = 0; i <= par.threads * 2; i++) {
-            relationFiles.push_back(outDir + "/relations_" + std::to_string(i) + ".txt");
+            relationFiles.push_back(outDir + "/relations_" + std::to_string(i) + ".bin");
         }
         reportAndRemoveFiles(relationFiles, "relations");
     }
@@ -690,10 +690,10 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt) {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
 
-    std::vector<std::ofstream> relationLogs;
+    std::vector<WriteBuffer<Relation>*> relationLogs;
     relationLogs.reserve(par.threads * 2 + 1);
     for (size_t i = 0; i < par.threads * 2 + 1; ++i) {
-        relationLogs.emplace_back(outDir + "/relations_" + std::to_string(i) + ".txt");
+        relationLogs.push_back(new WriteBuffer<Relation>(outDir + "/relations_" + std::to_string(i) + ".bin", 1024 * 1024));
     }
 
     std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
@@ -724,15 +724,22 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt) {
             }
         }
 
+        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
         if (minRelation.id1 % par.threads == minRelation.id2 % par.threads){
-            relationLogs[(minRelation.id1 % par.threads)] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
-        } 
-        else if (minRelation.id1 / range_size == minRelation.id2 / range_size){
-            relationLogs[(minRelation.id1 / range_size) + par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
-        } 
-        else{
-            relationLogs[par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
+            relationLogs[(minRelation.id1 % par.threads)]->write(&rel);
         }
+        else if (minRelation.id1 / range_size == minRelation.id2 / range_size){
+            relationLogs[(minRelation.id1 / range_size) + par.threads]->write(&rel);
+        }
+        else{
+            relationLogs[par.threads]->write(&rel);
+        }
+    }
+
+    // flush + close relation outputs before downstream reads / disk reporting.
+    for (size_t i = 0; i < relationLogs.size(); ++i) {
+        relationLogs[i]->flush();
+        delete relationLogs[i];
     }
 
     for (size_t i = 0; i < numOfGraph; ++i) {
@@ -757,14 +764,14 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
 
-    std::ofstream relationLog(outDir + "/relations.txt");
+    WriteBuffer<Relation> relationLog(outDir + "/relations.bin", 1024 * 1024);
 
     std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
     std::vector<Relation> currentRelations(this->numOfGraph);
     for (size_t i = 0; i < this->numOfGraph; ++i) {
         relationBuffers[i] = new ReadBuffer<Relation>(outDir + "/subGraph_" + to_string(i), 1024 * 1024);
         currentRelations[i] = relationBuffers[i]->getNext();
-    } 
+    }
 
     while (true) {
         Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
@@ -785,8 +792,10 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
             }
         }
 
-        relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
+        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
+        relationLog.write(&rel);
     }
+    relationLog.flush();
 
     for (size_t i = 0; i < numOfGraph; ++i) {
         delete relationBuffers[i];
@@ -805,10 +814,10 @@ void GroupGenerator::computeNodeDegree(
     degree.assign(processedReadCnt + 1, 0);
 
     auto processFile = [&](const std::string& fname) {
-        std::ifstream f(fname);
-        uint32_t id1, id2;
-        uint16_t w;
-        while (f >> id1 >> id2 >> w) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            uint32_t id1 = r.id1, id2 = r.id2;
+            uint16_t w = r.weight;
             if (id1 == 0 || id2 == 0) continue;
             if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
             if (w > threshold) {
@@ -819,7 +828,7 @@ void GroupGenerator::computeNodeDegree(
     };
 
     for (int i = 0; i < par.threads * 2 + 1; i++) {
-        processFile(outDir + "/relations_" + std::to_string(i) + ".txt");
+        processFile(outDir + "/relations_" + std::to_string(i) + ".bin");
     }
 }
 
@@ -856,10 +865,10 @@ void GroupGenerator::makeGroupsAdaptive(
     DisjointSet ds(processedReadCnt);
 
     auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
-        std::ifstream relationLog(fname);
-        uint32_t id1, id2;
-        uint16_t w;
-        while (relationLog >> id1 >> id2 >> w) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            uint32_t id1 = r.id1, id2 = r.id2;
+            uint16_t w = r.weight;
             if (id1 == 0 || id2 == 0) continue;
             if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
 
@@ -874,7 +883,7 @@ void GroupGenerator::makeGroupsAdaptive(
         int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
 
-        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".txt", subDs);
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin", subDs);
 
         subDs.flatten();
         #pragma omp critical
@@ -889,22 +898,21 @@ void GroupGenerator::makeGroupsAdaptive(
         #pragma omp critical
         { subDs = ds; }
 
-        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin", subDs);
 
         subDs.flatten();
         #pragma omp critical
         { ds += subDs; }
     }
-    
-    std::ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
-    uint32_t id1, id2;
-    uint16_t w;
-    while (relationLog >> id1 >> id2 >> w) {
-        if (keepEdgeGeo(w, nodeThr[id1], nodeThr[id2])) {
-            ds.unionSets(id1, id2);
+
+    {
+        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin", 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            if (keepEdgeGeo(r.weight, nodeThr[r.id1], nodeThr[r.id2])) {
+                ds.unionSets(r.id1, r.id2);
+            }
         }
     }
-    relationLog.close();    
 
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]) {
@@ -926,26 +934,25 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     DisjointSet ds(processedReadCnt);
 
     auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
-        std::ifstream relationLog(fname);
-        uint32_t id1, id2;
-        uint16_t weight;
-        while (relationLog >> id1 >> id2 >> weight) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            uint32_t id1 = r.id1, id2 = r.id2;
+            uint16_t weight = r.weight;
             if (static_cast<int>(weight) > groupKmerThr) {
                 if (id1 == 0 || id2 == 0) continue;
                 if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
                 subDs.unionSets(id1, id2);
             }
         }
-        relationLog.close();
     };
-    
+
 
     #pragma omp parallel num_threads(par.threads)
     {
         int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
 
-        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".txt", subDs);
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin", subDs);
 
         subDs.flatten();
 
@@ -962,20 +969,20 @@ void GroupGenerator::makeGroups(int groupKmerThr,
         #pragma omp critical
         { subDs = ds;}
 
-        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
-        
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin", subDs);
+
         subDs.flatten();
 
         #pragma omp critical
         { ds += subDs; }
     }
 
-    ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
-    uint32_t id1, id2;
-    uint16_t weight;
-    while (relationLog >> id1 >> id2 >> weight) {
-        if (static_cast<int>(weight) > groupKmerThr) {
-            ds.unionSets(id1, id2);
+    {
+        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin", 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            if (static_cast<int>(r.weight) > groupKmerThr) {
+                ds.unionSets(r.id1, r.id2);
+            }
         }
     }
 
