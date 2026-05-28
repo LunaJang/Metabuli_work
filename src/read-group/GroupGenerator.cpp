@@ -893,7 +893,7 @@ void GroupGenerator::makeGroupsAdaptive(
 
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]) {
-            queryGroupInfo[queryId] = ds.parent[queryId];
+            queryGroupInfo[queryId] = ds.find(queryId);
         }
     }
 
