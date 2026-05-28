@@ -170,8 +170,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
         
         computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
-        int maxIter = par.groupingIter;
-        float prevChangeRatio = 1.0f;
+        int maxIter = 5;
 
         for (int iter = 0; iter < maxIter; iter++) {
             cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
@@ -221,28 +220,6 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                     groupInfo[queryGroupInfo[i]].insert(i);
                 }
             }
-            // Early stopping
-            const float convergenceThreshold = 0.01f; // 1%
-            if (changeRatio < convergenceThreshold) {
-                cout << "  Converged at iteration " << iter + 1
-                    << " (change ratio " << (changeRatio * 100.0f) << "% < "
-                    << (convergenceThreshold * 100.0f) << "%)" << endl;
-                break;
-            }
-
-            // Convergence check (skip first iteration)
-            if (iter > 0 && changeRatio <= par.convergenceThreshold) {
-                cout << "Converged at iteration " << iter + 1 << endl;
-                break;
-            }
-
-            // Oscillation detection
-            if (iter > 0 && changeRatio >= prevChangeRatio * 0.95f) {
-                cout << "Change ratio not decreasing (prev=" << (prevChangeRatio * 100.0f)
-                     << "%, curr=" << (changeRatio * 100.0f) << "%), stopping." << endl;
-                break;
-            }
-            prevChangeRatio = changeRatio;
         }
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
