@@ -891,9 +891,20 @@ void GroupGenerator::makeGroupsAdaptive(
         }
     }
 
+    // Pass 1: map each component root -> min node ID in that component (canonical label)
+    std::unordered_map<uint32_t, uint32_t> rootToMin;
+    for (uint32_t i = 1; i < ds.parent.size(); ++i) {
+        if (!ds.grouped[i]) continue;
+        uint32_t root = ds.find(i);
+        auto it = rootToMin.find(root);
+        if (it == rootToMin.end() || i < it->second) {
+            rootToMin[root] = i;
+        }
+    }
+    // Pass 2: assign canonical group IDs
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]) {
-            queryGroupInfo[queryId] = ds.find(queryId);
+            queryGroupInfo[queryId] = rootToMin[ds.find(queryId)];
         }
     }
 
@@ -963,9 +974,20 @@ void GroupGenerator::makeGroups(int groupKmerThr,
         }
     }
 
+    // Pass 1: map each component root -> min node ID in that component (canonical label)
+    std::unordered_map<uint32_t, uint32_t> rootToMin;
+    for (uint32_t i = 1; i < ds.parent.size(); ++i) {
+        if (!ds.grouped[i]) continue;
+        uint32_t root = ds.find(i);
+        auto it = rootToMin.find(root);
+        if (it == rootToMin.end() || i < it->second) {
+            rootToMin[root] = i;
+        }
+    }
+    // Pass 2: assign canonical group IDs
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]){
-            uint32_t groupId = ds.find(queryId);
+            uint32_t groupId = rootToMin[ds.find(queryId)];
             groupInfo[groupId].insert(queryId);
             queryGroupInfo[queryId] = groupId;
         }
