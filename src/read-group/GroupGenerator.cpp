@@ -170,7 +170,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
         
         computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
-        int maxIter = 3;
+        int maxIter = 5;
 
         for (int iter = 0; iter < maxIter; iter++) {
             cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
