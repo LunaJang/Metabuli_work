@@ -170,7 +170,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
         
         computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
-        int maxIter = 5;
+        int maxIter = 10;
 
         for (int iter = 0; iter < maxIter; iter++) {
             cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
@@ -212,6 +212,10 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             cout << "  Iteration " << iter + 1
                 << ": " << changedCount << " / " << totalGroupedReads
                 << " reads changed group (" << (changeRatio * 100.0f) << "%)" << endl;
+
+            double ari = computeARI(prevGroupInfo, queryGroupInfo, processedReadCnt);
+            cout << "  Iteration " << iter + 1
+                 << ": ARI(prev vs curr) = " << ari << endl;
 
             // Rebuild groupInfo (existing logic)
             groupInfo.clear();
@@ -829,6 +833,61 @@ void GroupGenerator::computeGroupQuarterDegree(
         uint32_t p25 = degrees[n / 4];
         groupQuarterDeg[groupId] = p25;
     }
+}
+
+// Adjusted Rand Index between two partitions of the same N reads.
+// Convention (decided in plan Step 1): group_id == 0 (ungrouped) is treated as a
+// single distinguished cluster. This matches the changeRatio metric, which counts
+// 0 <-> non-zero transitions as partition changes. To reproduce these numbers
+// against sklearn.metrics.adjusted_rand_score, apply the same convention.
+//
+// Algorithm: build contingency table n_ij, row sums a_i, col sums b_j, then
+//   ARI = (sum C(n_ij,2) - sum C(a_i,2) * sum C(b_j,2) / C(N,2))
+//       / (0.5 * (sum C(a_i,2) + sum C(b_j,2)) - sum C(a_i,2) * sum C(b_j,2) / C(N,2))
+// Products are taken in double to avoid uint64 overflow at N ~ 10^8.
+double GroupGenerator::computeARI(const std::vector<uint32_t>& partA,
+                                  const std::vector<uint32_t>& partB,
+                                  size_t processedReadCnt) const {
+    if (processedReadCnt <= 1) return 1.0;
+
+    std::unordered_map<uint64_t, uint64_t> nij;
+    std::unordered_map<uint32_t, uint64_t> ai;
+    std::unordered_map<uint32_t, uint64_t> bj;
+
+    for (size_t i = 1; i <= processedReadCnt; ++i) {
+        uint32_t a = partA[i];
+        uint32_t b = partB[i];
+        uint64_t key = (static_cast<uint64_t>(a) << 32) | static_cast<uint64_t>(b);
+        ++nij[key];
+        ++ai[a];
+        ++bj[b];
+    }
+
+    auto choose2 = [](uint64_t n) -> uint64_t {
+        return n < 2 ? 0ULL : n * (n - 1) / 2;
+    };
+
+    uint64_t sum_nij_c2 = 0;
+    for (const auto& kv : nij) sum_nij_c2 += choose2(kv.second);
+    uint64_t sum_ai_c2 = 0;
+    for (const auto& kv : ai) sum_ai_c2 += choose2(kv.second);
+    uint64_t sum_bj_c2 = 0;
+    for (const auto& kv : bj) sum_bj_c2 += choose2(kv.second);
+
+    uint64_t N = static_cast<uint64_t>(processedReadCnt);
+    uint64_t N_c2 = choose2(N);
+    if (N_c2 == 0) return 1.0;
+
+    double sa  = static_cast<double>(sum_ai_c2);
+    double sb  = static_cast<double>(sum_bj_c2);
+    double sn  = static_cast<double>(sum_nij_c2);
+    double nc2 = static_cast<double>(N_c2);
+    double expected = sa * sb / nc2;
+    double num = sn - expected;
+    double den = 0.5 * (sa + sb) - expected;
+
+    if (den == 0.0) return 1.0;
+    return num / den;
 }
 
 void GroupGenerator::makeGroupsAdaptive(

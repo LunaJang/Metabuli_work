@@ -212,7 +212,15 @@ public:
     void computeGroupQuarterDegree(const std::vector<uint32_t>& queryGroupInfo,
                                   const std::vector<uint32_t>& degree,
                                   std::unordered_map<uint32_t, uint32_t>& groupQuarterDeg);
-    
+
+    // Adjusted Rand Index between two partitions (queryGroupInfo-style vectors).
+    // Both vectors are 1-based; index 0 is unused. group_id == 0 is treated as a
+    // single "ungrouped" cluster. Returns 1.0 for degenerate cases (single cluster
+    // in both partitions, N <= 1, or denominator == 0).
+    double computeARI(const std::vector<uint32_t>& partA,
+                      const std::vector<uint32_t>& partB,
+                      size_t processedReadCnt) const;
+
     void makeGroupsAdaptive(const vector<uint16_t>& nodeThr,
                             size_t processedReadCnt,
                             vector<uint32_t>& queryGroupInfo);         
