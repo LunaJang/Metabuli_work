@@ -98,6 +98,7 @@ public:
     PARAMETER(NUM_ITERATION)
     PARAMETER(MIN_EDGE_WEIGHT)
     PARAMETER(CONVERGENCE_THRESHOLD)
+    PARAMETER(MAX_KMER_FREQ_RATIO)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
     PARAMETER(READID_COL)
@@ -196,6 +197,7 @@ public:
     int neighborKmers;
     int groupingIter;
     float convergenceThreshold;
+    float maxKmerFreqRatio;
 
     // Group application
     int scoreCol;

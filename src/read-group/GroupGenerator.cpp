@@ -3,6 +3,53 @@
 #include "QueryIndexer.h"
 #include "common.h"
 #include "Kmer.h"
+#include <sys/stat.h>
+
+// Human-readable byte size for disk-usage logs.
+static std::string humanBytes(uint64_t bytes) {
+    const char* unit[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = static_cast<double>(bytes);
+    int i = 0;
+    while (v >= 1024.0 && i < 4) { v /= 1024.0; ++i; }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f %s", v, unit[i]);
+    return std::string(buf);
+}
+
+// Sum sizes of existing files in `paths`, log "<label>: N files, X freed", then remove them.
+// Non-existent paths are skipped (not counted).
+static void reportAndRemoveFiles(const std::vector<std::string>& paths, const std::string& label) {
+    uint64_t total = 0;
+    size_t count = 0;
+    for (const std::string& p : paths) {
+        struct stat st;
+        if (stat(p.c_str(), &st) == 0) {
+            total += static_cast<uint64_t>(st.st_size);
+            ++count;
+            std::remove(p.c_str());
+        }
+    }
+    std::cout << "[disk] " << label << ": " << count << " files, "
+              << humanBytes(total) << " freed" << std::endl;
+}
+
+// Deterministic 64-bit integer hash (murmur3 finalizer). No runtime randomness:
+// the same k-mer value always maps to the same hash, independent of input order.
+static inline uint64_t mixHash64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+// Pack center key: length in high 24 bits (larger length preferred as center),
+// content min-hash in low 40 bits (deterministic tie-break by content).
+static inline uint64_t packCenterKey(uint32_t pairedLength, uint64_t contentHash) {
+    return (static_cast<uint64_t>(pairedLength & 0xFFFFFFu) << 40)
+         | (contentHash & 0xFFFFFFFFFFULL);
+}
 
 GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     commonKmerDB = par.filenames[1 + (par.seqMode == 2)];
@@ -50,6 +97,8 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             cout << "Done" << endl;
             cout << "Total number of sequences: " << queryIndexer->getReadNum_1() << endl;
             cout << "Total read length: " << queryIndexer->getTotalReadLength() <<  "nt" << endl;
+            // center-star (Step 1): 1-based global read id -> center key. Sized once.
+            centerKey.assign(totalSeqCnt + 1, 0);
         }
 
         // Set up kseq
@@ -80,8 +129,12 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                                              queryReadSplit[splitIdx],
                                              par,
                                              kseq1,
-                                             kseq2); 
-                                                        
+                                             kseq2);
+
+            // center-star (Step 1): compute per-read center key from the freshly
+            // extracted k-mers (before common-kmer filtering reorders the buffer).
+            accumulateCenterKeys(queryKmerBuffer, queryList, processedReadCnt);
+
             filterCommonKmers(queryKmerBuffer, matchBuffer, commonKmerDB);
             time_t t = time(nullptr);
             writeKmers(queryKmerBuffer, processedReadCnt);
@@ -117,8 +170,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
         
         computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
-        int maxIter = par.groupingIter;
-        float prevChangeRatio = 1.0f;
+        int maxIter = 0;
 
         for (int iter = 0; iter < maxIter; iter++) {
             cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
@@ -168,31 +220,17 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                     groupInfo[queryGroupInfo[i]].insert(i);
                 }
             }
-            // Early stopping
-            const float convergenceThreshold = 0.01f; // 1%
-            if (changeRatio < convergenceThreshold) {
-                cout << "  Converged at iteration " << iter + 1
-                    << " (change ratio " << (changeRatio * 100.0f) << "% < "
-                    << (convergenceThreshold * 100.0f) << "%)" << endl;
-                break;
-            }
-
-            // Convergence check (skip first iteration)
-            if (iter > 0 && changeRatio <= par.convergenceThreshold) {
-                cout << "Converged at iteration " << iter + 1 << endl;
-                break;
-            }
-
-            // Oscillation detection
-            if (iter > 0 && changeRatio >= prevChangeRatio * 0.95f) {
-                cout << "Change ratio not decreasing (prev=" << (prevChangeRatio * 100.0f)
-                     << "%, curr=" << (changeRatio * 100.0f) << "%), stopping." << endl;
-                break;
-            }
-            prevChangeRatio = changeRatio;
         }
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
+
+        // relations_*.bin are reparsed every refinement iteration but are no longer
+        // needed once grouping is saved. Indices: relations_0 .. relations_{2*threads}.
+        std::vector<std::string> relationFiles;
+        for (int i = 0; i <= par.threads * 2; i++) {
+            relationFiles.push_back(outDir + "/relations_" + std::to_string(i) + ".bin");
+        }
+        reportAndRemoveFiles(relationFiles, "relations");
     }
 }
 
@@ -456,6 +494,42 @@ std::vector<std::pair<size_t, size_t>> GroupGenerator::getKmerRanges(const Buffe
     return ranges;
 }
 
+void GroupGenerator::accumulateCenterKeys(const Buffer<Kmer>& queryKmerBuffer,
+                                          const std::vector<Query>& queryList,
+                                          size_t processedReadCnt) {
+    // Local read ids in this split are 1-based (seqID = queryIdx + 1, KmerExtractor.cpp).
+    // queryList index for local id lid is (lid - 1); global id is (lid + processedReadCnt),
+    // matching writeKmers' "sequenceID += processedReadCnt" and the 1-based downstream queryId.
+    const size_t splitReadCnt = queryList.size();
+    if (splitReadCnt == 0) {
+        return;
+    }
+
+    // Content min-hash per local read: min over its k-mers of mixHash64(value).
+    // min is commutative and idempotent => deterministic and independent of k-mer order.
+    std::vector<uint64_t> localHash(splitReadCnt + 1, UINT64_MAX);
+    for (size_t i = 0; i < queryKmerBuffer.startIndexOfReserve; ++i) {
+        const uint32_t lid = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID);
+        if (lid == 0 || lid > splitReadCnt) {
+            continue; // blank/reserved slots have sequenceID 0
+        }
+        const uint64_t h = mixHash64(queryKmerBuffer.buffer[i].value);
+        if (h < localHash[lid]) {
+            localHash[lid] = h;
+        }
+    }
+
+    for (size_t lid = 1; lid <= splitReadCnt; ++lid) {
+        const Query& q = queryList[lid - 1];
+        uint32_t pairedLength = static_cast<uint32_t>(q.queryLength);
+        if (par.seqMode == 2) {
+            pairedLength += static_cast<uint32_t>(q.queryLength2);
+        }
+        const uint64_t contentHash = (localHash[lid] == UINT64_MAX) ? 0 : localHash[lid];
+        centerKey[lid + processedReadCnt] = packCenterKey(pairedLength, contentHash);
+    }
+}
+
 void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
@@ -509,9 +583,26 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             std::sort(currentQueryIds.begin(), currentQueryIds.end());
             auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
             currentQueryIds.erase(last, currentQueryIds.end());
-            for (size_t i = 0; i < currentQueryIds.size(); ++i) {
-                for (size_t j = i + 1; j < currentQueryIds.size(); ++j) {        
-                    uint64_t pairKey = (static_cast<uint64_t>(currentQueryIds[i]) << 32) | currentQueryIds[j];
+            if (par.maxKmerFreqRatio > 0.0f &&
+                currentQueryIds.size() > static_cast<size_t>(static_cast<double>(processedReadCnt) * par.maxKmerFreqRatio)) {
+                continue;
+            }
+            // center-star (Step 2): reduce the C(m,2) clique to an (m-1)-edge star.
+            // center = read with the largest centerKey (length first, content min-hash
+            // tie-break) -> content-based, order/thread independent. Ties (same length +
+            // 40-bit hash) are effectively identical reads, so the choice is partition-invariant.
+            if (currentQueryIds.size() >= 2) {
+                uint32_t center = currentQueryIds[0];
+                uint64_t bestKey = centerKey[center];
+                for (uint32_t id : currentQueryIds) {
+                    uint64_t k = centerKey[id];
+                    if (k > bestKey) { bestKey = k; center = id; }
+                }
+                for (uint32_t member : currentQueryIds) {
+                    if (member == center) { continue; }
+                    uint32_t a = std::min(center, member);
+                    uint32_t b = std::max(center, member);
+                    uint64_t pairKey = (static_cast<uint64_t>(a) << 32) | b;
                     pair2weight[pairKey]++;
                 }
             }
@@ -530,8 +621,21 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         for (size_t file = 0; file < this->numOfSplits; file++) {
             delete deltaIdxReaders[file];
         }
-    }    
+    }
     this->numOfGraph = counter.load(std::memory_order_relaxed);
+
+    // k-mer files are fully consumed by the merge above; report + remove to free disk.
+    {
+        std::vector<std::string> deltaFiles, infoFiles;
+        for (size_t i = 0; i < this->numOfSplits; i++) {
+            for (int t = 0; t < par.threads; t++) {
+                deltaFiles.push_back(outDir + "/kmer_delta_" + to_string(i) + "_" + to_string(t));
+                infoFiles.push_back(outDir + "/kmer_info_"  + to_string(i) + "_" + to_string(t));
+            }
+        }
+        reportAndRemoveFiles(deltaFiles, "kmer_delta");
+        reportAndRemoveFiles(infoFiles, "kmer_info");
+    }
 
     cout << "Relations generated from files successfully." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
@@ -563,10 +667,10 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt) {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
 
-    std::vector<std::ofstream> relationLogs;
+    std::vector<WriteBuffer<Relation>*> relationLogs;
     relationLogs.reserve(par.threads * 2 + 1);
     for (size_t i = 0; i < par.threads * 2 + 1; ++i) {
-        relationLogs.emplace_back(outDir + "/relations_" + std::to_string(i) + ".txt");
+        relationLogs.push_back(new WriteBuffer<Relation>(outDir + "/relations_" + std::to_string(i) + ".bin", 1024 * 1024));
     }
 
     std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
@@ -597,19 +701,35 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt) {
             }
         }
 
+        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
         if (minRelation.id1 % par.threads == minRelation.id2 % par.threads){
-            relationLogs[(minRelation.id1 % par.threads)] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
-        } 
-        else if (minRelation.id1 / range_size == minRelation.id2 / range_size){
-            relationLogs[(minRelation.id1 / range_size) + par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
-        } 
-        else{
-            relationLogs[par.threads] << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';            
+            relationLogs[(minRelation.id1 % par.threads)]->write(&rel);
         }
+        else if (minRelation.id1 / range_size == minRelation.id2 / range_size){
+            relationLogs[(minRelation.id1 / range_size) + par.threads]->write(&rel);
+        }
+        else{
+            relationLogs[par.threads]->write(&rel);
+        }
+    }
+
+    // flush + close relation outputs before downstream reads / disk reporting.
+    for (size_t i = 0; i < relationLogs.size(); ++i) {
+        relationLogs[i]->flush();
+        delete relationLogs[i];
     }
 
     for (size_t i = 0; i < numOfGraph; ++i) {
         delete relationBuffers[i];
+    }
+
+    // subGraph_* are fully merged into relations_*; report + remove to free disk.
+    {
+        std::vector<std::string> subGraphFiles;
+        for (size_t i = 0; i < this->numOfGraph; ++i) {
+            subGraphFiles.push_back(outDir + "/subGraph_" + to_string(i));
+        }
+        reportAndRemoveFiles(subGraphFiles, "subGraph");
     }
 
     cout << "Query relation graph merged successfully" << endl;
@@ -621,14 +741,14 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
 
-    std::ofstream relationLog(outDir + "/relations.txt");
+    WriteBuffer<Relation> relationLog(outDir + "/relations.bin", 1024 * 1024);
 
     std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
     std::vector<Relation> currentRelations(this->numOfGraph);
     for (size_t i = 0; i < this->numOfGraph; ++i) {
         relationBuffers[i] = new ReadBuffer<Relation>(outDir + "/subGraph_" + to_string(i), 1024 * 1024);
         currentRelations[i] = relationBuffers[i]->getNext();
-    } 
+    }
 
     while (true) {
         Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
@@ -649,8 +769,10 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
             }
         }
 
-        relationLog << minRelation.id1 << '\t' << minRelation.id2 << '\t' << totalWeight << '\n';
+        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
+        relationLog.write(&rel);
     }
+    relationLog.flush();
 
     for (size_t i = 0; i < numOfGraph; ++i) {
         delete relationBuffers[i];
@@ -669,10 +791,10 @@ void GroupGenerator::computeNodeDegree(
     degree.assign(processedReadCnt + 1, 0);
 
     auto processFile = [&](const std::string& fname) {
-        std::ifstream f(fname);
-        uint32_t id1, id2;
-        uint16_t w;
-        while (f >> id1 >> id2 >> w) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            uint32_t id1 = r.id1, id2 = r.id2;
+            uint16_t w = r.weight;
             if (id1 == 0 || id2 == 0) continue;
             if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
             if (w > threshold) {
@@ -683,7 +805,7 @@ void GroupGenerator::computeNodeDegree(
     };
 
     for (int i = 0; i < par.threads * 2 + 1; i++) {
-        processFile(outDir + "/relations_" + std::to_string(i) + ".txt");
+        processFile(outDir + "/relations_" + std::to_string(i) + ".bin");
     }
 }
 
@@ -720,10 +842,10 @@ void GroupGenerator::makeGroupsAdaptive(
     DisjointSet ds(processedReadCnt);
 
     auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
-        std::ifstream relationLog(fname);
-        uint32_t id1, id2;
-        uint16_t w;
-        while (relationLog >> id1 >> id2 >> w) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            uint32_t id1 = r.id1, id2 = r.id2;
+            uint16_t w = r.weight;
             if (id1 == 0 || id2 == 0) continue;
             if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
 
@@ -738,7 +860,7 @@ void GroupGenerator::makeGroupsAdaptive(
         int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
 
-        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".txt", subDs);
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin", subDs);
 
         subDs.flatten();
         #pragma omp critical
@@ -753,26 +875,36 @@ void GroupGenerator::makeGroupsAdaptive(
         #pragma omp critical
         { subDs = ds; }
 
-        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin", subDs);
 
         subDs.flatten();
         #pragma omp critical
         { ds += subDs; }
     }
-    
-    std::ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
-    uint32_t id1, id2;
-    uint16_t w;
-    while (relationLog >> id1 >> id2 >> w) {
-        if (keepEdgeGeo(w, nodeThr[id1], nodeThr[id2])) {
-            ds.unionSets(id1, id2);
+
+    {
+        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin", 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            if (keepEdgeGeo(r.weight, nodeThr[r.id1], nodeThr[r.id2])) {
+                ds.unionSets(r.id1, r.id2);
+            }
         }
     }
-    relationLog.close();    
 
+    // Pass 1: map each component root -> min node ID in that component (canonical label)
+    std::unordered_map<uint32_t, uint32_t> rootToMin;
+    for (uint32_t i = 1; i < ds.parent.size(); ++i) {
+        if (!ds.grouped[i]) continue;
+        uint32_t root = ds.find(i);
+        auto it = rootToMin.find(root);
+        if (it == rootToMin.end() || i < it->second) {
+            rootToMin[root] = i;
+        }
+    }
+    // Pass 2: assign canonical group IDs
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]) {
-            queryGroupInfo[queryId] = ds.parent[queryId];
+            queryGroupInfo[queryId] = rootToMin[ds.find(queryId)];
         }
     }
 
@@ -790,26 +922,25 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     DisjointSet ds(processedReadCnt);
 
     auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
-        std::ifstream relationLog(fname);
-        uint32_t id1, id2;
-        uint16_t weight;
-        while (relationLog >> id1 >> id2 >> weight) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            uint32_t id1 = r.id1, id2 = r.id2;
+            uint16_t weight = r.weight;
             if (static_cast<int>(weight) > groupKmerThr) {
                 if (id1 == 0 || id2 == 0) continue;
                 if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
                 subDs.unionSets(id1, id2);
             }
         }
-        relationLog.close();
     };
-    
+
 
     #pragma omp parallel num_threads(par.threads)
     {
         int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
 
-        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".txt", subDs);
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin", subDs);
 
         subDs.flatten();
 
@@ -826,26 +957,37 @@ void GroupGenerator::makeGroups(int groupKmerThr,
         #pragma omp critical
         { subDs = ds;}
 
-        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".txt", subDs);
-        
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin", subDs);
+
         subDs.flatten();
 
         #pragma omp critical
         { ds += subDs; }
     }
 
-    ifstream relationLog(outDir + "/relations_" + std::to_string(par.threads * 2) + ".txt");
-    uint32_t id1, id2;
-    uint16_t weight;
-    while (relationLog >> id1 >> id2 >> weight) {
-        if (static_cast<int>(weight) > groupKmerThr) {
-            ds.unionSets(id1, id2);
+    {
+        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin", 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            if (static_cast<int>(r.weight) > groupKmerThr) {
+                ds.unionSets(r.id1, r.id2);
+            }
         }
     }
 
+    // Pass 1: map each component root -> min node ID in that component (canonical label)
+    std::unordered_map<uint32_t, uint32_t> rootToMin;
+    for (uint32_t i = 1; i < ds.parent.size(); ++i) {
+        if (!ds.grouped[i]) continue;
+        uint32_t root = ds.find(i);
+        auto it = rootToMin.find(root);
+        if (it == rootToMin.end() || i < it->second) {
+            rootToMin[root] = i;
+        }
+    }
+    // Pass 2: assign canonical group IDs
     for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
         if (ds.grouped[queryId]){
-            uint32_t groupId = ds.find(queryId);
+            uint32_t groupId = rootToMin[ds.find(queryId)];
             groupInfo[groupId].insert(queryId);
             queryGroupInfo[queryId] = groupId;
         }
