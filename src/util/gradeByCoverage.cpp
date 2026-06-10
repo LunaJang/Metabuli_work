@@ -80,19 +80,21 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
     string nodes  = taxonomy + "/nodes.dmp";
     string merged = taxonomy + "/merged.dmp";
 
-    // accession (no version) -> coverage
-    unordered_map<string, float> assacc2cov;
+    // read id / accession (no version) -> coverage
+    unordered_map<string, float> id2cov;
     {
         ifstream f(covMappingFile);
         if (!f.is_open()) { cerr << "Cannot open: " << covMappingFile << endl; exit(1); }
-        string acc; float cov;
-        while (f >> acc >> cov) {
-            size_t dot = acc.find('.');
-            if (dot != string::npos) acc = acc.substr(0, dot);
-            assacc2cov[acc] = cov;
+        string key; float cov;
+        while (f >> key >> cov) {
+            if (par.testType != "cami") {
+                size_t dot = key.find('.');
+                if (dot != string::npos) key = key.substr(0, dot);
+            }
+            id2cov[key] = cov;
         }
     }
-    cerr << "Coverage map loaded: " << assacc2cov.size() << " species" << endl;
+    cerr << "Coverage map loaded: " << id2cov.size() << " entries" << endl;
 
     auto loadList = [](const string &path) {
         vector<string> v;
@@ -111,9 +113,9 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
 #endif
 
 #pragma omp parallel default(none), \
-    shared(results, ranks, N, mappingFiles, classFiles, assacc2cov, par, cerr, names, nodes, merged)
+    shared(results, ranks, N, mappingFiles, classFiles, id2cov, par, cerr, names, nodes, merged)
     {
-        unordered_map<string, int> assacc2taxid;
+        unordered_map<string, int> id2taxid;
         TaxonomyWrapper ncbiTax(names, nodes, merged, false);
         regex accRe("(GC[AF]_[0-9]+\\.[0-9]+)");
         smatch m;
@@ -122,7 +124,7 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
 
 #pragma omp for schedule(dynamic)
         for (size_t i = 0; i < N; ++i) {
-            assacc2taxid.clear();
+            id2taxid.clear();
 
             {
                 string k, v;
@@ -131,9 +133,14 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
                 while (getline(mf, k, '\t') && getline(mf, v, '\n')) {
                     if (!v.empty() && v.back() == '\r') v.pop_back();
                     if (v.empty() || !isdigit((unsigned char)v[0])) continue;
-                    size_t d = k.find('.');
-                    if (d != string::npos) k = k.substr(0, d);
-                    assacc2taxid[k] = stoi(v);
+                    if (par.testType == "cami") {
+                        size_t slash = k.rfind('/');
+                        if (slash != string::npos) k = k.substr(0, slash);
+                    } else {
+                        size_t d = k.find('.');
+                        if (d != string::npos) k = k.substr(0, d);
+                    }
+                    id2taxid[k] = stoi(v);
                 }
             }
 
@@ -148,20 +155,29 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
                 if (!isdigit(fields[par.taxidCol][0])) continue;
 
                 string id = fields[par.readIdCol];
-                if (!regex_search(id, m, accRe)) continue;
-                string acc = m[1];
-                size_t dot = acc.find('.');
-                if (dot != string::npos) acc = acc.substr(0, dot);
-
                 int classInt = stoi(fields[par.taxidCol]);
+
+                string lookupKey;
+                if (par.testType == "cami") {
+                    lookupKey = id;
+                    size_t slash = lookupKey.rfind('/');
+                    if (slash != string::npos) lookupKey = lookupKey.substr(0, slash);
+                } else {
+                    if (!regex_search(id, m, accRe)) continue;
+                    string acc = m[1];
+                    size_t dot = acc.find('.');
+                    if (dot != string::npos) acc = acc.substr(0, dot);
+                    lookupKey = acc;
+                }
+
                 if (classInt != 0) classified++;
 
-                auto taxIt = assacc2taxid.find(acc);
-                if (taxIt == assacc2taxid.end()) continue;
+                auto taxIt = id2taxid.find(lookupKey);
+                if (taxIt == id2taxid.end()) continue;
                 TaxID rightAnswer = taxIt->second;
 
-                auto covIt = assacc2cov.find(acc);
-                if (covIt == assacc2cov.end()) continue;
+                auto covIt = id2cov.find(lookupKey);
+                if (covIt == id2cov.end()) continue;
                 float cov = covIt->second;
 
                 for (const string &rank : ranks_local)
