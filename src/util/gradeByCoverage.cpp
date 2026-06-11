@@ -27,8 +27,18 @@ struct CovCount {
     }
 };
 
+static const float COV_BREAKS[] = {1, 5, 10, 20, 50};
+static const char* COV_LABELS[] = {"<1", "1-5", "5-10", "10-20", "20-50", "50+"};
+static const int N_COV_BINS = 6;
+
+static int covToBin(float c) {
+    for (int i = 0; i < N_COV_BINS - 1; i++)
+        if (c < COV_BREAKS[i]) return i;
+    return N_COV_BINS - 1;
+}
+
 struct GradeByCovResult {
-    map<float, unordered_map<string, CovCount>> cov2rank;
+    map<int, unordered_map<string, CovCount>> cov2rank;
     string path;
 };
 
@@ -178,11 +188,11 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
 
                 auto covIt = id2cov.find(lookupKey);
                 if (covIt == id2cov.end()) continue;
-                float cov = covIt->second;
+                int bin = covToBin(covIt->second);
 
                 for (const string &rank : ranks_local)
                     compareTaxonAtRank_ByCov(classInt, rightAnswer, ncbiTax,
-                                             results[i].cov2rank[cov][rank], rank);
+                                             results[i].cov2rank[bin][rank], rank);
             }
             cf.close();
 
@@ -194,22 +204,16 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
         }
     }
 
-    // Summary table to stdout only
-    std::set<float> allCovs;
-    for (auto &r : results)
-        for (auto &p : r.cov2rank)
-            allCovs.insert(p.first);
-
     cout << "Coverage\tRank";
     for (size_t i = 0; i < results.size(); i++)
         cout << "\tPrecision\tSensitivity\tF1";
     cout << "\n";
 
-    for (float cov : allCovs) {
+    for (int bin = 0; bin < N_COV_BINS; bin++) {
         for (const string &rank : ranks) {
-            cout << cov << "\t" << rank;
+            cout << COV_LABELS[bin] << "\t" << rank;
             for (auto &r : results) {
-                auto cIt = r.cov2rank.find(cov);
+                auto cIt = r.cov2rank.find(bin);
                 if (cIt != r.cov2rank.end()) {
                     auto rIt = cIt->second.find(rank);
                     if (rIt != cIt->second.end()) {
