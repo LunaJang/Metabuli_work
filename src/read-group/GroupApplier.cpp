@@ -203,10 +203,22 @@ void GroupApplier::applyRepLabel(const vector<OrgResult>& orgResults,
     for (int queryIdx = 0; queryIdx < orgResults.size() ; queryIdx++){
         uint32_t groupId = groupMappingInfo[queryIdx];
         auto repLabelIt = repLabel.find(groupId);
-        if (orgResults[queryIdx].label != 0) {
+        bool hasRepLabel = (repLabelIt != repLabel.end() && repLabelIt->second != 0);
+
+        if (hasRepLabel) {
+            bool applyRep;
+            if (par.weightMode == 0) {
+                applyRep = true;
+            } else {
+                applyRep = (orgResults[queryIdx].label == 0 || orgResults[queryIdx].score < par.minVoteScr);
+            }
+            if (applyRep) {
+                queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, true, orgResults[queryIdx].name));
+            } else {
+                queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, true, orgResults[queryIdx].name));
+            }
+        } else if (orgResults[queryIdx].label != 0) {
             queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, true, orgResults[queryIdx].name));
-        } else if (repLabelIt != repLabel.end() && repLabelIt->second != 0) {
-            queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, true, orgResults[queryIdx].name));
         } else {
             queryList.emplace_back(Query(0, orgResults[queryIdx].score, false, orgResults[queryIdx].name));
         }
