@@ -25,8 +25,18 @@ struct CovGroupCount {
     }
 };
 
+static const float COV_BREAKS[] = {1, 5, 10, 20, 50};
+static const char* COV_LABELS[] = {"<1", "1-5", "5-10", "10-20", "20-50", "50+"};
+static const int N_COV_BINS = 6;
+
+static int covToBin(float c) {
+    for (int i = 0; i < N_COV_BINS - 1; i++)
+        if (c < COV_BREAKS[i]) return i;
+    return N_COV_BINS - 1;
+}
+
 struct GradeGroupByCovResult {
-    map<float, unordered_map<string, CovGroupCount>> cov2rank;
+    map<int, unordered_map<string, CovGroupCount>> cov2rank;
     string path;
 };
 
@@ -170,9 +180,9 @@ int gradeGroupByCoverage(int argc, const char **argv, const Command &command) {
             cerr << "Query names loaded: " << queryNameFiles[i]
                  << " (n=" << queryTaxid.size() << ")" << endl;
 
-            // Phase 1: read the read-group file once into a flat per-coverage list.
-            // covReads[cov] = vector of (taxid, groupId) — compact, no per-rank expansion yet.
-            map<float, vector<pair<TaxID, int>>> covReads;
+            // Phase 1: read the read-group file once into a flat per-coverage bin list.
+            // covReads[bin] = vector of (taxid, groupId) — compact, no per-rank expansion yet.
+            map<int, vector<pair<TaxID, int>>> covReads;
             {
                 ifstream rgf(readGroupFiles[i]);
                 if (!rgf.is_open()) { cerr << "Cannot open: " << readGroupFiles[i] << endl; continue; }
@@ -200,15 +210,15 @@ int gradeGroupByCoverage(int argc, const char **argv, const Command &command) {
                     TaxID taxid = queryTaxid[vecIdx];
                     float cov   = queryCov[vecIdx];
                     if (taxid < 0 || cov < 0.0f) continue;
-                    covReads[cov].emplace_back(taxid, gId);
+                    covReads[covToBin(cov)].emplace_back(taxid, gId);
                 }
             }
 
-            // Phase 2: for each rank, iterate over coverages, build group/tax maps on the fly.
-            // Memory at any point: O(reads_at_one_cov) instead of O(ranks × covs × reads).
+            // Phase 2: for each rank, iterate over coverage bins, build group/tax maps on the fly.
+            // Memory at any point: O(reads_at_one_bin) instead of O(ranks × covs × reads).
             for (const string &rank : ranks_local) {
                 for (auto &kv : covReads) {
-                    float cov = kv.first;
+                    int bin = kv.first;
                     unordered_map<int, vector<TaxID>> group2taxs;
                     unordered_map<TaxID, vector<int>> tax2groups;
                     for (auto &entry : kv.second) {
@@ -217,8 +227,8 @@ int gradeGroupByCoverage(int argc, const char **argv, const Command &command) {
                         tax2groups[taxAtRank].push_back(entry.second);
                     }
                     computeGroupPurityRecallByCov(group2taxs, tax2groups,
-                                                  results[i].cov2rank[cov][rank]);
-                    results[i].cov2rank[cov][rank].calculate();
+                                                  results[i].cov2rank[bin][rank]);
+                    results[i].cov2rank[bin][rank].calculate();
                 }
             }
 
@@ -226,22 +236,16 @@ int gradeGroupByCoverage(int argc, const char **argv, const Command &command) {
         }
     }
 
-    // Summary table to stdout only
-    std::set<float> allCovs;
-    for (auto &r : results)
-        for (auto &p : r.cov2rank)
-            allCovs.insert(p.first);
-
     cout << "Coverage\tRank";
     for (size_t i = 0; i < results.size(); i++)
         cout << "\tPurity\tRecall\tF1";
     cout << "\n";
 
-    for (float cov : allCovs) {
+    for (int bin = 0; bin < N_COV_BINS; bin++) {
         for (const string &rank : ranks) {
-            cout << cov << "\t" << rank;
+            cout << COV_LABELS[bin] << "\t" << rank;
             for (auto &r : results) {
-                auto cIt = r.cov2rank.find(cov);
+                auto cIt = r.cov2rank.find(bin);
                 if (cIt != r.cov2rank.end()) {
                     auto rIt = cIt->second.find(rank);
                     if (rIt != cIt->second.end()) {
