@@ -3,6 +3,7 @@
 #include "QueryIndexer.h"
 #include "common.h"
 #include "Kmer.h"
+#include <queue>
 #include <sys/stat.h>
 
 // Human-readable byte size for disk-usage logs.
@@ -162,65 +163,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         mergeGraph_one(processedReadCnt);
     } else {
         mergeGraph(processedReadCnt);
-        makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
-        
-        // Step 2: Iterative adaptive refinement
-        std::vector<uint16_t> nodeThr(processedReadCnt + 1, par.minEdgeWeight);
-        std::vector<uint32_t> degree;
-        std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
-        
-        computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
-        int maxIter = 2;
-
-        for (int iter = 0; iter < maxIter; iter++) {
-            cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
-
-            computeGroupQuarterDegree(queryGroupInfo, degree, groupQuarterDeg);
-
-            for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                uint32_t groupId = queryGroupInfo[i];
-                if (groupId == 0) {
-                    nodeThr[i] = static_cast<uint16_t>(par.minEdgeWeight);
-                } else {
-                    uint32_t quarterDegree = groupQuarterDeg.count(groupId) ? groupQuarterDeg[groupId] : 0;
-                    nodeThr[i] = degreeToThr(quarterDegree);
-                }
-            }
-
-            // Snapshot before adaptive regrouping
-            std::vector<uint32_t> prevGroupInfo(queryGroupInfo);
-
-            groupInfo.clear();
-            makeGroupsAdaptive(nodeThr, processedReadCnt, queryGroupInfo);
-
-            // Count membership changes
-            size_t changedCount = 0;
-            size_t totalGroupedReads = 0;
-            for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                if (queryGroupInfo[i] != 0) {
-                    totalGroupedReads++;
-                    if (queryGroupInfo[i] != prevGroupInfo[i]) {
-                        changedCount++;
-                    }
-                }
-            }
-
-            float changeRatio = (totalGroupedReads > 0)
-                ? static_cast<float>(changedCount) / static_cast<float>(totalGroupedReads)
-                : 0.0f;
-
-            cout << "  Iteration " << iter + 1
-                << ": " << changedCount << " / " << totalGroupedReads
-                << " reads changed group (" << (changeRatio * 100.0f) << "%)" << endl;
-
-            // Rebuild groupInfo (existing logic)
-            groupInfo.clear();
-            for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                if (queryGroupInfo[i] != 0) {
-                    groupInfo[queryGroupInfo[i]].insert(i);
-                }
-            }
-        }
+        labelPropagation(processedReadCnt, groupInfo, queryGroupInfo);
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
 
@@ -912,9 +855,139 @@ void GroupGenerator::makeGroupsAdaptive(
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
+void GroupGenerator::labelPropagation(size_t processedReadCnt,
+                                      unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
+                                      vector<uint32_t>& queryGroupInfo) {
+    cout << "Label propagation grouping..." << endl;
+    time_t beforeLP = time(nullptr);
+
+    // Step A: build adjacency list from all relations_*.bin files
+    vector<vector<pair<uint32_t, uint16_t>>> adj(processedReadCnt + 1);
+
+    auto loadRelFile = [&](const string& fname) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            if (r.id1 == 0 || r.id2 == 0) continue;
+            if (r.id1 > processedReadCnt || r.id2 > processedReadCnt) continue;
+            if (static_cast<int>(r.weight) < par.minEdgeWeight) continue;
+            adj[r.id1].emplace_back(r.id2, r.weight);
+            adj[r.id2].emplace_back(r.id1, r.weight);
+        }
+    };
+
+    for (int i = 0; i <= par.threads * 2; i++) {
+        loadRelFile(outDir + "/relations_" + std::to_string(i) + ".bin");
+    }
+
+    // Step B: pre-isolation — BFS to find connected components;
+    // components smaller than isolationThreshold skip LP and output directly as groups
+    vector<bool> visited(processedReadCnt + 1, false);
+    vector<bool> isolated(processedReadCnt + 1, false);
+
+    for (uint32_t start = 1; start <= processedReadCnt; start++) {
+        if (visited[start] || adj[start].empty()) continue;
+
+        vector<uint32_t> component;
+        queue<uint32_t> q;
+        q.push(start);
+        visited[start] = true;
+        while (!q.empty()) {
+            uint32_t v = q.front(); q.pop();
+            component.push_back(v);
+            for (const auto& edge : adj[v]) {
+                uint32_t u = edge.first;
+                if (!visited[u]) { visited[u] = true; q.push(u); }
+            }
+        }
+
+        if (static_cast<int>(component.size()) < par.isolationThreshold) {
+            if (component.size() >= 2) {
+                uint32_t groupId = *std::min_element(component.begin(), component.end());
+                for (uint32_t v : component) {
+                    groupInfo[groupId].insert(v);
+                    queryGroupInfo[v] = groupId;
+                }
+            }
+            for (uint32_t v : component) isolated[v] = true;
+        }
+    }
+
+    cout << "Pre-isolation: " << groupInfo.size() << " small groups extracted." << endl;
+
+    // Step C: label initialization + node order (degree descending, isolated excluded)
+    vector<uint32_t> label(processedReadCnt + 1);
+    for (uint32_t i = 1; i <= processedReadCnt; i++) label[i] = i;
+
+    vector<uint32_t> nodeOrder;
+    nodeOrder.reserve(processedReadCnt);
+    for (uint32_t i = 1; i <= processedReadCnt; i++) {
+        if (!adj[i].empty() && !isolated[i]) nodeOrder.push_back(i);
+    }
+    std::sort(nodeOrder.begin(), nodeOrder.end(),
+              [&](uint32_t a, uint32_t b) { return adj[a].size() > adj[b].size(); });
+
+    // Step D: asynchronous LP with inertia and convergence check
+    const int   maxLPIter = par.maxIter;
+    const float convThr   = par.convergenceThreshold;
+    const float inertiaW  = par.inertiaWeight;
+
+    for (int iter = 0; iter < maxLPIter; iter++) {
+        size_t changed = 0;
+
+        for (uint32_t v : nodeOrder) {
+            unordered_map<uint32_t, float> votes;
+            for (const auto& edge : adj[v]) {
+                uint32_t u = edge.first;
+                if (!isolated[u]) votes[label[u]] += static_cast<float>(edge.second);
+            }
+            votes[label[v]] += inertiaW;
+
+            uint32_t bestLabel = label[v];
+            float    bestVote  = 0.0f;
+            for (const auto& kv : votes) {
+                if (kv.second > bestVote ||
+                    (kv.second == bestVote && kv.first < bestLabel)) {
+                    bestVote  = kv.second;
+                    bestLabel = kv.first;
+                }
+            }
+
+            if (bestLabel != label[v]) { label[v] = bestLabel; changed++; }
+        }
+
+        const float changeRatio = nodeOrder.empty()
+            ? 0.0f
+            : static_cast<float>(changed) / static_cast<float>(nodeOrder.size());
+        cout << "LP iter " << iter + 1 << ": " << changed
+             << " reads changed label (" << changeRatio * 100.0f << "%)" << endl;
+
+        if (changeRatio < convThr) break;
+    }
+
+    // Step E: convert labels to groupInfo / queryGroupInfo (size >= 2, isolated excluded)
+    unordered_map<uint32_t, unordered_set<uint32_t>> labelToNodes;
+    for (uint32_t v : nodeOrder) {
+        labelToNodes[label[v]].insert(v);
+    }
+
+    for (auto& kv : labelToNodes) {
+        const unordered_set<uint32_t>& members = kv.second;
+        if (members.size() < 2) continue;
+        uint32_t groupId = *std::min_element(members.begin(), members.end());
+        for (uint32_t v : members) {
+            groupInfo[groupId].insert(v);
+            queryGroupInfo[v] = groupId;
+        }
+    }
+
+    cout << "LP grouping done: " << groupInfo.size()
+         << " groups total (incl. pre-isolated)." << endl;
+    cout << "Time spent: " << double(time(nullptr) - beforeLP) << " seconds." << endl;
+}
+
 void GroupGenerator::makeGroups(int groupKmerThr,
                                 size_t processedReadCnt,
-                                unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo, 
+                                unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
                                 vector<uint32_t> &queryGroupInfo) {
     cout << "Creating groups from relation file..." << endl;
     time_t beforeSearch = time(nullptr);

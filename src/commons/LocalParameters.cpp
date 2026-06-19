@@ -215,17 +215,17 @@ LocalParameters::LocalParameters() :
                 typeid(int),
                 (void *) &neighborKmers,
                 "[0-4]"),
-        NUM_ITERATION(NUM_ITERATION_ID,
-                "--num-iteration",
-                "Number of iterations for grouping",
-                "Number of iterations for grouping",
+        MAX_ITER(MAX_ITER_ID,
+                "--max-iter",
+                "Max LP iterations",
+                "Maximum number of label propagation iterations",
                 typeid(int),
-                (void *) &groupingIter,
-                "^(0|[1-9]|1[0-5])$"),
+                (void *) &maxIter,
+                "^[0-9]+$"),
         CONVERGENCE_THRESHOLD(CONVERGENCE_THRESHOLD_ID,
                 "--convergence-thr",
-                "Convergence threshold for adaptive grouping",
-                "Stop adaptive grouping when membership change ratio falls below this value (0.0-1.0)",
+                "Stop LP when change ratio falls below this value",
+                "Stop label propagation when membership change ratio falls below this value (0.0-1.0)",
                 typeid(float),
                 (void *) &convergenceThreshold,
                 "^0(\\.[0-9]+)?|1(\\.0+)?$"),
@@ -236,6 +236,20 @@ LocalParameters::LocalParameters() :
                 typeid(float),
                 (void *) &maxKmerFreqRatio,
                 "^0(\\.[0-9]+)?|1(\\.0+)?$"),
+        INERTIA_WEIGHT(INERTIA_WEIGHT_ID,
+                "--inertia-weight",
+                "LP inertia weight (bias toward current label on tie)",
+                "LP inertia weight: adds this value to the vote for the current label to bias stability",
+                typeid(float),
+                (void *) &inertiaWeight,
+                "^[0-9]+(\\.[0-9]+)?$"),
+        ISOLATION_THRESHOLD(ISOLATION_THRESHOLD_ID,
+                "--isolation-threshold",
+                "Components smaller than this skip LP and output directly as groups",
+                "Connected components with fewer nodes than this threshold are isolated before LP to protect minority groups",
+                typeid(int),
+                (void *) &isolationThreshold,
+                "^[0-9]+$"),
         TARGET_TAX_ID(TARGET_TAX_ID_ID,
                "--tax-id",
                "Tax. ID of clade to be extracted",
@@ -593,7 +607,9 @@ LocalParameters::LocalParameters() :
     neighborKmers = 1;
     minEdgeWeight = 1;
     convergenceThreshold = 0.001;
-    groupingIter = 15;
+    maxIter = 15;
+    inertiaWeight = 5.0f;
+    isolationThreshold = 10;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
@@ -706,8 +722,10 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MIN_EDGE_WEIGHT);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
     groupGeneration.push_back(&MAX_KMER_FREQ_RATIO);
-    groupGeneration.push_back(&NUM_ITERATION);
+    groupGeneration.push_back(&MAX_ITER);
     groupGeneration.push_back(&CONVERGENCE_THRESHOLD);
+    groupGeneration.push_back(&INERTIA_WEIGHT);
+    groupGeneration.push_back(&ISOLATION_THRESHOLD);
     groupGeneration.push_back(&PRINT_LOG);
 
     //groupApplication

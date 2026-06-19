@@ -6,7 +6,7 @@
 
 void setGroupGenerationDefaults(LocalParameters & par){    
     par.neighborKmers = 0;
-    par.groupingIter = 10;
+    par.maxIter = 10;
     par.minEdgeWeight = 10;
     par.convergenceThreshold = 0.01f;
     par.maxKmerFreqRatio = 0.0f;

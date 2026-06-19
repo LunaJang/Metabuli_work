@@ -219,10 +219,14 @@ public:
 
     void makeGroups(int groupKmerThr,
                     size_t processedReadCnt,
-                    unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+                    unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                     vector<uint32_t> &queryGroupInfo);
-                    
-    void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+
+    void labelPropagation(size_t processedReadCnt,
+                          unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
+                          vector<uint32_t>& queryGroupInfo);
+
+    void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                           const vector<uint32_t>& queryGroupInfo);
     
     uint16_t degreeToThr(uint32_t quarterDegree) const {

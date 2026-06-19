@@ -95,10 +95,12 @@ public:
     
     // Group generation
     PARAMETER(NEIGHBOR_KMERS)
-    PARAMETER(NUM_ITERATION)
+    PARAMETER(MAX_ITER)
     PARAMETER(MIN_EDGE_WEIGHT)
     PARAMETER(CONVERGENCE_THRESHOLD)
     PARAMETER(MAX_KMER_FREQ_RATIO)
+    PARAMETER(INERTIA_WEIGHT)
+    PARAMETER(ISOLATION_THRESHOLD)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
     PARAMETER(READID_COL)
@@ -195,9 +197,11 @@ public:
     // Group generation
     int minEdgeWeight;
     int neighborKmers;
-    int groupingIter;
+    int maxIter;
     float convergenceThreshold;
     float maxKmerFreqRatio;
+    float inertiaWeight;
+    int isolationThreshold;
 
     // Group application
     int scoreCol;
