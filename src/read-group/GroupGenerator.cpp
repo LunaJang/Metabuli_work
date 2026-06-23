@@ -3,7 +3,6 @@
 #include "QueryIndexer.h"
 #include "common.h"
 #include "Kmer.h"
-#include <queue>
 #include <sys/stat.h>
 
 // Human-readable byte size for disk-usage logs.
@@ -861,6 +860,12 @@ void GroupGenerator::labelPropagation(size_t processedReadCnt,
     cout << "Label propagation grouping..." << endl;
     time_t beforeLP = time(nullptr);
 
+    // Step B: union-find grouping (recall anchor)
+    unordered_map<uint32_t, unordered_set<uint32_t>> ufGroupInfo;
+    vector<uint32_t> ufQueryGroupInfo(processedReadCnt + 1, 0);
+    makeGroups(par.minEdgeWeight, processedReadCnt, ufGroupInfo, ufQueryGroupInfo);
+    cout << "Union-find groups: " << ufGroupInfo.size() << endl;
+
     // Step A: build adjacency list from all relations_*.bin files
     vector<vector<pair<uint32_t, uint16_t>>> adj(processedReadCnt + 1);
 
@@ -879,49 +884,14 @@ void GroupGenerator::labelPropagation(size_t processedReadCnt,
         loadRelFile(outDir + "/relations_" + std::to_string(i) + ".bin");
     }
 
-    // Step B: pre-isolation — BFS to find connected components;
-    // components smaller than isolationThreshold skip LP and output directly as groups
-    vector<bool> visited(processedReadCnt + 1, false);
-    vector<bool> isolated(processedReadCnt + 1, false);
-
-    for (uint32_t start = 1; start <= processedReadCnt; start++) {
-        if (visited[start] || adj[start].empty()) continue;
-
-        vector<uint32_t> component;
-        queue<uint32_t> q;
-        q.push(start);
-        visited[start] = true;
-        while (!q.empty()) {
-            uint32_t v = q.front(); q.pop();
-            component.push_back(v);
-            for (const auto& edge : adj[v]) {
-                uint32_t u = edge.first;
-                if (!visited[u]) { visited[u] = true; q.push(u); }
-            }
-        }
-
-        if (static_cast<int>(component.size()) < par.isolationThreshold) {
-            if (component.size() >= 2) {
-                uint32_t groupId = *std::min_element(component.begin(), component.end());
-                for (uint32_t v : component) {
-                    groupInfo[groupId].insert(v);
-                    queryGroupInfo[v] = groupId;
-                }
-            }
-            for (uint32_t v : component) isolated[v] = true;
-        }
-    }
-
-    cout << "Pre-isolation: " << groupInfo.size() << " small groups extracted." << endl;
-
-    // Step C: label initialization + node order (degree descending, isolated excluded)
+    // Step C: label initialization + node order (degree descending)
     vector<uint32_t> label(processedReadCnt + 1);
     for (uint32_t i = 1; i <= processedReadCnt; i++) label[i] = i;
 
     vector<uint32_t> nodeOrder;
     nodeOrder.reserve(processedReadCnt);
     for (uint32_t i = 1; i <= processedReadCnt; i++) {
-        if (!adj[i].empty() && !isolated[i]) nodeOrder.push_back(i);
+        if (!adj[i].empty()) nodeOrder.push_back(i);
     }
     std::sort(nodeOrder.begin(), nodeOrder.end(),
               [&](uint32_t a, uint32_t b) { return adj[a].size() > adj[b].size(); });
@@ -937,8 +907,7 @@ void GroupGenerator::labelPropagation(size_t processedReadCnt,
         for (uint32_t v : nodeOrder) {
             unordered_map<uint32_t, float> votes;
             for (const auto& edge : adj[v]) {
-                uint32_t u = edge.first;
-                if (!isolated[u]) votes[label[u]] += static_cast<float>(edge.second);
+                votes[label[edge.first]] += static_cast<float>(edge.second);
             }
             votes[label[v]] += inertiaW;
 
@@ -964,24 +933,77 @@ void GroupGenerator::labelPropagation(size_t processedReadCnt,
         if (changeRatio < convThr) break;
     }
 
-    // Step E: convert labels to groupInfo / queryGroupInfo (size >= 2, isolated excluded)
-    unordered_map<uint32_t, unordered_set<uint32_t>> labelToNodes;
+    // Step E: UF-aware reconstruction.
+    // LP sub-groups where all members share the same UF component are kept (precision gain).
+    // Cross-UF LP groups and LP singletons fall back to their UF component (recall preservation).
+    // UF components not touched by LP are emitted as-is.
+
+    unordered_map<uint32_t, vector<uint32_t>> lpGroups;
     for (uint32_t v : nodeOrder) {
-        labelToNodes[label[v]].insert(v);
+        lpGroups[label[v]].push_back(v);
     }
 
-    for (auto& kv : labelToNodes) {
-        const unordered_set<uint32_t>& members = kv.second;
+    unordered_map<uint32_t, vector<uint32_t>> fallbackByUF;
+
+    for (auto& lpKv : lpGroups) {
+        vector<uint32_t>& members = lpKv.second;
+
+        if (members.size() < 2) {
+            const uint32_t ufId = ufQueryGroupInfo[members[0]];
+            if (ufId != 0) fallbackByUF[ufId].push_back(members[0]);
+            continue;
+        }
+
+        const uint32_t firstUF = ufQueryGroupInfo[members[0]];
+        bool sameUF = true;
+        for (size_t k = 1; k < members.size(); ++k) {
+            if (ufQueryGroupInfo[members[k]] != firstUF) { sameUF = false; break; }
+        }
+
+        if (sameUF) {
+            const uint32_t groupId = *std::min_element(members.begin(), members.end());
+            for (uint32_t v : members) {
+                groupInfo[groupId].insert(v);
+                queryGroupInfo[v] = groupId;
+            }
+        } else {
+            for (uint32_t v : members) {
+                const uint32_t ufId = ufQueryGroupInfo[v];
+                if (ufId != 0) fallbackByUF[ufId].push_back(v);
+            }
+        }
+    }
+
+    for (auto& fbKv : fallbackByUF) {
+        const uint32_t ufId = fbKv.first;
+        const vector<uint32_t>& members = fbKv.second;
         if (members.size() < 2) continue;
-        uint32_t groupId = *std::min_element(members.begin(), members.end());
+        uint32_t groupId = ufId;
+        if (groupInfo.count(groupId)) {
+            groupId = *std::min_element(members.begin(), members.end());
+        }
         for (uint32_t v : members) {
             groupInfo[groupId].insert(v);
             queryGroupInfo[v] = groupId;
         }
     }
 
-    cout << "LP grouping done: " << groupInfo.size()
-         << " groups total (incl. pre-isolated)." << endl;
+    // UF groups whose members were not reached by LP (all have empty adj in LP)
+    for (const auto& ufKv : ufGroupInfo) {
+        const uint32_t ufId = ufKv.first;
+        const unordered_set<uint32_t>& ufMembers = ufKv.second;
+        bool anyAssigned = false;
+        for (uint32_t v : ufMembers) {
+            if (queryGroupInfo[v] != 0) { anyAssigned = true; break; }
+        }
+        if (anyAssigned || ufMembers.size() < 2) continue;
+        for (uint32_t v : ufMembers) {
+            groupInfo[ufId].insert(v);
+            queryGroupInfo[v] = ufId;
+        }
+    }
+
+    cout << "LP grouping done: " << groupInfo.size() << " groups total." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeLP) << " seconds." << endl;
 }
 
