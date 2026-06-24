@@ -163,65 +163,6 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     } else {
         mergeGraph(processedReadCnt);
         makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
-        
-        // Step 2: Iterative adaptive refinement
-        std::vector<uint16_t> nodeThr(processedReadCnt + 1, par.minEdgeWeight);
-        std::vector<uint32_t> degree;
-        std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
-        
-        computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
-        int maxIter = 2;
-
-        for (int iter = 0; iter < maxIter; iter++) {
-            cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
-
-            computeGroupQuarterDegree(queryGroupInfo, degree, groupQuarterDeg);
-
-            for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                uint32_t groupId = queryGroupInfo[i];
-                if (groupId == 0) {
-                    nodeThr[i] = static_cast<uint16_t>(par.minEdgeWeight);
-                } else {
-                    uint32_t quarterDegree = groupQuarterDeg.count(groupId) ? groupQuarterDeg[groupId] : 0;
-                    nodeThr[i] = degreeToThr(quarterDegree);
-                }
-            }
-
-            // Snapshot before adaptive regrouping
-            std::vector<uint32_t> prevGroupInfo(queryGroupInfo);
-
-            groupInfo.clear();
-            makeGroupsAdaptive(nodeThr, processedReadCnt, queryGroupInfo);
-
-            // Count membership changes
-            size_t changedCount = 0;
-            size_t totalGroupedReads = 0;
-            for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                if (queryGroupInfo[i] != 0) {
-                    totalGroupedReads++;
-                    if (queryGroupInfo[i] != prevGroupInfo[i]) {
-                        changedCount++;
-                    }
-                }
-            }
-
-            float changeRatio = (totalGroupedReads > 0)
-                ? static_cast<float>(changedCount) / static_cast<float>(totalGroupedReads)
-                : 0.0f;
-
-            cout << "  Iteration " << iter + 1
-                << ": " << changedCount << " / " << totalGroupedReads
-                << " reads changed group (" << (changeRatio * 100.0f) << "%)" << endl;
-
-            // Rebuild groupInfo (existing logic)
-            groupInfo.clear();
-            for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                if (queryGroupInfo[i] != 0) {
-                    groupInfo[queryGroupInfo[i]].insert(i);
-                }
-            }
-        }
-
         saveGroupsToFile(groupInfo, queryGroupInfo);
 
         // relations_*.bin are reparsed every refinement iteration but are no longer

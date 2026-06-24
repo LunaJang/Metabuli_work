@@ -97,6 +97,7 @@ public:
     PARAMETER(NEIGHBOR_KMERS)
     PARAMETER(NUM_ITERATION)
     PARAMETER(MIN_EDGE_WEIGHT)
+    PARAMETER(CORE_EDGE_WEIGHT)
     PARAMETER(CONVERGENCE_THRESHOLD)
     PARAMETER(MAX_KMER_FREQ_RATIO)
     PARAMETER(MIN_VOTE_SCORE)
@@ -194,6 +195,7 @@ public:
     
     // Group generation
     int minEdgeWeight;
+    int coreEdgeWeight;
     int neighborKmers;
     int groupingIter;
     float convergenceThreshold;
