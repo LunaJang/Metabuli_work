@@ -162,7 +162,19 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         mergeGraph_one(processedReadCnt);
     } else {
         mergeGraph(processedReadCnt);
-        makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
+
+        // Phase 1: form core groups with strong edges
+        makeGroups(par.coreEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
+
+        // Phase 2: link Phase-1 singletons among themselves with weak edges
+        if (par.coreEdgeWeight > par.minEdgeWeight) {
+            std::vector<bool> isSingleton(processedReadCnt + 1, false);
+            for (uint32_t i = 1; i <= processedReadCnt; i++) {
+                if (queryGroupInfo[i] == 0) isSingleton[i] = true;
+            }
+            makeGroupsPhase2(par.minEdgeWeight, processedReadCnt, isSingleton, groupInfo, queryGroupInfo);
+        }
+
         saveGroupsToFile(groupInfo, queryGroupInfo);
 
         // relations_*.bin are reparsed every refinement iteration but are no longer
@@ -936,6 +948,83 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
     cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
+}
+
+void GroupGenerator::makeGroupsPhase2(
+    int groupKmerThr,
+    size_t processedReadCnt,
+    const std::vector<bool>& isSingleton,
+    unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
+    vector<uint32_t>& queryGroupInfo)
+{
+    cout << "Phase 2: linking singletons..." << endl;
+    time_t t0 = time(nullptr);
+
+    DisjointSet ds(processedReadCnt);
+
+    auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            uint32_t id1 = r.id1, id2 = r.id2;
+            if (id1 == 0 || id2 == 0) continue;
+            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+            if (!isSingleton[id1] || !isSingleton[id2]) continue;
+            if (static_cast<int>(r.weight) > groupKmerThr) {
+                subDs.unionSets(id1, id2);
+            }
+        }
+    };
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin", subDs);
+        subDs.flatten();
+        #pragma omp critical
+        { ds += subDs; }
+    }
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+        #pragma omp critical
+        { subDs = ds; }
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin", subDs);
+        subDs.flatten();
+        #pragma omp critical
+        { ds += subDs; }
+    }
+
+    {
+        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin", 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            if (r.id1 == 0 || r.id2 == 0) continue;
+            if (r.id1 > processedReadCnt || r.id2 > processedReadCnt) continue;
+            if (!isSingleton[r.id1] || !isSingleton[r.id2]) continue;
+            if (static_cast<int>(r.weight) > groupKmerThr) {
+                ds.unionSets(r.id1, r.id2);
+            }
+        }
+    }
+
+    std::unordered_map<uint32_t, uint32_t> rootToMin;
+    for (uint32_t i = 1; i < ds.parent.size(); ++i) {
+        if (!ds.grouped[i]) continue;
+        uint32_t root = ds.find(i);
+        auto it = rootToMin.find(root);
+        if (it == rootToMin.end() || i < it->second) rootToMin[root] = i;
+    }
+    for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
+        if (ds.grouped[queryId]) {
+            uint32_t groupId = rootToMin[ds.find(queryId)];
+            groupInfo[groupId].insert(queryId);
+            queryGroupInfo[queryId] = groupId;
+        }
+    }
+
+    cout << "Phase 2 done: " << double(time(nullptr) - t0) << " s" << endl;
 }
 
 void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
