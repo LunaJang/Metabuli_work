@@ -161,13 +161,24 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     if (printLog) {
         mergeGraph_one(processedReadCnt);
     } else {
-        mergeGraph(processedReadCnt);
+        std::vector<uint64_t> edgeWeightHist;
+        mergeGraph(processedReadCnt, edgeWeightHist);
+
+        int effectiveCoreEdge = par.coreEdgeWeight;
+        const int autoEdge = otsuThreshold(edgeWeightHist);
+        if (autoEdge > par.minEdgeWeight) {
+            effectiveCoreEdge = autoEdge;
+            cout << "Auto coreEdgeWeight (Otsu): " << effectiveCoreEdge << endl;
+        } else {
+            cout << "Otsu: unimodal or insufficient data, using --core-edge: "
+                 << effectiveCoreEdge << endl;
+        }
 
         // Phase 1: form core groups with strong edges
-        makeGroups(par.coreEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
+        makeGroups(effectiveCoreEdge, processedReadCnt, groupInfo, queryGroupInfo);
 
         // Phase 2: link Phase-1 singletons among themselves with weak edges
-        if (par.coreEdgeWeight > par.minEdgeWeight) {
+        if (effectiveCoreEdge > par.minEdgeWeight) {
             std::vector<bool> isSingleton(processedReadCnt + 1, false);
             for (uint32_t i = 1; i <= processedReadCnt; i++) {
                 if (queryGroupInfo[i] == 0) isSingleton[i] = true;
@@ -616,9 +627,51 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>&
     fclose(outFile);
 }
 
-void GroupGenerator::mergeGraph(size_t processedReadCnt) {
+int GroupGenerator::otsuThreshold(const std::vector<uint64_t>& hist) {
+    uint64_t N = 0;
+    double S = 0.0;
+    for (size_t i = 0; i < hist.size(); i++) {
+        N += hist[i];
+        S += static_cast<double>(i) * static_cast<double>(hist[i]);
+    }
+    if (N == 0) return 0;
+
+    double mean = S / static_cast<double>(N);
+    double varTotal = 0.0;
+    for (size_t i = 0; i < hist.size(); i++) {
+        double d = static_cast<double>(i) - mean;
+        varTotal += d * d * static_cast<double>(hist[i]);
+    }
+    varTotal /= static_cast<double>(N);
+    if (varTotal == 0.0) return 0;
+
+    double maxVarB = 0.0;
+    int threshold = 0;
+    uint64_t wB = 0;
+    double sumB = 0.0;
+    for (size_t t = 0; t < hist.size(); t++) {
+        wB += hist[t];
+        sumB += static_cast<double>(t) * static_cast<double>(hist[t]);
+        uint64_t wF = N - wB;
+        if (wB == 0 || wF == 0) continue;
+        double muB = sumB / static_cast<double>(wB);
+        double muF = (S - sumB) / static_cast<double>(wF);
+        double varB = (static_cast<double>(wB) * static_cast<double>(wF)
+                       / (static_cast<double>(N) * static_cast<double>(N)))
+                      * (muB - muF) * (muB - muF);
+        if (varB > maxVarB) {
+            maxVarB = varB;
+            threshold = static_cast<int>(t);
+        }
+    }
+
+    return (maxVarB / varTotal >= 0.1) ? threshold : 0;
+}
+
+void GroupGenerator::mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& edgeWeightHist) {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
+    edgeWeightHist.assign(65536, 0);
 
     std::vector<WriteBuffer<Relation>*> relationLogs;
     relationLogs.reserve(par.threads * 2 + 1);
@@ -655,6 +708,7 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt) {
         }
 
         Relation rel(minRelation.id1, minRelation.id2, totalWeight);
+        if (totalWeight > 0) edgeWeightHist[totalWeight]++;
         if (minRelation.id1 % par.threads == minRelation.id2 % par.threads){
             relationLogs[(minRelation.id1 % par.threads)]->write(&rel);
         }

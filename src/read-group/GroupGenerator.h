@@ -201,7 +201,9 @@ public:
     void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
                             const size_t counter_now);
 
-    void mergeGraph(size_t processedReadCnt);
+    void mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& edgeWeightHist);
+
+    static int otsuThreshold(const std::vector<uint64_t>& hist);
 
     void mergeGraph_one(size_t processedReadCnt);
     
