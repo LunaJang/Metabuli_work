@@ -165,10 +165,16 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         mergeGraph(processedReadCnt, edgeWeightHist);
 
         int effectiveCoreEdge = par.coreEdgeWeight;
-        const int autoEdge = kneeThreshold(edgeWeightHist, par.minEdgeWeight);
+        int autoEdge = kneeThreshold(edgeWeightHist, par.minEdgeWeight);
+        if (autoEdge > par.minEdgeWeight && par.kneeScale != 1.0f) {
+            // --knee-scale < 1.0 lowers the core threshold; clamp so Phase 2 stays enabled.
+            autoEdge = static_cast<int>(autoEdge * par.kneeScale + 0.5f);
+            if (autoEdge < par.minEdgeWeight + 1) autoEdge = par.minEdgeWeight + 1;
+        }
         if (autoEdge > par.minEdgeWeight) {
             effectiveCoreEdge = autoEdge;
-            cout << "Auto coreEdgeWeight (knee): " << effectiveCoreEdge << endl;
+            cout << "Auto coreEdgeWeight (knee x" << par.kneeScale << "): "
+                 << effectiveCoreEdge << endl;
         } else {
             cout << "Knee: insufficient data, using --core-edge: "
                  << effectiveCoreEdge << endl;
