@@ -205,6 +205,8 @@ public:
 
     static int otsuThreshold(const std::vector<uint64_t>& hist);
 
+    static int kneeThreshold(const std::vector<uint64_t>& hist, int minWeight);
+
     void mergeGraph_one(size_t processedReadCnt);
     
     void computeNodeDegree(int groupKmerThr, 

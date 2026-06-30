@@ -165,12 +165,12 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         mergeGraph(processedReadCnt, edgeWeightHist);
 
         int effectiveCoreEdge = par.coreEdgeWeight;
-        const int autoEdge = otsuThreshold(edgeWeightHist);
+        const int autoEdge = kneeThreshold(edgeWeightHist, par.minEdgeWeight);
         if (autoEdge > par.minEdgeWeight) {
             effectiveCoreEdge = autoEdge;
-            cout << "Auto coreEdgeWeight (Otsu): " << effectiveCoreEdge << endl;
+            cout << "Auto coreEdgeWeight (knee): " << effectiveCoreEdge << endl;
         } else {
-            cout << "Otsu: unimodal or insufficient data, using --core-edge: "
+            cout << "Knee: insufficient data, using --core-edge: "
                  << effectiveCoreEdge << endl;
         }
 
@@ -666,6 +666,56 @@ int GroupGenerator::otsuThreshold(const std::vector<uint64_t>& hist) {
     }
 
     return (maxVarB / varTotal >= 0.1) ? threshold : 0;
+}
+
+// Single-knee (Kneedle) threshold on the edge-weight CCDF.
+// hist[w] = number of edges with total weight w (index 0 unused, size 65536).
+// Unlike Otsu (which needs two comparable-mass classes), the knee only needs a
+// curvature transition, so it survives the unimodal/power-law distributions of
+// natural metagenomes. Returns 0 (= "no usable knee, fall back to --core-edge")
+// on degenerate input, matching otsuThreshold()'s contract.
+int GroupGenerator::kneeThreshold(const std::vector<uint64_t>& hist, int minWeight) {
+    const int wLo = minWeight + 1;                 // Phase 1 only cuts above minWeight
+
+    // Scan the usable domain: total edges, highest non-empty weight, distinct bins.
+    uint64_t N = 0;
+    int wmax = 0;
+    int nonzero = 0;
+    for (int w = wLo; w < static_cast<int>(hist.size()); w++) {
+        if (hist[w] > 0) {
+            N += hist[w];
+            wmax = w;
+            nonzero++;
+        }
+    }
+    if (N == 0) return 0;                           // no edges above minWeight
+    if (nonzero < 3 || wmax <= minWeight) return 0; // too few points to form a curve
+
+    const int wHi = wmax;
+    const uint64_t survHi = hist[wHi];              // CCDF at the top weight
+    const double xden = static_cast<double>(wHi - wLo);
+    const double yden = static_cast<double>(N - survHi);
+    if (xden <= 0.0 || yden <= 0.0) return 0;       // single distinct weight → degenerate
+
+    // CCDF surv(w) = #edges with weight >= w, monotone decreasing. After normalizing
+    // x,y to [0,1] (endpoints (0,1) and (1,0)), the convex curve lies below the chord
+    // y = 1 - x; the knee is the point of maximum distance below that chord.
+    double bestDist = -1.0;
+    int knee = 0;
+    uint64_t cumBelow = 0;                          // edges with weight in [wLo, w)
+    for (int w = wLo; w <= wHi; w++) {
+        const uint64_t surv = N - cumBelow;
+        const double xn = static_cast<double>(w - wLo) / xden;
+        const double yn = (static_cast<double>(surv) - static_cast<double>(survHi)) / yden;
+        const double dist = (1.0 - xn) - yn;
+        if (dist > bestDist) {
+            bestDist = dist;
+            knee = w;
+        }
+        cumBelow += hist[w];
+    }
+
+    return (knee > minWeight) ? knee : 0;
 }
 
 void GroupGenerator::mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& edgeWeightHist) {
