@@ -264,6 +264,23 @@ LocalParameters::LocalParameters() :
                         typeid(int),
                         (void *) &minEdgeWeight,
                         "^[0-9]+$"),
+        CORE_EDGE_WEIGHT(CORE_EDGE_WEIGHT_ID,
+                         "--core-edge",
+                         "Min. edge weight for core group formation (Phase 1)",
+                         "Min. edge weight for core group formation (Phase 1). "
+                         "Reads sharing fewer k-mers than this threshold are not grouped in Phase 1.",
+                         typeid(int),
+                         (void *) &coreEdgeWeight,
+                         "^[0-9]+$"),
+        KNEE_SCALE(KNEE_SCALE_ID,
+                   "--knee-scale",
+                   "Scale factor applied to the auto-detected knee (Phase 1)",
+                   "Scale factor applied to the auto-detected knee threshold (Phase 1). "
+                   "Values below 1.0 lower the core threshold (larger cores, fewer singletons); "
+                   "1.0 keeps the raw knee. Ignored when knee detection falls back to --core-edge.",
+                   typeid(float),
+                   (void *) &kneeScale,
+                   "^[0-9]*\\.?[0-9]+$"),
         MIN_VOTE_SCORE(MIN_VOTE_SCORE_ID,
                     "--min-vote-score",
                     "Min. classification score to vote.",
@@ -592,6 +609,8 @@ LocalParameters::LocalParameters() :
     // Group generation
     neighborKmers = 1;
     minEdgeWeight = 1;
+    coreEdgeWeight = 10;
+    kneeScale = 1.0f;
     convergenceThreshold = 0.001;
     groupingIter = 15;
 
@@ -704,6 +723,8 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&SYNCMER);
     groupGeneration.push_back(&SMER_LEN);
     groupGeneration.push_back(&MIN_EDGE_WEIGHT);
+    groupGeneration.push_back(&CORE_EDGE_WEIGHT);
+    groupGeneration.push_back(&KNEE_SCALE);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
     groupGeneration.push_back(&MAX_KMER_FREQ_RATIO);
     groupGeneration.push_back(&NUM_ITERATION);

@@ -201,7 +201,11 @@ public:
     void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
                             const size_t counter_now);
 
-    void mergeGraph(size_t processedReadCnt);
+    void mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& edgeWeightHist);
+
+    static int otsuThreshold(const std::vector<uint64_t>& hist);
+
+    static int kneeThreshold(const std::vector<uint64_t>& hist, int minWeight);
 
     void mergeGraph_one(size_t processedReadCnt);
     
@@ -219,10 +223,16 @@ public:
 
     void makeGroups(int groupKmerThr,
                     size_t processedReadCnt,
-                    unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+                    unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                     vector<uint32_t> &queryGroupInfo);
-                    
-    void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo, 
+
+    void makeGroupsPhase2(int groupKmerThr,
+                          size_t processedReadCnt,
+                          const std::vector<bool>& isSingleton,
+                          unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
+                          vector<uint32_t>& queryGroupInfo);
+
+    void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                           const vector<uint32_t>& queryGroupInfo);
     
     uint16_t degreeToThr(uint32_t quarterDegree) const {

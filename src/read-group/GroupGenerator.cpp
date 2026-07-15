@@ -161,65 +161,35 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     if (printLog) {
         mergeGraph_one(processedReadCnt);
     } else {
-        mergeGraph(processedReadCnt);
-        makeGroups(par.minEdgeWeight, processedReadCnt, groupInfo, queryGroupInfo);
-        
-        // Step 2: Iterative adaptive refinement
-        std::vector<uint16_t> nodeThr(processedReadCnt + 1, par.minEdgeWeight);
-        std::vector<uint32_t> degree;
-        std::unordered_map<uint32_t, uint32_t> groupQuarterDeg;
-        
-        computeNodeDegree(par.minEdgeWeight, processedReadCnt, degree);
-        int maxIter = 2;
+        std::vector<uint64_t> edgeWeightHist;
+        mergeGraph(processedReadCnt, edgeWeightHist);
 
-        for (int iter = 0; iter < maxIter; iter++) {
-            cout << "Iterative grouping, iteration " << iter + 1 << "/" << maxIter << endl;
+        int effectiveCoreEdge = par.coreEdgeWeight;
+        int autoEdge = kneeThreshold(edgeWeightHist, par.minEdgeWeight);
+        if (autoEdge > par.minEdgeWeight && par.kneeScale != 1.0f) {
+            // --knee-scale < 1.0 lowers the core threshold; clamp so Phase 2 stays enabled.
+            autoEdge = static_cast<int>(autoEdge * par.kneeScale + 0.5f);
+            if (autoEdge < par.minEdgeWeight + 1) autoEdge = par.minEdgeWeight + 1;
+        }
+        if (autoEdge > par.minEdgeWeight) {
+            effectiveCoreEdge = autoEdge;
+            cout << "Auto coreEdgeWeight (knee x" << par.kneeScale << "): "
+                 << effectiveCoreEdge << endl;
+        } else {
+            cout << "Knee: insufficient data, using --core-edge: "
+                 << effectiveCoreEdge << endl;
+        }
 
-            computeGroupQuarterDegree(queryGroupInfo, degree, groupQuarterDeg);
+        // Phase 1: form core groups with strong edges
+        makeGroups(effectiveCoreEdge, processedReadCnt, groupInfo, queryGroupInfo);
 
+        // Phase 2: link Phase-1 singletons among themselves with weak edges
+        if (effectiveCoreEdge > par.minEdgeWeight) {
+            std::vector<bool> isSingleton(processedReadCnt + 1, false);
             for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                uint32_t groupId = queryGroupInfo[i];
-                if (groupId == 0) {
-                    nodeThr[i] = static_cast<uint16_t>(par.minEdgeWeight);
-                } else {
-                    uint32_t quarterDegree = groupQuarterDeg.count(groupId) ? groupQuarterDeg[groupId] : 0;
-                    nodeThr[i] = degreeToThr(quarterDegree);
-                }
+                if (queryGroupInfo[i] == 0) isSingleton[i] = true;
             }
-
-            // Snapshot before adaptive regrouping
-            std::vector<uint32_t> prevGroupInfo(queryGroupInfo);
-
-            groupInfo.clear();
-            makeGroupsAdaptive(nodeThr, processedReadCnt, queryGroupInfo);
-
-            // Count membership changes
-            size_t changedCount = 0;
-            size_t totalGroupedReads = 0;
-            for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                if (queryGroupInfo[i] != 0) {
-                    totalGroupedReads++;
-                    if (queryGroupInfo[i] != prevGroupInfo[i]) {
-                        changedCount++;
-                    }
-                }
-            }
-
-            float changeRatio = (totalGroupedReads > 0)
-                ? static_cast<float>(changedCount) / static_cast<float>(totalGroupedReads)
-                : 0.0f;
-
-            cout << "  Iteration " << iter + 1
-                << ": " << changedCount << " / " << totalGroupedReads
-                << " reads changed group (" << (changeRatio * 100.0f) << "%)" << endl;
-
-            // Rebuild groupInfo (existing logic)
-            groupInfo.clear();
-            for (uint32_t i = 1; i <= processedReadCnt; i++) {
-                if (queryGroupInfo[i] != 0) {
-                    groupInfo[queryGroupInfo[i]].insert(i);
-                }
-            }
+            makeGroupsPhase2(par.minEdgeWeight, processedReadCnt, isSingleton, groupInfo, queryGroupInfo);
         }
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
@@ -663,9 +633,101 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>&
     fclose(outFile);
 }
 
-void GroupGenerator::mergeGraph(size_t processedReadCnt) {
+int GroupGenerator::otsuThreshold(const std::vector<uint64_t>& hist) {
+    uint64_t N = 0;
+    double S = 0.0;
+    for (size_t i = 0; i < hist.size(); i++) {
+        N += hist[i];
+        S += static_cast<double>(i) * static_cast<double>(hist[i]);
+    }
+    if (N == 0) return 0;
+
+    double mean = S / static_cast<double>(N);
+    double varTotal = 0.0;
+    for (size_t i = 0; i < hist.size(); i++) {
+        double d = static_cast<double>(i) - mean;
+        varTotal += d * d * static_cast<double>(hist[i]);
+    }
+    varTotal /= static_cast<double>(N);
+    if (varTotal == 0.0) return 0;
+
+    double maxVarB = 0.0;
+    int threshold = 0;
+    uint64_t wB = 0;
+    double sumB = 0.0;
+    for (size_t t = 0; t < hist.size(); t++) {
+        wB += hist[t];
+        sumB += static_cast<double>(t) * static_cast<double>(hist[t]);
+        uint64_t wF = N - wB;
+        if (wB == 0 || wF == 0) continue;
+        double muB = sumB / static_cast<double>(wB);
+        double muF = (S - sumB) / static_cast<double>(wF);
+        double varB = (static_cast<double>(wB) * static_cast<double>(wF)
+                       / (static_cast<double>(N) * static_cast<double>(N)))
+                      * (muB - muF) * (muB - muF);
+        if (varB > maxVarB) {
+            maxVarB = varB;
+            threshold = static_cast<int>(t);
+        }
+    }
+
+    return (maxVarB / varTotal >= 0.1) ? threshold : 0;
+}
+
+// Single-knee (Kneedle) threshold on the edge-weight CCDF.
+// hist[w] = number of edges with total weight w (index 0 unused, size 65536).
+// Unlike Otsu (which needs two comparable-mass classes), the knee only needs a
+// curvature transition, so it survives the unimodal/power-law distributions of
+// natural metagenomes. Returns 0 (= "no usable knee, fall back to --core-edge")
+// on degenerate input, matching otsuThreshold()'s contract.
+int GroupGenerator::kneeThreshold(const std::vector<uint64_t>& hist, int minWeight) {
+    const int wLo = minWeight + 1;                 // Phase 1 only cuts above minWeight
+
+    // Scan the usable domain: total edges, highest non-empty weight, distinct bins.
+    uint64_t N = 0;
+    int wmax = 0;
+    int nonzero = 0;
+    for (int w = wLo; w < static_cast<int>(hist.size()); w++) {
+        if (hist[w] > 0) {
+            N += hist[w];
+            wmax = w;
+            nonzero++;
+        }
+    }
+    if (N == 0) return 0;                           // no edges above minWeight
+    if (nonzero < 3 || wmax <= minWeight) return 0; // too few points to form a curve
+
+    const int wHi = wmax;
+    const uint64_t survHi = hist[wHi];              // CCDF at the top weight
+    const double xden = static_cast<double>(wHi - wLo);
+    const double yden = static_cast<double>(N - survHi);
+    if (xden <= 0.0 || yden <= 0.0) return 0;       // single distinct weight → degenerate
+
+    // CCDF surv(w) = #edges with weight >= w, monotone decreasing. After normalizing
+    // x,y to [0,1] (endpoints (0,1) and (1,0)), the convex curve lies below the chord
+    // y = 1 - x; the knee is the point of maximum distance below that chord.
+    double bestDist = -1.0;
+    int knee = 0;
+    uint64_t cumBelow = 0;                          // edges with weight in [wLo, w)
+    for (int w = wLo; w <= wHi; w++) {
+        const uint64_t surv = N - cumBelow;
+        const double xn = static_cast<double>(w - wLo) / xden;
+        const double yn = (static_cast<double>(surv) - static_cast<double>(survHi)) / yden;
+        const double dist = (1.0 - xn) - yn;
+        if (dist > bestDist) {
+            bestDist = dist;
+            knee = w;
+        }
+        cumBelow += hist[w];
+    }
+
+    return (knee > minWeight) ? knee : 0;
+}
+
+void GroupGenerator::mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& edgeWeightHist) {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
+    edgeWeightHist.assign(65536, 0);
 
     std::vector<WriteBuffer<Relation>*> relationLogs;
     relationLogs.reserve(par.threads * 2 + 1);
@@ -702,6 +764,7 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt) {
         }
 
         Relation rel(minRelation.id1, minRelation.id2, totalWeight);
+        if (totalWeight > 0) edgeWeightHist[totalWeight]++;
         if (minRelation.id1 % par.threads == minRelation.id2 % par.threads){
             relationLogs[(minRelation.id1 % par.threads)]->write(&rel);
         }
@@ -995,6 +1058,83 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
     cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
+}
+
+void GroupGenerator::makeGroupsPhase2(
+    int groupKmerThr,
+    size_t processedReadCnt,
+    const std::vector<bool>& isSingleton,
+    unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
+    vector<uint32_t>& queryGroupInfo)
+{
+    cout << "Phase 2: linking singletons..." << endl;
+    time_t t0 = time(nullptr);
+
+    DisjointSet ds(processedReadCnt);
+
+    auto processFile = [&](const std::string& fname, DisjointSet& subDs) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            uint32_t id1 = r.id1, id2 = r.id2;
+            if (id1 == 0 || id2 == 0) continue;
+            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+            if (!isSingleton[id1] || !isSingleton[id2]) continue;
+            if (static_cast<int>(r.weight) > groupKmerThr) {
+                subDs.unionSets(id1, id2);
+            }
+        }
+    };
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin", subDs);
+        subDs.flatten();
+        #pragma omp critical
+        { ds += subDs; }
+    }
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        int threadIdx = omp_get_thread_num();
+        DisjointSet subDs(processedReadCnt);
+        #pragma omp critical
+        { subDs = ds; }
+        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin", subDs);
+        subDs.flatten();
+        #pragma omp critical
+        { ds += subDs; }
+    }
+
+    {
+        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin", 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            if (r.id1 == 0 || r.id2 == 0) continue;
+            if (r.id1 > processedReadCnt || r.id2 > processedReadCnt) continue;
+            if (!isSingleton[r.id1] || !isSingleton[r.id2]) continue;
+            if (static_cast<int>(r.weight) > groupKmerThr) {
+                ds.unionSets(r.id1, r.id2);
+            }
+        }
+    }
+
+    std::unordered_map<uint32_t, uint32_t> rootToMin;
+    for (uint32_t i = 1; i < ds.parent.size(); ++i) {
+        if (!ds.grouped[i]) continue;
+        uint32_t root = ds.find(i);
+        auto it = rootToMin.find(root);
+        if (it == rootToMin.end() || i < it->second) rootToMin[root] = i;
+    }
+    for (uint32_t queryId = 1; queryId < ds.parent.size(); queryId++) {
+        if (ds.grouped[queryId]) {
+            uint32_t groupId = rootToMin[ds.find(queryId)];
+            groupInfo[groupId].insert(queryId);
+            queryGroupInfo[queryId] = groupId;
+        }
+    }
+
+    cout << "Phase 2 done: " << double(time(nullptr) - t0) << " s" << endl;
 }
 
 void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,

@@ -100,8 +100,10 @@ int gradeGroupByCoverage(int argc, const char **argv, const Command &command) {
         if (!f.is_open()) { cerr << "Cannot open: " << covMappingFile << endl; exit(1); }
         string acc; float cov;
         while (f >> acc >> cov) {
-            size_t dot = acc.find('.');
-            if (dot != string::npos) acc = acc.substr(0, dot);
+            if (par.testType != "cami") {
+                size_t dot = acc.find('.');
+                if (dot != string::npos) acc = acc.substr(0, dot);
+            }
             assacc2cov[acc] = cov;
         }
     }
@@ -147,8 +149,13 @@ int gradeGroupByCoverage(int argc, const char **argv, const Command &command) {
                 while (getline(mf, k, '\t') && getline(mf, v, '\n')) {
                     if (!v.empty() && v.back() == '\r') v.pop_back();
                     if (v.empty() || !isdigit((unsigned char)v[0])) continue;
-                    size_t d = k.find('.');
-                    if (d != string::npos) k = k.substr(0, d);
+                    if (par.testType == "cami") {
+                        size_t slash = k.rfind('/');
+                        if (slash != string::npos) k = k.substr(0, slash);
+                    } else {
+                        size_t d = k.find('.');
+                        if (d != string::npos) k = k.substr(0, d);
+                    }
                     assacc2taxid[k] = stoi(v);
                 }
             }
@@ -164,7 +171,15 @@ int gradeGroupByCoverage(int argc, const char **argv, const Command &command) {
                     if (qline.empty()) { queryTaxid.push_back(-1); queryCov.push_back(-1.0f); continue; }
                     if (qline[0] == '>') qline = qline.substr(1);
                     TaxID taxid = -1; float cov = -1.0f;
-                    if (regex_search(qline, m, accRe)) {
+                    if (par.testType == "cami") {
+                        string key = qline;
+                        size_t slash = key.rfind('/');
+                        if (slash != string::npos) key = key.substr(0, slash);
+                        auto taxIt = assacc2taxid.find(key);
+                        if (taxIt != assacc2taxid.end()) taxid = taxIt->second;
+                        auto covIt = assacc2cov.find(key);
+                        if (covIt != assacc2cov.end()) cov = covIt->second;
+                    } else if (regex_search(qline, m, accRe)) {
                         string acc = m[1];
                         size_t dot = acc.find('.');
                         if (dot != string::npos) acc = acc.substr(0, dot);
