@@ -682,7 +682,7 @@ int GroupGenerator::otsuThreshold(const std::vector<uint64_t>& hist) {
 // on degenerate input, matching otsuThreshold()'s contract.
 int GroupGenerator::kneeThreshold(const std::vector<uint64_t>& hist, int minWeight) {
     const int wLo = minWeight + 1;                 // Phase 1 only cuts above minWeight
-
+ 
     // Scan the usable domain: total edges, highest non-empty weight, distinct bins.
     uint64_t N = 0;
     int wmax = 0;
@@ -696,13 +696,46 @@ int GroupGenerator::kneeThreshold(const std::vector<uint64_t>& hist, int minWeig
     }
     if (N == 0) return 0;                           // no edges above minWeight
     if (nonzero < 3 || wmax <= minWeight) return 0; // too few points to form a curve
-
+ 
+    // --- [smoothing_test] diagnostic log, remove after verification ---
+    std::cout << "[knee-debug] wLo=" << wLo << " wmax=" << wmax
+              << " N=" << N << " nonzero_bins=" << nonzero << std::endl;
+    {
+        // Top 10 non-empty weight bins counting down from the very top of the
+        // histogram array (not just from wmax) so we can see if wmax itself
+        // is an isolated outlier far from the next-highest populated bin.
+        int shown = 0;
+        for (int w = static_cast<int>(hist.size()) - 1; w >= wLo && shown < 10; w--) {
+            if (hist[w] > 0) {
+                std::cout << "[knee-debug] top w=" << w << " count=" << hist[w] << std::endl;
+                shown++;
+            }
+        }
+ 
+        // Weight at which cumulative survivor fraction drops below each target,
+        // i.e. "the weight below which 99.9% / 99% / 95% / 90% of edge mass lives".
+        // If wmax sits far past the 0.1% point, it's an outlier distorting wHi.
+        uint64_t cum = 0;
+        double targets[] = {0.001, 0.01, 0.05, 0.10};
+        int ti = 0;
+        for (int w = wLo; w <= wmax && ti < 4; w++) {
+            cum += hist[w];
+            double survFrac = static_cast<double>(N - cum) / static_cast<double>(N);
+            if (survFrac <= 1.0 - targets[ti]) {
+                std::cout << "[knee-debug] surv<=" << (1.0 - targets[ti])
+                          << " at w=" << w << std::endl;
+                ti++;
+            }
+        }
+    }
+    // --- end [smoothing_test] diagnostic log ---
+ 
     const int wHi = wmax;
     const uint64_t survHi = hist[wHi];              // CCDF at the top weight
     const double xden = static_cast<double>(wHi - wLo);
     const double yden = static_cast<double>(N - survHi);
-    if (xden <= 0.0 || yden <= 0.0) return 0;       // single distinct weight → degenerate
-
+    if (xden <= 0.0 || yden <= 0.0) return 0;       // single distinct weight -> degenerate
+ 
     // CCDF surv(w) = #edges with weight >= w, monotone decreasing. After normalizing
     // x,y to [0,1] (endpoints (0,1) and (1,0)), the convex curve lies below the chord
     // y = 1 - x; the knee is the point of maximum distance below that chord.
@@ -720,7 +753,7 @@ int GroupGenerator::kneeThreshold(const std::vector<uint64_t>& hist, int minWeig
         }
         cumBelow += hist[w];
     }
-
+ 
     return (knee > minWeight) ? knee : 0;
 }
 
