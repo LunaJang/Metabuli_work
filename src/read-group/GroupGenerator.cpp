@@ -697,44 +697,30 @@ int GroupGenerator::kneeThreshold(const std::vector<uint64_t>& hist, int minWeig
     if (N == 0) return 0;                           // no edges above minWeight
     if (nonzero < 3 || wmax <= minWeight) return 0; // too few points to form a curve
  
-    // --- [smoothing_test] diagnostic log, remove after verification ---
-    std::cout << "[knee-debug] wLo=" << wLo << " wmax=" << wmax
-              << " N=" << N << " nonzero_bins=" << nonzero << std::endl;
-    {
-        // Top 10 non-empty weight bins counting down from the very top of the
-        // histogram array (not just from wmax) so we can see if wmax itself
-        // is an isolated outlier far from the next-highest populated bin.
-        int shown = 0;
-        for (int w = static_cast<int>(hist.size()) - 1; w >= wLo && shown < 10; w--) {
-            if (hist[w] > 0) {
-                std::cout << "[knee-debug] top w=" << w << " count=" << hist[w] << std::endl;
-                shown++;
-            }
-        }
- 
-        // Weight at which cumulative survivor fraction drops below each target,
-        // i.e. "the weight below which 99.9% / 99% / 95% / 90% of edge mass lives".
-        // If wmax sits far past the 0.1% point, it's an outlier distorting wHi.
-        uint64_t cum = 0;
-        double targets[] = {0.001, 0.01, 0.05, 0.10};
-        int ti = 0;
-        for (int w = wLo; w <= wmax && ti < 4; w++) {
-            cum += hist[w];
-            double survFrac = static_cast<double>(N - cum) / static_cast<double>(N);
-            if (survFrac <= 1.0 - targets[ti]) {
-                std::cout << "[knee-debug] surv<=" << (1.0 - targets[ti])
-                          << " at w=" << w << std::endl;
-                ti++;
-            }
+    // --- robust wHi: anchor the chord's top end where enough edges actually
+    // support that weight, instead of at the single largest (possibly
+    // near-empty outlier) weight bin. minSamples floors at 100 edges or
+    // 0.05% of N, whichever is larger, so it scales with dataset size.
+    const uint64_t minSamples = std::max<uint64_t>(100, static_cast<uint64_t>(N * 0.0005));
+    uint64_t survFromTop = 0;
+    int wHi = wLo;
+    for (int w = wmax; w >= wLo; w--) {
+        survFromTop += hist[w];
+        if (survFromTop >= minSamples) {
+            wHi = w;
+            break;
         }
     }
-    // --- end [smoothing_test] diagnostic log ---
+    if (wHi <= wLo) return 0;                       // not enough support anywhere above wLo
  
-    const int wHi = wmax;
-    const uint64_t survHi = hist[wHi];              // CCDF at the top weight
+    // survFromTop was accumulated top-down from wmax to wHi, so it already
+    // equals surv(wHi) = #edges with weight >= wHi.
+    const uint64_t survHi = survFromTop;
+    // --- end robust wHi ---
+ 
     const double xden = static_cast<double>(wHi - wLo);
     const double yden = static_cast<double>(N - survHi);
-    if (xden <= 0.0 || yden <= 0.0) return 0;       // single distinct weight -> degenerate
+    if (xden <= 0.0 || yden <= 0.0) return 0;       // degenerate curve
  
     // CCDF surv(w) = #edges with weight >= w, monotone decreasing. After normalizing
     // x,y to [0,1] (endpoints (0,1) and (1,0)), the convex curve lies below the chord
