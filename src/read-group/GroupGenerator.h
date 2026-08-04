@@ -122,31 +122,66 @@ static inline bool keepEdgeGeo(uint16_t w, uint16_t tu, uint16_t tv) {
     return (uint64_t)w * (uint64_t)w >= (uint64_t)tu * (uint64_t)tv;
 }
 
-inline size_t getRelationThreshold(int numThreads) {
-    size_t availableBytes;
+// Saturating accumulation into a uint16 edge weight: clamps at UINT16_MAX
+// instead of wrapping. Relation::weight is uint16_t, so both the per-subgraph
+// count and the cross-subgraph sum can exceed 65535; a wrapped weight would
+// look small and be dropped by the Phase 1/2 threshold comparisons.
+static inline void addSat16(uint16_t & dst, uint32_t add) {
+    const uint32_t sum = static_cast<uint32_t>(dst) + add;
+    dst = (sum > UINT16_MAX) ? UINT16_MAX : static_cast<uint16_t>(sum);
+}
 
+// Memory the OS reports as free. Linux: sysinfo. macOS: hw.memsize, which is TOTAL memory
+// and therefore an over-estimate. Other platforms: fixed 8 GB.
+inline size_t getAvailableMemoryBytes() {
 #if defined(__linux__)
     struct sysinfo info;
     sysinfo(&info);
-    availableBytes = info.freeram * info.mem_unit;
+    return info.freeram * info.mem_unit;
 #elif defined(__APPLE__)
     int64_t freeMemory;
     size_t len = sizeof(freeMemory);
     sysctlbyname("hw.memsize", &freeMemory, &len, nullptr, 0);
-    availableBytes = (size_t)freeMemory; // 근사치
+    return (size_t)freeMemory; // 근사치
 #else
-    availableBytes = 8ULL * 1024 * 1024 * 1024; // fallback 8GB
+    return 8ULL * 1024 * 1024 * 1024; // fallback 8GB
 #endif
+}
+
+inline size_t getRelationThreshold(int numThreads) {
+    const size_t availableBytes = getAvailableMemoryBytes();
 
     const double safetyFactor = 0.6;
     const size_t bytesPerEntry = 48; // unordered_map node overhead
-    
-    size_t threshold = (size_t)(availableBytes * safetyFactor) 
+
+    size_t threshold = (size_t)(availableBytes * safetyFactor)
                        / (numThreads * bytesPerEntry);
-    
+
     const size_t MIN_THRESHOLD = 1'000'000;
     const size_t MAX_THRESHOLD = 200'000'000;
     return std::max(MIN_THRESHOLD, std::min(threshold, MAX_THRESHOLD));
+}
+
+// Floor for mergeGraph's per-stream read buffer. Reaching it means numOfGraph is so large
+// that even the memory budget cannot give each stream a useful buffer; mergeGraph warns,
+// and the real fix is multi-round merging (not implemented).
+static const size_t MERGE_BUFFER_MIN_ELEMS = 4'096;
+
+// Per-stream ReadBuffer size (in Relation elements) for the k-way subgraph merge.
+// The merge opens one buffer per subGraph_* file, so a fixed per-stream size makes total
+// memory scale with numOfGraph: the historical 1M elements is 12 MB per stream, i.e. 12 GB
+// at 1000 streams. Budget the total against free memory and split it across streams.
+inline size_t getMergeBufferElems(size_t numOfGraph) {
+    const size_t MAX_ELEMS = 1'048'576; // 12 MB per stream; the historical fixed size
+    if (numOfGraph == 0) {
+        return MAX_ELEMS;
+    }
+
+    const double safetyFactor = 0.5;
+    const size_t budget = (size_t)(getAvailableMemoryBytes() * safetyFactor);
+    const size_t perStream = budget / (numOfGraph * sizeof(Relation));
+
+    return std::max(MERGE_BUFFER_MIN_ELEMS, std::min(perStream, MAX_ELEMS));
 }
 
 class GroupGenerator {
@@ -169,10 +204,6 @@ protected:
     bool boundariesInitialized = false;
     bool useOnlyTrueRelations = false; // for debug
 
-    // center-star (Step 1): index = 1-based global read id; pack(length, contentHash).
-    // Larger key wins center selection (length first, content min-hash tie-break).
-    std::vector<uint64_t> centerKey;
-
 public:
     GroupGenerator(LocalParameters & par);
 
@@ -186,12 +217,6 @@ public:
 
     void writeKmers(Buffer<Kmer>& queryKmerBuffer,
                     size_t processedReadCnt);
-
-    // center-star (Step 1): accumulate per-read center key (length + content min-hash)
-    // for this split into the global centerKey array. Deterministic, order/thread independent.
-    void accumulateCenterKeys(const Buffer<Kmer>& queryKmerBuffer,
-                              const std::vector<Query>& queryList,
-                              size_t processedReadCnt);
 
     std::vector<std::pair<size_t, size_t>> getKmerRanges(const Buffer<Kmer>& kmerBuffer,
                                                          size_t offset);

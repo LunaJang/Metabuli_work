@@ -4,6 +4,27 @@
 #include "common.h"
 #include "Kmer.h"
 #include <sys/stat.h>
+#include <queue>
+
+// One stream head in mergeGraph's k-way merge: the relation plus the subGraph_* index it
+// came from, so the merge knows which stream to refill after popping.
+struct MergeHeapEntry {
+    Relation rel;
+    size_t stream;
+};
+
+// Min-heap ordering for MergeHeapEntry. std::priority_queue pops the "largest" element, so
+// this comparator answers "does a come after b". Relation::operator< compares (id1,id2)
+// only; equal keys tie-break on stream index to keep the pop order deterministic.
+struct MergeHeapGreater {
+    bool operator()(const MergeHeapEntry & a, const MergeHeapEntry & b) const {
+        if (a.rel < b.rel) { return false; }
+        if (b.rel < a.rel) { return true; }
+        return a.stream > b.stream;
+    }
+};
+
+using MergeHeap = std::priority_queue<MergeHeapEntry, std::vector<MergeHeapEntry>, MergeHeapGreater>;
 
 // Human-readable byte size for disk-usage logs.
 static std::string humanBytes(uint64_t bytes) {
@@ -31,24 +52,6 @@ static void reportAndRemoveFiles(const std::vector<std::string>& paths, const st
     }
     std::cout << "[disk] " << label << ": " << count << " files, "
               << humanBytes(total) << " freed" << std::endl;
-}
-
-// Deterministic 64-bit integer hash (murmur3 finalizer). No runtime randomness:
-// the same k-mer value always maps to the same hash, independent of input order.
-static inline uint64_t mixHash64(uint64_t x) {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
-}
-
-// Pack center key: length in high 24 bits (larger length preferred as center),
-// content min-hash in low 40 bits (deterministic tie-break by content).
-static inline uint64_t packCenterKey(uint32_t pairedLength, uint64_t contentHash) {
-    return (static_cast<uint64_t>(pairedLength & 0xFFFFFFu) << 40)
-         | (contentHash & 0xFFFFFFFFFFULL);
 }
 
 GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
@@ -97,8 +100,6 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             cout << "Done" << endl;
             cout << "Total number of sequences: " << queryIndexer->getReadNum_1() << endl;
             cout << "Total read length: " << queryIndexer->getTotalReadLength() <<  "nt" << endl;
-            // center-star (Step 1): 1-based global read id -> center key. Sized once.
-            centerKey.assign(totalSeqCnt + 1, 0);
         }
 
         // Set up kseq
@@ -130,10 +131,6 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                                              par,
                                              kseq1,
                                              kseq2);
-
-            // center-star (Step 1): compute per-read center key from the freshly
-            // extracted k-mers (before common-kmer filtering reorders the buffer).
-            accumulateCenterKeys(queryKmerBuffer, queryList, processedReadCnt);
 
             filterCommonKmers(queryKmerBuffer, matchBuffer, commonKmerDB);
             time_t t = time(nullptr);
@@ -464,42 +461,6 @@ std::vector<std::pair<size_t, size_t>> GroupGenerator::getKmerRanges(const Buffe
     return ranges;
 }
 
-void GroupGenerator::accumulateCenterKeys(const Buffer<Kmer>& queryKmerBuffer,
-                                          const std::vector<Query>& queryList,
-                                          size_t processedReadCnt) {
-    // Local read ids in this split are 1-based (seqID = queryIdx + 1, KmerExtractor.cpp).
-    // queryList index for local id lid is (lid - 1); global id is (lid + processedReadCnt),
-    // matching writeKmers' "sequenceID += processedReadCnt" and the 1-based downstream queryId.
-    const size_t splitReadCnt = queryList.size();
-    if (splitReadCnt == 0) {
-        return;
-    }
-
-    // Content min-hash per local read: min over its k-mers of mixHash64(value).
-    // min is commutative and idempotent => deterministic and independent of k-mer order.
-    std::vector<uint64_t> localHash(splitReadCnt + 1, UINT64_MAX);
-    for (size_t i = 0; i < queryKmerBuffer.startIndexOfReserve; ++i) {
-        const uint32_t lid = static_cast<uint32_t>(queryKmerBuffer.buffer[i].qInfo.sequenceID);
-        if (lid == 0 || lid > splitReadCnt) {
-            continue; // blank/reserved slots have sequenceID 0
-        }
-        const uint64_t h = mixHash64(queryKmerBuffer.buffer[i].value);
-        if (h < localHash[lid]) {
-            localHash[lid] = h;
-        }
-    }
-
-    for (size_t lid = 1; lid <= splitReadCnt; ++lid) {
-        const Query& q = queryList[lid - 1];
-        uint32_t pairedLength = static_cast<uint32_t>(q.queryLength);
-        if (par.seqMode == 2) {
-            pairedLength += static_cast<uint32_t>(q.queryLength2);
-        }
-        const uint64_t contentHash = (localHash[lid] == UINT64_MAX) ? 0 : localHash[lid];
-        centerKey[lid + processedReadCnt] = packCenterKey(pairedLength, contentHash);
-    }
-}
-
 void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
@@ -507,11 +468,36 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     const size_t RELATION_THRESHOLD = getRelationThreshold(par.threads);
     std::atomic<int> counter(0);
 
+    // High-frequency k-mers are dropped by --max-kmer-freq-ratio. Record which ones so the
+    // information loss stays auditable instead of silent.
+    size_t skippedKmerCnt = 0;
+    size_t skippedMaxM = 0;
+    size_t skippedSumM = 0;
+    double skippedPairEst = 0.0; // sum of C(m,2) over skipped k-mers; double because it overflows uint64
+
+    // Edge-volume instrumentation: how much the C(m,2) clique actually produced, and the
+    // largest m that survived the skip -- that m sets the per-k-mer worst case.
+    size_t emittedEdgeCnt = 0; // Relation records written to subGraph_*
+    size_t maxKeptM = 0;       // largest reads-per-k-mer that was NOT skipped
+
     #pragma omp parallel num_threads(par.threads)
     {
         int threadIdx = omp_get_thread_num();
         std::unordered_map<uint64_t, uint16_t> pair2weight;
         pair2weight.reserve(RELATION_THRESHOLD);
+
+        const string skippedPartName = outDir + "/skipped_kmers_" + to_string(threadIdx);
+        ofstream skippedPart(skippedPartName);
+        if (!skippedPart.is_open()) {
+            cerr << "Error opening file: " << skippedPartName << endl;
+        }
+        size_t localSkippedCnt = 0;
+        size_t localMaxM = 0;
+        size_t localSumM = 0;
+        double localPairEst = 0.0;
+        size_t localEmittedEdges = 0;
+        size_t localMaxKeptM = 0;
+
         std::vector<DeltaIdxReader*> deltaIdxReaders;
         std::vector<Kmer> currentKmers;
         for (size_t i = 0; i < this->numOfSplits; i++) {
@@ -555,35 +541,39 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             currentQueryIds.erase(last, currentQueryIds.end());
             if (par.maxKmerFreqRatio > 0.0f &&
                 currentQueryIds.size() > static_cast<size_t>(static_cast<double>(processedReadCnt) * par.maxKmerFreqRatio)) {
+                const size_t m = currentQueryIds.size();
+                skippedPart << minKmer << "\t" << m << "\n";
+                localSkippedCnt++;
+                localSumM += m;
+                if (m > localMaxM) { localMaxM = m; }
+                localPairEst += static_cast<double>(m) * static_cast<double>(m - 1) * 0.5;
                 continue;
             }
-            // center-star (Step 2): reduce the C(m,2) clique to an (m-1)-edge star.
-            // center = read with the largest centerKey (length first, content min-hash
-            // tie-break) -> content-based, order/thread independent. Ties (same length +
-            // 40-bit hash) are effectively identical reads, so the choice is partition-invariant.
-            if (currentQueryIds.size() >= 2) {
-                uint32_t center = currentQueryIds[0];
-                uint64_t bestKey = centerKey[center];
-                for (uint32_t id : currentQueryIds) {
-                    uint64_t k = centerKey[id];
-                    if (k > bestKey) { bestKey = k; center = id; }
-                }
-                for (uint32_t member : currentQueryIds) {
-                    if (member == center) { continue; }
-                    uint32_t a = std::min(center, member);
-                    uint32_t b = std::max(center, member);
-                    uint64_t pairKey = (static_cast<uint64_t>(a) << 32) | b;
-                    pair2weight[pairKey]++;
+            // Every read pair sharing this k-mer gets an edge: the full C(m,2) clique.
+            // Edge weight therefore counts shared k-mers directly, which is what the
+            // Phase 1/2 thresholds and the knee detection assume. currentQueryIds is
+            // sorted and deduplicated above, so id[i] < id[j] holds and pairKey needs no
+            // min/max normalization. The quadratic term is bounded by the high-frequency
+            // k-mer skip above, not by reducing the clique.
+            const size_t memberCnt = currentQueryIds.size();
+            if (memberCnt > localMaxKeptM) { localMaxKeptM = memberCnt; }
+            for (size_t i = 0; i + 1 < memberCnt; ++i) {
+                const uint64_t idHi = static_cast<uint64_t>(currentQueryIds[i]) << 32;
+                for (size_t j = i + 1; j < memberCnt; ++j) {
+                    const uint64_t pairKey = idHi | static_cast<uint64_t>(currentQueryIds[j]);
+                    addSat16(pair2weight[pairKey], 1);
                 }
             }
             if (pair2weight.size() >= RELATION_THRESHOLD) {
                 size_t counter_now = counter.fetch_add(1, memory_order_relaxed);
+                localEmittedEdges += pair2weight.size();
                 saveSubGraphToFile(pair2weight, counter_now);
                 pair2weight.clear();
             }
         }
         if (!pair2weight.empty()) {
             size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
+            localEmittedEdges += pair2weight.size();
             saveSubGraphToFile(pair2weight, counter_now);
         } else {
             cout << "Thread " << threadIdx << " has no relations to write." << endl;
@@ -591,8 +581,55 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         for (size_t file = 0; file < this->numOfSplits; file++) {
             delete deltaIdxReaders[file];
         }
+        skippedPart.close();
+
+        #pragma omp critical
+        {
+            skippedKmerCnt  += localSkippedCnt;
+            skippedSumM     += localSumM;
+            skippedPairEst  += localPairEst;
+            emittedEdgeCnt  += localEmittedEdges;
+            if (localMaxM > skippedMaxM) { skippedMaxM = localMaxM; }
+            if (localMaxKeptM > maxKeptM) { maxKeptM = localMaxKeptM; }
+        }
     }
     this->numOfGraph = counter.load(std::memory_order_relaxed);
+
+    // Concatenate the per-thread skip logs. Thread t owns k-mer value range t (writeKmers
+    // fixes kmerBoundaries once, so the ranges are disjoint and ordered), which makes thread
+    // order equal to ascending k-mer order -- no merge sort needed. Unlike the other
+    // intermediates this file is diagnostic output and is kept, not deleted.
+    {
+        const string skippedFileName = outDir + "/skipped_kmers";
+        ofstream skippedAll(skippedFileName);
+        if (!skippedAll.is_open()) {
+            cerr << "Error opening file: " << skippedFileName << endl;
+        } else {
+            std::vector<std::string> skippedParts;
+            for (int t = 0; t < par.threads; t++) {
+                skippedParts.push_back(outDir + "/skipped_kmers_" + to_string(t));
+            }
+            for (const std::string & part : skippedParts) {
+                ifstream in(part);
+                // Streaming an empty rdbuf sets failbit on the destination, so guard it.
+                if (in.is_open() && in.peek() != std::ifstream::traits_type::eof()) {
+                    skippedAll << in.rdbuf();
+                }
+            }
+            skippedAll.close();
+            reportAndRemoveFiles(skippedParts, "skipped_kmers parts");
+        }
+    }
+
+    if (skippedKmerCnt > 0) {
+        cout << "[skip] " << skippedKmerCnt << " k-mers skipped by --max-kmer-freq-ratio "
+             << par.maxKmerFreqRatio << " (max m: " << skippedMaxM << ", sum m: " << skippedSumM
+             << ", est. dropped read-pairs: " << skippedPairEst << ")" << endl;
+        cout << "[skip] see " << outDir << "/skipped_kmers" << endl;
+    } else {
+        cout << "[skip] 0 k-mers skipped (--max-kmer-freq-ratio "
+             << par.maxKmerFreqRatio << ")" << endl;
+    }
 
     // k-mer files are fully consumed by the merge above; report + remove to free disk.
     {
@@ -606,6 +643,16 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         reportAndRemoveFiles(deltaFiles, "kmer_delta");
         reportAndRemoveFiles(infoFiles, "kmer_info");
     }
+
+    // Edge-volume summary. maxKeptM is the worst per-k-mer case that survived the skip:
+    // that single k-mer contributed C(maxKeptM, 2) edges, so it is the knob to watch when
+    // tuning --max-kmer-freq-ratio against a disk budget.
+    cout << "[edges] emitted " << emittedEdgeCnt << " edge records into "
+         << this->numOfGraph << " subgraphs ("
+         << humanBytes(static_cast<uint64_t>(emittedEdgeCnt) * sizeof(Relation)) << " before merge)" << endl;
+    cout << "[edges] largest kept k-mer: m = " << maxKeptM << " -> "
+         << (static_cast<double>(maxKeptM) * static_cast<double>(maxKeptM > 0 ? maxKeptM - 1 : 0) * 0.5)
+         << " edges from that k-mer alone" << endl;
 
     cout << "Relations generated from files successfully." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
@@ -754,33 +801,65 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& 
         relationLogs.push_back(new WriteBuffer<Relation>(outDir + "/relations_" + std::to_string(i) + ".bin", 1024 * 1024));
     }
 
+    // Per-stream read buffer sized against free memory instead of a fixed 12 MB, so total
+    // merge memory no longer scales with numOfGraph.
+    const size_t mergeBufElems = getMergeBufferElems(this->numOfGraph);
+    cout << "Merge read buffers: " << this->numOfGraph << " streams x " << mergeBufElems
+         << " Relations ("
+         << humanBytes(static_cast<uint64_t>(this->numOfGraph) * mergeBufElems * sizeof(Relation))
+         << ")" << endl;
+    if (this->numOfGraph > 0 && mergeBufElems == MERGE_BUFFER_MIN_ELEMS) {
+        cout << "Warning: " << this->numOfGraph << " subgraphs exceed the merge memory budget; "
+             << "read buffers are at the " << MERGE_BUFFER_MIN_ELEMS
+             << "-element floor. Merging will be I/O bound." << endl;
+    }
+
     std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
-    std::vector<Relation> currentRelations(this->numOfGraph);
     for (size_t i = 0; i < this->numOfGraph; ++i) {
-        relationBuffers[i] = new ReadBuffer<Relation>(outDir + "/subGraph_" + to_string(i), 1024 * 1024);
-        currentRelations[i] = relationBuffers[i]->getNext();
-    } 
+        relationBuffers[i] = new ReadBuffer<Relation>(outDir + "/subGraph_" + to_string(i), mergeBufElems);
+    }
 
     size_t range_size = (processedReadCnt > par.threads)?(processedReadCnt / static_cast<size_t>(par.threads)):(processedReadCnt);
 
-    while (true) {
-        Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
-        for (size_t i = 0; i < this->numOfGraph; ++i) {
-            if (currentRelations[i] < minRelation) {
-                minRelation = currentRelations[i];
-            }
+    size_t ceilingEdgeCnt = 0; // edges whose merged weight sits at the uint16 ceiling
+    size_t mergedEdgeCnt = 0;  // distinct (id1,id2) pairs after merging
+
+    // Min-heap over the stream heads. The previous linear scan re-examined all numOfGraph
+    // streams for every output edge -- O(numOfGraph) per edge. Clique edge volume pushes
+    // numOfGraph up, which made that the merge's dominant cost.
+    // An exhausted stream is simply not pushed back, so heap.empty() ends the merge; no
+    // UINT32_MAX sentinel is needed. getNext() returns a default Relation at EOF, and read
+    // ids are 1-based, so id1 == 0 can only mean EOF.
+    MergeHeap heap;
+    for (size_t i = 0; i < this->numOfGraph; ++i) {
+        const Relation first = relationBuffers[i]->getNext();
+        if (!(first == Relation())) {
+            MergeHeapEntry entry;
+            entry.rel = first;
+            entry.stream = i;
+            heap.push(entry);
         }
-        if (minRelation.id1 == UINT32_MAX) break;
+    }
+
+    while (!heap.empty()) {
+        const Relation minRelation = heap.top().rel;
         uint16_t totalWeight = 0;
-        for (size_t i = 0; i < this->numOfGraph; ++i) {
-            if (currentRelations[i] == minRelation) {
-                totalWeight += currentRelations[i].weight;
-                currentRelations[i] = relationBuffers[i]->getNext();
-                if (currentRelations[i] == Relation()) {
-                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
-                }
+        // Each subGraph_* holds each (id1,id2) once and in sorted order, so a refilled head
+        // is strictly greater than minRelation; this drains exactly the equal keys.
+        while (!heap.empty() && heap.top().rel == minRelation) {
+            const size_t stream = heap.top().stream;
+            addSat16(totalWeight, heap.top().rel.weight);
+            heap.pop();
+            const Relation next = relationBuffers[stream]->getNext();
+            if (!(next == Relation())) {
+                MergeHeapEntry entry;
+                entry.rel = next;
+                entry.stream = stream;
+                heap.push(entry);
             }
         }
+        if (totalWeight == UINT16_MAX) ceilingEdgeCnt++;
+        mergedEdgeCnt++;
 
         Relation rel(minRelation.id1, minRelation.id2, totalWeight);
         if (totalWeight > 0) edgeWeightHist[totalWeight]++;
@@ -814,6 +893,16 @@ void GroupGenerator::mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& 
         reportAndRemoveFiles(subGraphFiles, "subGraph");
     }
 
+    cout << "[edges] merged into " << mergedEdgeCnt << " distinct edges ("
+         << humanBytes(static_cast<uint64_t>(mergedEdgeCnt) * sizeof(Relation)) << ")" << endl;
+
+    if (ceilingEdgeCnt > 0) {
+        cout << "Warning: " << ceilingEdgeCnt << " edges reached the weight ceiling ("
+             << UINT16_MAX << "); their weights are saturated." << endl;
+    } else {
+        cout << "Edges at weight ceiling (" << UINT16_MAX << "): 0" << endl;
+    }
+
     cout << "Query relation graph merged successfully" << endl;
     cout << "Time spent: " << double(time(nullptr) - before) << " seconds." << endl;
     return;
@@ -825,12 +914,23 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
 
     WriteBuffer<Relation> relationLog(outDir + "/relations.bin", 1024 * 1024);
 
+    // Same read-buffer budget as mergeGraph: this path opens one buffer per subgraph too, so
+    // a fixed per-stream size would blow up with numOfGraph. The k-way merge below stays a
+    // linear scan -- this is the --print-log debug path.
+    const size_t mergeBufElems = getMergeBufferElems(this->numOfGraph);
+    cout << "Merge read buffers: " << this->numOfGraph << " streams x " << mergeBufElems
+         << " Relations ("
+         << humanBytes(static_cast<uint64_t>(this->numOfGraph) * mergeBufElems * sizeof(Relation))
+         << ")" << endl;
+
     std::vector<ReadBuffer<Relation> *> relationBuffers(this->numOfGraph);
     std::vector<Relation> currentRelations(this->numOfGraph);
     for (size_t i = 0; i < this->numOfGraph; ++i) {
-        relationBuffers[i] = new ReadBuffer<Relation>(outDir + "/subGraph_" + to_string(i), 1024 * 1024);
+        relationBuffers[i] = new ReadBuffer<Relation>(outDir + "/subGraph_" + to_string(i), mergeBufElems);
         currentRelations[i] = relationBuffers[i]->getNext();
     }
+
+    size_t ceilingEdgeCnt = 0; // edges whose merged weight sits at the uint16 ceiling
 
     while (true) {
         Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
@@ -843,13 +943,14 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
         uint16_t totalWeight = 0;
         for (size_t i = 0; i < this->numOfGraph; ++i) {
             if (currentRelations[i] == minRelation) {
-                totalWeight += currentRelations[i].weight;
+                addSat16(totalWeight, currentRelations[i].weight);
                 currentRelations[i] = relationBuffers[i]->getNext();
                 if (currentRelations[i] == Relation()) {
                     currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
                 }
             }
         }
+        if (totalWeight == UINT16_MAX) ceilingEdgeCnt++;
 
         Relation rel(minRelation.id1, minRelation.id2, totalWeight);
         relationLog.write(&rel);
@@ -858,6 +959,15 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
 
     for (size_t i = 0; i < numOfGraph; ++i) {
         delete relationBuffers[i];
+    }
+
+    // This path exists to dump relations.bin for weight-histogram analysis, so a
+    // silent saturation would quietly distort that histogram. Report it.
+    if (ceilingEdgeCnt > 0) {
+        cout << "Warning: " << ceilingEdgeCnt << " edges reached the weight ceiling ("
+             << UINT16_MAX << "); their weights are saturated." << endl;
+    } else {
+        cout << "Edges at weight ceiling (" << UINT16_MAX << "): 0" << endl;
     }
 
     cout << "Query relation graph merged successfully" << endl;

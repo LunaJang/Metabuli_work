@@ -613,6 +613,7 @@ LocalParameters::LocalParameters() :
     kneeScale = 1.0f;
     convergenceThreshold = 0.001;
     groupingIter = 15;
+    maxKmerFreqRatio = 0.0f;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
