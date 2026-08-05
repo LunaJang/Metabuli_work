@@ -236,6 +236,16 @@ LocalParameters::LocalParameters() :
                 typeid(float),
                 (void *) &maxKmerFreqRatio,
                 "^0(\\.[0-9]+)?|1(\\.0+)?$"),
+        MAX_KMER_READS(MAX_KMER_READS_ID,
+                "--max-kmer-reads",
+                "Skip k-mers shared by more than this many reads (0=disabled)",
+                "Skip k-mers shared by more than this many reads (0=disabled). "
+                "Absolute cap, so it bounds the C(m,2) edges a single k-mer can emit "
+                "regardless of dataset size. Unlike --max-kmer-freq-ratio, whose threshold "
+                "scales with the read count.",
+                typeid(int),
+                (void *) &maxKmerReads,
+                "^[0-9]+$"),
         TARGET_TAX_ID(TARGET_TAX_ID_ID,
                "--tax-id",
                "Tax. ID of clade to be extracted",
@@ -614,6 +624,7 @@ LocalParameters::LocalParameters() :
     convergenceThreshold = 0.001;
     groupingIter = 15;
     maxKmerFreqRatio = 0.0f;
+    maxKmerReads = 0;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
@@ -728,6 +739,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&KNEE_SCALE);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
     groupGeneration.push_back(&MAX_KMER_FREQ_RATIO);
+    groupGeneration.push_back(&MAX_KMER_READS);
     groupGeneration.push_back(&NUM_ITERATION);
     groupGeneration.push_back(&CONVERGENCE_THRESHOLD);
     groupGeneration.push_back(&PRINT_LOG);

@@ -9,7 +9,13 @@ void setGroupGenerationDefaults(LocalParameters & par){
     par.groupingIter = 10;
     par.minEdgeWeight = 10;
     par.convergenceThreshold = 0.01f;
-    par.maxKmerFreqRatio = 0.0001f;
+    // Absolute cap is the primary brake on Sum C(m,2): it bounds a single k-mer's edge
+    // contribution regardless of read count. The ratio threshold scales with the dataset
+    // (readCnt * ratio), so one value cannot fit both a 5k-read and a 62M-read run --
+    // 0.0001 skipped everything on the former and 11 k-mers on the latter. Ratio is left
+    // off by default and kept only as a secondary net.
+    par.maxKmerFreqRatio = 0.0f;
+    par.maxKmerReads = 1000; // provisional; C(1000,2) = 499,500 edges per k-mer
     par.syncmer = 1;
     par.smerLen = 5;
     par.seqMode = 2;    

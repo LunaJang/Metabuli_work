@@ -162,6 +162,19 @@ inline size_t getRelationThreshold(int numThreads) {
     return std::max(MIN_THRESHOLD, std::min(threshold, MAX_THRESHOLD));
 }
 
+// m-distribution histogram: reads-per-k-mer bucketed by floor(log2(m)). m can reach the
+// read count (tens of millions), so a flat array is not affordable per thread; log2 buckets
+// give cap candidates at factor-2 spacing, which is enough to pick a disk budget.
+static const size_t M_HIST_BUCKETS = 64;
+
+static inline size_t mHistBucket(size_t m) {
+    size_t bucket = 0;
+    while ((m >> bucket) > 1 && bucket + 1 < M_HIST_BUCKETS) {
+        ++bucket;
+    }
+    return bucket; // floor(log2(m)) for m >= 1; 0 for m == 0
+}
+
 // Floor for mergeGraph's per-stream read buffer. Reaching it means numOfGraph is so large
 // that even the memory budget cannot give each stream a useful buffer; mergeGraph warns,
 // and the real fix is multi-round merging (not implemented).

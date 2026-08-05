@@ -5,6 +5,7 @@
 #include "Kmer.h"
 #include <sys/stat.h>
 #include <queue>
+#include <iomanip>
 
 // One stream head in mergeGraph's k-way merge: the relation plus the subGraph_* index it
 // came from, so the merge knows which stream to refill after popping.
@@ -479,6 +480,27 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // largest m that survived the skip -- that m sets the per-k-mer worst case.
     size_t emittedEdgeCnt = 0; // Relation records written to subGraph_*
     size_t maxKeptM = 0;       // largest reads-per-k-mer that was NOT skipped
+    // Sum of C(m,2) over kept k-mers = pair OCCURRENCES the clique produced. Records written
+    // are fewer, because pair2weight collapses a pair seen across several k-mers into one
+    // entry. emittedEdgeCnt / keptPairSum is that collapse factor, measured on this run.
+    uint64_t keptPairSum = 0;
+
+    // m distribution over ALL k-mers, skipped or not. The [edges] summary only reports what
+    // the chosen thresholds produced; this reports what any other threshold would have.
+    std::vector<uint64_t> mHistKmers(M_HIST_BUCKETS, 0);
+    std::vector<uint64_t> mHistPairs(M_HIST_BUCKETS, 0);
+
+    // Skip thresholds, resolved once. The ratio threshold is floored at 2: readCnt * ratio
+    // truncates to 0 whenever it is below 1, and "m > 0" skips every k-mer including m = 1,
+    // which yields zero edges and zero groups. That is never the intent.
+    const size_t ratioThr = (par.maxKmerFreqRatio > 0.0f)
+        ? std::max<size_t>(2, static_cast<size_t>(static_cast<double>(processedReadCnt) * par.maxKmerFreqRatio))
+        : 0;
+    const size_t absThr = (par.maxKmerReads > 0) ? static_cast<size_t>(par.maxKmerReads) : 0;
+    cout << "[skip] thresholds: --max-kmer-reads "
+         << (absThr > 0 ? to_string(absThr) : string("off"))
+         << ", --max-kmer-freq-ratio " << par.maxKmerFreqRatio
+         << " (m > " << (ratioThr > 0 ? to_string(ratioThr) : string("off")) << ")" << endl;
 
     #pragma omp parallel num_threads(par.threads)
     {
@@ -497,6 +519,9 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         double localPairEst = 0.0;
         size_t localEmittedEdges = 0;
         size_t localMaxKeptM = 0;
+        std::vector<uint64_t> localHistKmers(M_HIST_BUCKETS, 0);
+        std::vector<uint64_t> localHistPairs(M_HIST_BUCKETS, 0);
+        uint64_t localKeptPairs = 0;
 
         std::vector<DeltaIdxReader*> deltaIdxReaders;
         std::vector<Kmer> currentKmers;
@@ -539,9 +564,17 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             std::sort(currentQueryIds.begin(), currentQueryIds.end());
             auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
             currentQueryIds.erase(last, currentQueryIds.end());
-            if (par.maxKmerFreqRatio > 0.0f &&
-                currentQueryIds.size() > static_cast<size_t>(static_cast<double>(processedReadCnt) * par.maxKmerFreqRatio)) {
-                const size_t m = currentQueryIds.size();
+            const size_t m = currentQueryIds.size();
+
+            // Histogram every k-mer, skipped or not, so the summary table can answer
+            // "what would a different cap have cost".
+            if (m >= 2) {
+                const size_t bucket = mHistBucket(m);
+                localHistKmers[bucket]++;
+                localHistPairs[bucket] += static_cast<uint64_t>(m) * static_cast<uint64_t>(m - 1) / 2;
+            }
+
+            if ((absThr > 0 && m > absThr) || (ratioThr > 0 && m > ratioThr)) {
                 skippedPart << minKmer << "\t" << m << "\n";
                 localSkippedCnt++;
                 localSumM += m;
@@ -555,11 +588,13 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             // sorted and deduplicated above, so id[i] < id[j] holds and pairKey needs no
             // min/max normalization. The quadratic term is bounded by the high-frequency
             // k-mer skip above, not by reducing the clique.
-            const size_t memberCnt = currentQueryIds.size();
-            if (memberCnt > localMaxKeptM) { localMaxKeptM = memberCnt; }
-            for (size_t i = 0; i + 1 < memberCnt; ++i) {
+            if (m > localMaxKeptM) { localMaxKeptM = m; }
+            if (m >= 2) {
+                localKeptPairs += static_cast<uint64_t>(m) * static_cast<uint64_t>(m - 1) / 2;
+            }
+            for (size_t i = 0; i + 1 < m; ++i) {
                 const uint64_t idHi = static_cast<uint64_t>(currentQueryIds[i]) << 32;
-                for (size_t j = i + 1; j < memberCnt; ++j) {
+                for (size_t j = i + 1; j < m; ++j) {
                     const uint64_t pairKey = idHi | static_cast<uint64_t>(currentQueryIds[j]);
                     addSat16(pair2weight[pairKey], 1);
                 }
@@ -591,6 +626,11 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             emittedEdgeCnt  += localEmittedEdges;
             if (localMaxM > skippedMaxM) { skippedMaxM = localMaxM; }
             if (localMaxKeptM > maxKeptM) { maxKeptM = localMaxKeptM; }
+            keptPairSum += localKeptPairs;
+            for (size_t b = 0; b < M_HIST_BUCKETS; ++b) {
+                mHistKmers[b] += localHistKmers[b];
+                mHistPairs[b] += localHistPairs[b];
+            }
         }
     }
     this->numOfGraph = counter.load(std::memory_order_relaxed);
@@ -622,13 +662,14 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     }
 
     if (skippedKmerCnt > 0) {
-        cout << "[skip] " << skippedKmerCnt << " k-mers skipped by --max-kmer-freq-ratio "
-             << par.maxKmerFreqRatio << " (max m: " << skippedMaxM << ", sum m: " << skippedSumM
+        cout << "[skip] " << skippedKmerCnt << " k-mers skipped (max m: " << skippedMaxM
+             << ", sum m: " << skippedSumM
              << ", est. dropped read-pairs: " << skippedPairEst << ")" << endl;
         cout << "[skip] see " << outDir << "/skipped_kmers" << endl;
+    } else if (absThr == 0 && ratioThr == 0) {
+        cout << "[skip] 0 k-mers skipped (both thresholds off)" << endl;
     } else {
-        cout << "[skip] 0 k-mers skipped (--max-kmer-freq-ratio "
-             << par.maxKmerFreqRatio << ")" << endl;
+        cout << "[skip] 0 k-mers skipped (no k-mer exceeded the thresholds)" << endl;
     }
 
     // k-mer files are fully consumed by the merge above; report + remove to free disk.
@@ -642,6 +683,60 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         }
         reportAndRemoveFiles(deltaFiles, "kmer_delta");
         reportAndRemoveFiles(infoFiles, "kmer_info");
+    }
+
+    // m-distribution table. Each row is a candidate --max-kmer-reads value (the bucket's
+    // upper bound) with the edge volume that cap would produce: the cumulative sum of
+    // C(m,2) over every k-mer with m at or below it. Pick the row that fits the disk budget.
+    // Counts cover all k-mers with m >= 2, whether or not the current run skipped them, so
+    // the table stays valid for thresholds other than the one just used.
+    {
+        size_t topBucket = 0;
+        uint64_t totalKmers = 0;
+        uint64_t totalPairs = 0;
+        for (size_t b = 0; b < M_HIST_BUCKETS; ++b) {
+            totalKmers += mHistKmers[b];
+            totalPairs += mHistPairs[b];
+            if (mHistKmers[b] > 0) { topBucket = b; }
+        }
+
+        // Pair occurrences over-count what actually lands on disk, because pair2weight
+        // collapses a pair seen across several k-mers into one record. Measure that factor
+        // on this run and apply it, so the table predicts records rather than an upper bound.
+        const double dedup = (keptPairSum > 0)
+            ? static_cast<double>(emittedEdgeCnt) / static_cast<double>(keptPairSum)
+            : 1.0;
+
+        cout << "[mhist] reads-per-k-mer distribution (m >= 2): " << totalKmers
+             << " k-mers, " << totalPairs << " pair occurrences uncapped" << endl;
+        cout << "[mhist] measured collapse factor: " << emittedEdgeCnt << " records / "
+             << keptPairSum << " kept pair occurrences = " << dedup << endl;
+        cout << "[mhist] estimates below extrapolate that factor to other caps; it was"
+             << " measured only on k-mers this run kept, so expect roughly +/-20%" << endl;
+        if (totalKmers > 0) {
+            cout << "[mhist] " << setw(16) << "cap (max m)"
+                 << setw(14) << "k-mers"
+                 << setw(18) << "pairs in range"
+                 << setw(18) << "cum pairs"
+                 << setw(16) << "est. records"
+                 << setw(12) << "est. disk" << endl;
+            uint64_t cumPairs = 0;
+            for (size_t b = 0; b <= topBucket; ++b) {
+                cumPairs += mHistPairs[b];
+                if (mHistKmers[b] == 0) { continue; }
+                const size_t lo = (size_t(1) << b);
+                const size_t hi = (size_t(1) << (b + 1)) - 1;
+                const uint64_t estRecords = static_cast<uint64_t>(static_cast<double>(cumPairs) * dedup);
+                cout << "[mhist] " << setw(16) << (to_string(hi) + " (" + to_string(lo) + "-" + to_string(hi) + ")")
+                     << setw(14) << mHistKmers[b]
+                     << setw(18) << mHistPairs[b]
+                     << setw(18) << cumPairs
+                     << setw(16) << estRecords
+                     << setw(12) << humanBytes(estRecords * sizeof(Relation)) << endl;
+            }
+            cout << "[mhist] read off the row whose est. disk fits the budget,"
+                 << " then pass its cap as --max-kmer-reads" << endl;
+        }
     }
 
     // Edge-volume summary. maxKeptM is the worst per-k-mer case that survived the skip:
