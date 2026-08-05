@@ -12,8 +12,10 @@
 #include <cassert>
 #include <thread>
 #include <atomic>
-#include <sys/sysinfo.h> 
-#include <algorithm> 
+#include <sys/sysinfo.h>
+#include <sys/resource.h>
+#include <cstdio>
+#include <algorithm>
 #include "IndexCreator.h"
 #include "SeqIterator.h"
 #include "NcbiTaxonomy.h"
@@ -131,13 +133,29 @@ static inline void addSat16(uint16_t & dst, uint32_t add) {
     dst = (sum > UINT16_MAX) ? UINT16_MAX : static_cast<uint16_t>(sum);
 }
 
-// Memory the OS reports as free. Linux: sysinfo. macOS: hw.memsize, which is TOTAL memory
-// and therefore an over-estimate. Other platforms: fixed 8 GB.
+// Memory usable for buffers.
+//
+// Linux uses /proc/meminfo's MemAvailable, not sysinfo's freeram: freeram excludes the page
+// cache even though the cache is reclaimable, so during a multi-hundred-GB write it collapses.
+// That collapse used to shrink the flush threshold and split the graph into tens of thousands
+// of tiny subgraph files, which then exhausted the process's file descriptors.
+// macOS uses hw.memsize, which is TOTAL memory and therefore an over-estimate.
 inline size_t getAvailableMemoryBytes() {
 #if defined(__linux__)
+    // Line-by-line: /proc/meminfo rows do not all carry a unit token, so streaming with >>
+    // would read the next row's key as this row's unit.
+    std::ifstream meminfo("/proc/meminfo");
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        unsigned long long kb = 0;
+        if (sscanf(line.c_str(), "MemAvailable: %llu kB", &kb) == 1) {
+            return static_cast<size_t>(kb) * 1024;
+        }
+    }
+    // Pre-3.14 kernels have no MemAvailable; free + reclaimable buffers is the closest stand-in.
     struct sysinfo info;
     sysinfo(&info);
-    return info.freeram * info.mem_unit;
+    return (size_t)(info.freeram + info.bufferram) * info.mem_unit;
 #elif defined(__APPLE__)
     int64_t freeMemory;
     size_t len = sizeof(freeMemory);
@@ -148,8 +166,20 @@ inline size_t getAvailableMemoryBytes() {
 #endif
 }
 
-inline size_t getRelationThreshold(int numThreads) {
+// Memory budget: what the OS can spare, capped by the user's declared --max-ram. The rest of
+// the pipeline already budgets against --max-ram (Buffer::calculateBufferSize); these two
+// helpers used to ignore it and trust an instantaneous OS reading alone.
+inline size_t getMemoryBudgetBytes(int maxRamGiB) {
     const size_t availableBytes = getAvailableMemoryBytes();
+    if (maxRamGiB <= 0) {
+        return availableBytes;
+    }
+    const size_t declared = static_cast<size_t>(maxRamGiB) * 1024 * 1024 * 1024;
+    return std::min(availableBytes, declared);
+}
+
+inline size_t getRelationThreshold(int numThreads, int maxRamGiB) {
+    const size_t availableBytes = getMemoryBudgetBytes(maxRamGiB);
 
     const double safetyFactor = 0.6;
     const size_t bytesPerEntry = 48; // unordered_map node overhead
@@ -160,6 +190,27 @@ inline size_t getRelationThreshold(int numThreads) {
     const size_t MIN_THRESHOLD = 1'000'000;
     const size_t MAX_THRESHOLD = 200'000'000;
     return std::max(MIN_THRESHOLD, std::min(threshold, MAX_THRESHOLD));
+}
+
+// Soft cap on how many files this process may hold open.
+inline size_t getOpenFileLimit() {
+    struct rlimit lim;
+    if (getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY) {
+        return static_cast<size_t>(lim.rlim_cur);
+    }
+    return 1024; // POSIX-typical default when the limit cannot be read
+}
+
+// How many subgraph files one merge pass may open at once. Bounded by the fd limit -- with a
+// reserve for the relations_* writers, stdio, and the k-mer readers -- and by a cap that keeps
+// each stream's read buffer large enough for sequential I/O. Anything beyond this is handled
+// by merging in rounds rather than by opening more files.
+inline size_t getMergeFanIn(int numThreads) {
+    const size_t FAN_IN_CAP = 512;
+    const size_t reserved = static_cast<size_t>(numThreads) * 2 + 1 + 64; // relations_* + slack
+    const size_t limit = getOpenFileLimit();
+    const size_t byFd = (limit > reserved + 8) ? (limit - reserved) : 8;
+    return std::max<size_t>(2, std::min(FAN_IN_CAP, byFd));
 }
 
 // m-distribution histogram: reads-per-k-mer bucketed by floor(log2(m)). m can reach the
@@ -184,14 +235,14 @@ static const size_t MERGE_BUFFER_MIN_ELEMS = 4'096;
 // The merge opens one buffer per subGraph_* file, so a fixed per-stream size makes total
 // memory scale with numOfGraph: the historical 1M elements is 12 MB per stream, i.e. 12 GB
 // at 1000 streams. Budget the total against free memory and split it across streams.
-inline size_t getMergeBufferElems(size_t numOfGraph) {
+inline size_t getMergeBufferElems(size_t numOfGraph, int maxRamGiB) {
     const size_t MAX_ELEMS = 1'048'576; // 12 MB per stream; the historical fixed size
     if (numOfGraph == 0) {
         return MAX_ELEMS;
     }
 
     const double safetyFactor = 0.5;
-    const size_t budget = (size_t)(getAvailableMemoryBytes() * safetyFactor);
+    const size_t budget = (size_t)(getMemoryBudgetBytes(maxRamGiB) * safetyFactor);
     const size_t perStream = budget / (numOfGraph * sizeof(Relation));
 
     return std::max(MERGE_BUFFER_MIN_ELEMS, std::min(perStream, MAX_ELEMS));
@@ -240,6 +291,18 @@ public:
                             const size_t counter_now);
 
     void mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& edgeWeightHist);
+
+    // Merge one batch of sorted subgraph files into a single sorted file, summing the weights
+    // of duplicate (id1,id2) pairs. Returns the number of records written. Used to fold many
+    // subgraphs down to a mergeable fan-in; it does no partitioning or histogramming, which
+    // only the final pass performs.
+    size_t mergeSubGraphBatch(const std::vector<std::string>& inputs,
+                              const std::string& output,
+                              size_t bufElems);
+
+    // Reduce `files` to at most maxFanIn entries by merging in rounds, deleting each batch's
+    // inputs as soon as it is folded so peak disk grows by one batch rather than a full copy.
+    void reduceSubGraphFanIn(std::vector<std::string>& files, size_t maxFanIn);
 
     static int otsuThreshold(const std::vector<uint64_t>& hist);
 
