@@ -247,15 +247,28 @@ inline size_t getOpenFileLimit() {
 // reserve for the relations_* writers, stdio, and the k-mer readers -- and by a cap that keeps
 // each stream's read buffer large enough for sequential I/O. Anything beyond this is handled
 // by merging in rounds rather than by opening more files.
-// `concurrentMergers` routes merge at the same time and each opens its own set of files, so
-// the descriptor budget is split between them.
+// Descriptors one merge unit holds at its peak: `fanIn` readers plus the single file it is
+// writing (its output, or a fold intermediate).
+inline size_t mergeFdsPerUnit(size_t fanIn) {
+    return fanIn + 1;
+}
+
+// Largest fan-in whose peak descriptor use fits the process limit.
+//
+// `concurrentMergers` units run at once, each holding mergeFdsPerUnit(fanIn). An earlier
+// version reserved a flat slack and forgot the per-unit writer, which put the peak one
+// descriptor over an 8192 limit at 16 threads and killed the merge with a bare
+// "Error opening file". Only a fraction of the limit is spent so that descriptors held
+// elsewhere -- and the writer this arithmetic now counts -- cannot tip it over.
 inline size_t getMergeFanIn(int numThreads, size_t concurrentMergers) {
+    (void) numThreads;
     const size_t FAN_IN_CAP = 512;
-    const size_t reserved = static_cast<size_t>(numThreads) * 2 + 1 + 64; // relations_* + slack
-    const size_t limit = getOpenFileLimit();
-    const size_t byFd = (limit > reserved + 8) ? (limit - reserved) : 8;
+    const double utilisation = 0.75;
     const size_t mergers = std::max<size_t>(1, concurrentMergers);
-    return std::max<size_t>(2, std::min(FAN_IN_CAP, byFd / mergers));
+    const size_t budget = static_cast<size_t>(getOpenFileLimit() * utilisation);
+    // Solve mergers * (fanIn + 1) <= budget.
+    const size_t perUnit = (budget > mergers) ? (budget / mergers - 1) : 0;
+    return std::max<size_t>(2, std::min(FAN_IN_CAP, perUnit));
 }
 
 // m-distribution histogram: reads-per-k-mer bucketed by floor(log2(m)). m can reach the

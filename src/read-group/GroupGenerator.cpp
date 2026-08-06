@@ -1121,11 +1121,16 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
              : (outDir + "/relations_" + to_string(route) + "_s" + to_string(shard) + ".tmp");
     };
 
+    const size_t peakFds = concurrentMergers * mergeFdsPerUnit(std::min(this->numOfGraph, maxFanIn));
     cout << "Merge: " << unitCnt << " units (" << routeCnt << " routes, cross bucket sharded x"
          << shardsForRoute(static_cast<size_t>(par.threads), par.threads) << ") x "
          << this->numOfGraph << " subgraphs, " << concurrentMergers
-         << " concurrent (fd soft limit " << getOpenFileLimit()
-         << ", fan-in " << maxFanIn << ")" << endl;
+         << " concurrent (fan-in " << maxFanIn << ", peak fds " << peakFds
+         << " of soft limit " << getOpenFileLimit() << ")" << endl;
+    if (peakFds >= getOpenFileLimit()) {
+        cout << "Warning: peak descriptor use " << peakFds << " meets the soft limit "
+             << getOpenFileLimit() << "; raise it or lower --threads." << endl;
+    }
     cout << "Merge read buffers: " << streamsPerUnit << " streams x " << mergeBufElems
          << " Relations per unit, "
          << humanBytes(static_cast<uint64_t>(streamsPerUnit) * mergeBufElems
