@@ -160,7 +160,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         mergeGraph_one(processedReadCnt);
     } else {
         std::vector<uint64_t> edgeWeightHist;
-        mergeGraph(processedReadCnt, edgeWeightHist);
+        mergeGraph(edgeWeightHist);
 
         int effectiveCoreEdge = par.coreEdgeWeight;
         int autoEdge = kneeThreshold(edgeWeightHist, par.minEdgeWeight);
@@ -605,14 +605,14 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             if (pair2weight.size() >= RELATION_THRESHOLD) {
                 size_t counter_now = counter.fetch_add(1, memory_order_relaxed);
                 localEmittedEdges += pair2weight.size();
-                saveSubGraphToFile(pair2weight, counter_now);
+                saveSubGraphToFile(pair2weight, counter_now, processedReadCnt);
                 pair2weight.clear();
             }
         }
         if (!pair2weight.empty()) {
             size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
             localEmittedEdges += pair2weight.size();
-            saveSubGraphToFile(pair2weight, counter_now);
+            saveSubGraphToFile(pair2weight, counter_now, processedReadCnt);
         } else {
             cout << "Thread " << threadIdx << " has no relations to write." << endl;
         }
@@ -757,25 +757,36 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
 }
 
 void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
-                                        const size_t counter_now) {
-    const string subGraphFileName = outDir + "/subGraph_" + to_string(counter_now);
-    FILE * outFile = fopen(subGraphFileName.c_str(), "wb");
-    if (!outFile) {
-        cerr << "Error opening file: " << subGraphFileName << endl;
-        return;
-    }
-    
-    // Get a sorted vector of relations
-    std::vector<Relation> relations;
-    relations.reserve(pair2weight.size());
+                                        const size_t counter_now,
+                                        size_t processedReadCnt) {
+    // Split by relations_* route at write time. Because the route is a function of
+    // (id1, id2) alone, a pair can never land under two routes -- which is what makes the
+    // per-route merges independent and lets them run in parallel.
+    const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
+    const size_t rangeSize = getRouteRangeSize(processedReadCnt, par.threads);
+
+    std::vector<std::vector<Relation>> byRoute(routeCnt);
     for (const auto& [pairKey, weight] : pair2weight) {
-        uint32_t id1 = static_cast<uint32_t>(pairKey >> 32);
-        uint32_t id2 = static_cast<uint32_t>(pairKey & 0xFFFFFFFF);
-        relations.emplace_back(id1, id2, weight);
+        const uint32_t id1 = static_cast<uint32_t>(pairKey >> 32);
+        const uint32_t id2 = static_cast<uint32_t>(pairKey & 0xFFFFFFFF);
+        byRoute[routeOf(id1, id2, par.threads, rangeSize)].emplace_back(id1, id2, weight);
     }
-    sort(relations.begin(), relations.end(), Relation::compare);
-    fwrite(relations.data(), sizeof(Relation), relations.size(), outFile);
-    fclose(outFile);
+
+    // Empty routes still get an empty file: the merge's input list is then simply
+    // subGraph_{0..numOfGraph-1}_{route} with no existence checks.
+    for (size_t route = 0; route < routeCnt; ++route) {
+        const string subGraphFileName =
+            outDir + "/subGraph_" + to_string(counter_now) + "_" + to_string(route);
+        FILE * outFile = fopen(subGraphFileName.c_str(), "wb");
+        if (!outFile) {
+            cerr << "Error opening file: " << subGraphFileName << endl;
+            continue;
+        }
+        std::vector<Relation> & relations = byRoute[route];
+        sort(relations.begin(), relations.end(), Relation::compare);
+        fwrite(relations.data(), sizeof(Relation), relations.size(), outFile);
+        fclose(outFile);
+    }
 }
 
 size_t GroupGenerator::mergeSubGraphBatch(const std::vector<std::string> & inputs,
@@ -827,24 +838,24 @@ size_t GroupGenerator::mergeSubGraphBatch(const std::vector<std::string> & input
     return written;
 }
 
-void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_t maxFanIn) {
+void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_t maxFanIn,
+                                         size_t route) {
     if (files.size() <= maxFanIn) {
         return;
     }
 
-    cout << "Folding " << files.size() << " subgraphs down to <= " << maxFanIn
-         << " (fd soft limit " << getOpenFileLimit() << ")" << endl;
-
+    const size_t bufElems = getMergeBufferElems(maxFanIn, par.ramUsage, par.threads);
     size_t round = 0;
     while (files.size() > maxFanIn) {
-        const time_t roundStart = time(nullptr);
-        const size_t bufElems = getMergeBufferElems(maxFanIn, par.ramUsage);
         std::vector<std::string> next;
         size_t batchIdx = 0;
         for (size_t start = 0; start < files.size(); start += maxFanIn) {
             const size_t end = std::min(start + maxFanIn, files.size());
             const std::vector<std::string> batch(files.begin() + start, files.begin() + end);
-            const std::string out = outDir + "/subGraph_r" + to_string(round) + "_" + to_string(batchIdx);
+            // The route is part of the name: concurrent routes fold at the same time, and a
+            // shared name would have two of them write the same file.
+            const std::string out = outDir + "/subGraph_p" + to_string(route)
+                                  + "_r" + to_string(round) + "_" + to_string(batchIdx);
             mergeSubGraphBatch(batch, out, bufElems);
             // Delete this batch now, not after the whole round: peak disk then grows by one
             // batch's output instead of by a second copy of every subgraph.
@@ -855,9 +866,73 @@ void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_
             ++batchIdx;
         }
         files.swap(next);
-        cout << "  round " << round << ": " << files.size() << " files left ("
-             << double(time(nullptr) - roundStart) << " s)" << endl;
         ++round;
+    }
+}
+
+void GroupGenerator::mergeRoute(size_t route, size_t bufElems, size_t maxFanIn,
+                                std::vector<uint64_t> & histOut, size_t & mergedOut,
+                                size_t & ceilingOut) {
+    histOut.assign(65536, 0);
+    mergedOut = 0;
+    ceilingOut = 0;
+
+    std::vector<std::string> files;
+    files.reserve(this->numOfGraph);
+    for (size_t i = 0; i < this->numOfGraph; ++i) {
+        files.push_back(outDir + "/subGraph_" + to_string(i) + "_" + to_string(route));
+    }
+    reduceSubGraphFanIn(files, maxFanIn, route);
+
+    const size_t streamCnt = files.size();
+    std::vector<ReadBuffer<Relation> *> readers(streamCnt);
+    for (size_t i = 0; i < streamCnt; ++i) {
+        readers[i] = new ReadBuffer<Relation>(files[i], bufElems);
+    }
+
+    WriteBuffer<Relation> out(outDir + "/relations_" + to_string(route) + ".bin", 1024 * 1024);
+
+    // No routing decision here: every edge in these files already belongs to this route.
+    MergeHeap heap;
+    for (size_t i = 0; i < streamCnt; ++i) {
+        const Relation first = readers[i]->getNext();
+        if (!(first == Relation())) {
+            MergeHeapEntry entry;
+            entry.rel = first;
+            entry.stream = i;
+            heap.push(entry);
+        }
+    }
+
+    while (!heap.empty()) {
+        const Relation minRelation = heap.top().rel;
+        uint16_t totalWeight = 0;
+        while (!heap.empty() && heap.top().rel == minRelation) {
+            const size_t stream = heap.top().stream;
+            addSat16(totalWeight, heap.top().rel.weight);
+            heap.pop();
+            const Relation next = readers[stream]->getNext();
+            if (!(next == Relation())) {
+                MergeHeapEntry entry;
+                entry.rel = next;
+                entry.stream = stream;
+                heap.push(entry);
+            }
+        }
+        if (totalWeight == UINT16_MAX) ceilingOut++;
+        mergedOut++;
+        if (totalWeight > 0) histOut[totalWeight]++;
+
+        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
+        out.write(&rel);
+    }
+    out.flush();
+
+    for (size_t i = 0; i < streamCnt; ++i) {
+        delete readers[i];
+    }
+    for (size_t i = 0; i < streamCnt; ++i) {
+        std::remove(files[i].c_str());
     }
 }
 
@@ -971,118 +1046,80 @@ int GroupGenerator::kneeThreshold(const std::vector<uint64_t>& hist, int minWeig
     return (knee > minWeight) ? knee : 0;
 }
 
-void GroupGenerator::mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& edgeWeightHist) {
+void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
     edgeWeightHist.assign(65536, 0);
 
-    // Fold the subgraphs down to a fan-in this process can hold open before opening anything
-    // else: a run with 12,826 subgraphs died at subGraph_7660 because fopen ran out of file
-    // descriptors. relationLogs are opened only after the folding, so they do not consume
-    // descriptors during it.
-    std::vector<std::string> subGraphFiles;
-    subGraphFiles.reserve(this->numOfGraph);
-    for (size_t i = 0; i < this->numOfGraph; ++i) {
-        subGraphFiles.push_back(outDir + "/subGraph_" + to_string(i));
-    }
-    const size_t maxFanIn = getMergeFanIn(par.threads);
-    cout << "Merge fan-in: " << maxFanIn << " (subgraphs " << this->numOfGraph
-         << ", fd soft limit " << getOpenFileLimit() << ")" << endl;
-    reduceSubGraphFanIn(subGraphFiles, maxFanIn);
+    // Routes merge independently: saveSubGraphToFile already split every flush by the
+    // relations_* route, and the route is a function of (id1, id2), so no pair spans two of
+    // them. Each route therefore produces its own relations_{r}.bin with no coordination.
+    const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
+    const size_t concurrentMergers = std::min(static_cast<size_t>(par.threads), routeCnt);
+    const size_t maxFanIn = getMergeFanIn(par.threads, concurrentMergers);
+    const size_t mergeBufElems = getMergeBufferElems(std::min(this->numOfGraph, maxFanIn),
+                                                     par.ramUsage, concurrentMergers);
+    const size_t streamsPerRoute = std::min(this->numOfGraph, maxFanIn);
 
-    std::vector<WriteBuffer<Relation>*> relationLogs;
-    relationLogs.reserve(par.threads * 2 + 1);
-    for (size_t i = 0; i < par.threads * 2 + 1; ++i) {
-        relationLogs.push_back(new WriteBuffer<Relation>(outDir + "/relations_" + std::to_string(i) + ".bin", 1024 * 1024));
+    cout << "Merge: " << routeCnt << " routes x " << this->numOfGraph << " subgraphs, "
+         << concurrentMergers << " concurrent (fd soft limit " << getOpenFileLimit()
+         << ", fan-in " << maxFanIn << ")" << endl;
+    cout << "Merge read buffers: " << streamsPerRoute << " streams x " << mergeBufElems
+         << " Relations per route, "
+         << humanBytes(static_cast<uint64_t>(streamsPerRoute) * mergeBufElems
+                       * sizeof(Relation) * concurrentMergers)
+         << " total" << endl;
+    if (this->numOfGraph > maxFanIn) {
+        cout << "Folding each route's " << this->numOfGraph << " subgraphs down to <= "
+             << maxFanIn << endl;
     }
-
-    // Per-stream read buffer sized against the memory budget instead of a fixed 12 MB, so
-    // total merge memory does not scale with the stream count.
-    const size_t streamCnt = subGraphFiles.size();
-    const size_t mergeBufElems = getMergeBufferElems(streamCnt, par.ramUsage);
-    cout << "Merge read buffers: " << streamCnt << " streams x " << mergeBufElems
-         << " Relations ("
-         << humanBytes(static_cast<uint64_t>(streamCnt) * mergeBufElems * sizeof(Relation))
-         << ")" << endl;
-    if (streamCnt > 0 && mergeBufElems == MERGE_BUFFER_MIN_ELEMS) {
-        cout << "Warning: " << streamCnt << " streams exceed the merge memory budget; "
-             << "read buffers are at the " << MERGE_BUFFER_MIN_ELEMS
+    if (mergeBufElems == MERGE_BUFFER_MIN_ELEMS) {
+        cout << "Warning: read buffers are at the " << MERGE_BUFFER_MIN_ELEMS
              << "-element floor. Merging will be I/O bound." << endl;
     }
 
-    std::vector<ReadBuffer<Relation> *> relationBuffers(streamCnt);
-    for (size_t i = 0; i < streamCnt; ++i) {
-        relationBuffers[i] = new ReadBuffer<Relation>(subGraphFiles[i], mergeBufElems);
+    // Each route deletes its own inputs as it finishes, so total subgraph bytes are measured
+    // up front to keep the [disk] report the single-pass merge used to print.
+    uint64_t subGraphBytes = 0;
+    for (size_t i = 0; i < this->numOfGraph; ++i) {
+        for (size_t r = 0; r < routeCnt; ++r) {
+            struct stat st;
+            const string name = outDir + "/subGraph_" + to_string(i) + "_" + to_string(r);
+            if (stat(name.c_str(), &st) == 0) {
+                subGraphBytes += static_cast<uint64_t>(st.st_size);
+            }
+        }
     }
 
-    size_t range_size = (processedReadCnt > par.threads)?(processedReadCnt / static_cast<size_t>(par.threads)):(processedReadCnt);
+    std::vector<std::vector<uint64_t>> routeHist(routeCnt);
+    std::vector<size_t> routeMerged(routeCnt, 0);
+    std::vector<size_t> routeCeiling(routeCnt, 0);
+    std::vector<double> routeSeconds(routeCnt, 0.0);
+
+    // schedule(dynamic): routes carry very different loads -- the cross bucket in particular
+    // collects every edge whose ids fall in different partitions.
+    #pragma omp parallel for schedule(dynamic) num_threads(concurrentMergers)
+    for (size_t r = 0; r < routeCnt; ++r) {
+        const time_t routeStart = time(nullptr);
+        mergeRoute(r, mergeBufElems, maxFanIn, routeHist[r], routeMerged[r], routeCeiling[r]);
+        routeSeconds[r] = double(time(nullptr) - routeStart);
+    }
 
     size_t ceilingEdgeCnt = 0; // edges whose merged weight sits at the uint16 ceiling
     size_t mergedEdgeCnt = 0;  // distinct (id1,id2) pairs after merging
-
-    // Min-heap over the stream heads. The previous linear scan re-examined every stream for
-    // every output edge -- O(streams) per edge -- and clique edge volume pushes the stream
-    // count up, which made that the merge's dominant cost.
-    // An exhausted stream is simply not pushed back, so heap.empty() ends the merge; no
-    // UINT32_MAX sentinel is needed. getNext() returns a default Relation at EOF, and read
-    // ids are 1-based, so id1 == 0 can only mean EOF.
-    MergeHeap heap;
-    for (size_t i = 0; i < streamCnt; ++i) {
-        const Relation first = relationBuffers[i]->getNext();
-        if (!(first == Relation())) {
-            MergeHeapEntry entry;
-            entry.rel = first;
-            entry.stream = i;
-            heap.push(entry);
+    size_t slowestRoute = 0;
+    for (size_t r = 0; r < routeCnt; ++r) {
+        mergedEdgeCnt += routeMerged[r];
+        ceilingEdgeCnt += routeCeiling[r];
+        for (size_t w = 0; w < edgeWeightHist.size(); ++w) {
+            edgeWeightHist[w] += routeHist[r][w];
         }
+        if (routeSeconds[r] > routeSeconds[slowestRoute]) { slowestRoute = r; }
     }
-
-    while (!heap.empty()) {
-        const Relation minRelation = heap.top().rel;
-        uint16_t totalWeight = 0;
-        // Each subGraph_* holds each (id1,id2) once and in sorted order, so a refilled head
-        // is strictly greater than minRelation; this drains exactly the equal keys.
-        while (!heap.empty() && heap.top().rel == minRelation) {
-            const size_t stream = heap.top().stream;
-            addSat16(totalWeight, heap.top().rel.weight);
-            heap.pop();
-            const Relation next = relationBuffers[stream]->getNext();
-            if (!(next == Relation())) {
-                MergeHeapEntry entry;
-                entry.rel = next;
-                entry.stream = stream;
-                heap.push(entry);
-            }
-        }
-        if (totalWeight == UINT16_MAX) ceilingEdgeCnt++;
-        mergedEdgeCnt++;
-
-        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
-        if (totalWeight > 0) edgeWeightHist[totalWeight]++;
-        if (minRelation.id1 % par.threads == minRelation.id2 % par.threads){
-            relationLogs[(minRelation.id1 % par.threads)]->write(&rel);
-        }
-        else if (minRelation.id1 / range_size == minRelation.id2 / range_size){
-            relationLogs[(minRelation.id1 / range_size) + par.threads]->write(&rel);
-        }
-        else{
-            relationLogs[par.threads]->write(&rel);
-        }
-    }
-
-    // flush + close relation outputs before downstream reads / disk reporting.
-    for (size_t i = 0; i < relationLogs.size(); ++i) {
-        relationLogs[i]->flush();
-        delete relationLogs[i];
-    }
-
-    for (size_t i = 0; i < streamCnt; ++i) {
-        delete relationBuffers[i];
-    }
-
-    // The surviving streams are fully merged into relations_*; report + remove to free disk.
-    // Folded-away inputs were already deleted round by round, so only these are left.
-    reportAndRemoveFiles(subGraphFiles, "subGraph");
+    cout << "[edges] slowest route " << slowestRoute << ": " << routeSeconds[slowestRoute]
+         << " s, " << routeMerged[slowestRoute] << " edges" << endl;
+    cout << "[disk] subGraph: " << (this->numOfGraph * routeCnt) << " files, "
+         << humanBytes(subGraphBytes) << " freed" << endl;
 
     cout << "[edges] merged into " << mergedEdgeCnt << " distinct edges ("
          << humanBytes(static_cast<uint64_t>(mergedEdgeCnt) * sizeof(Relation)) << ")" << endl;
@@ -1103,69 +1140,73 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
 
-    // Same folding and buffer budget as mergeGraph -- this path opens one buffer per subgraph
-    // too, so it hits the same fd limit. The k-way merge below stays a linear scan; this is
-    // the --print-log debug path.
-    std::vector<std::string> subGraphFiles;
-    subGraphFiles.reserve(this->numOfGraph);
-    for (size_t i = 0; i < this->numOfGraph; ++i) {
-        subGraphFiles.push_back(outDir + "/subGraph_" + to_string(i));
-    }
-    const size_t maxFanIn = getMergeFanIn(par.threads);
-    cout << "Merge fan-in: " << maxFanIn << " (subgraphs " << this->numOfGraph
-         << ", fd soft limit " << getOpenFileLimit() << ")" << endl;
-    reduceSubGraphFanIn(subGraphFiles, maxFanIn);
+    // Subgraphs are now split by route, so this path walks the routes in turn and appends
+    // each one's merge to relations.bin. Records are sorted within a route but the file as a
+    // whole is segmented by route -- this dump exists for weight-histogram analysis, which
+    // does not depend on global ordering. The merge itself stays a linear scan.
+    const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
+    const size_t maxFanIn = getMergeFanIn(par.threads, 1);
+    const size_t mergeBufElems = getMergeBufferElems(std::min(this->numOfGraph, maxFanIn),
+                                                     par.ramUsage, 1);
+    cout << "Merge: " << routeCnt << " routes x " << this->numOfGraph
+         << " subgraphs, sequential (fd soft limit " << getOpenFileLimit()
+         << ", fan-in " << maxFanIn << ")" << endl;
 
     WriteBuffer<Relation> relationLog(outDir + "/relations.bin", 1024 * 1024);
 
-    const size_t streamCnt = subGraphFiles.size();
-    const size_t mergeBufElems = getMergeBufferElems(streamCnt, par.ramUsage);
-    cout << "Merge read buffers: " << streamCnt << " streams x " << mergeBufElems
-         << " Relations ("
-         << humanBytes(static_cast<uint64_t>(streamCnt) * mergeBufElems * sizeof(Relation))
-         << ")" << endl;
-
-    std::vector<ReadBuffer<Relation> *> relationBuffers(streamCnt);
-    std::vector<Relation> currentRelations(streamCnt);
-    for (size_t i = 0; i < streamCnt; ++i) {
-        relationBuffers[i] = new ReadBuffer<Relation>(subGraphFiles[i], mergeBufElems);
-        currentRelations[i] = relationBuffers[i]->getNext();
-        if (currentRelations[i] == Relation()) {
-            currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
-        }
-    }
-
     size_t ceilingEdgeCnt = 0; // edges whose merged weight sits at the uint16 ceiling
 
-    while (true) {
-        Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
+    for (size_t route = 0; route < routeCnt; ++route) {
+        std::vector<std::string> subGraphFiles;
+        subGraphFiles.reserve(this->numOfGraph);
+        for (size_t i = 0; i < this->numOfGraph; ++i) {
+            subGraphFiles.push_back(outDir + "/subGraph_" + to_string(i) + "_" + to_string(route));
+        }
+        reduceSubGraphFanIn(subGraphFiles, maxFanIn, route);
+
+        const size_t streamCnt = subGraphFiles.size();
+        std::vector<ReadBuffer<Relation> *> relationBuffers(streamCnt);
+        std::vector<Relation> currentRelations(streamCnt);
         for (size_t i = 0; i < streamCnt; ++i) {
-            if (currentRelations[i] < minRelation) {
-                minRelation = currentRelations[i];
+            relationBuffers[i] = new ReadBuffer<Relation>(subGraphFiles[i], mergeBufElems);
+            currentRelations[i] = relationBuffers[i]->getNext();
+            if (currentRelations[i] == Relation()) {
+                currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
             }
         }
-        if (minRelation.id1 == UINT32_MAX) break;
-        uint16_t totalWeight = 0;
-        for (size_t i = 0; i < streamCnt; ++i) {
-            if (currentRelations[i] == minRelation) {
-                addSat16(totalWeight, currentRelations[i].weight);
-                currentRelations[i] = relationBuffers[i]->getNext();
-                if (currentRelations[i] == Relation()) {
-                    currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
+
+        while (true) {
+            Relation minRelation(UINT32_MAX, UINT32_MAX, 0);
+            for (size_t i = 0; i < streamCnt; ++i) {
+                if (currentRelations[i] < minRelation) {
+                    minRelation = currentRelations[i];
                 }
             }
-        }
-        if (totalWeight == UINT16_MAX) ceilingEdgeCnt++;
+            if (minRelation.id1 == UINT32_MAX) break;
+            uint16_t totalWeight = 0;
+            for (size_t i = 0; i < streamCnt; ++i) {
+                if (currentRelations[i] == minRelation) {
+                    addSat16(totalWeight, currentRelations[i].weight);
+                    currentRelations[i] = relationBuffers[i]->getNext();
+                    if (currentRelations[i] == Relation()) {
+                        currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
+                    }
+                }
+            }
+            if (totalWeight == UINT16_MAX) ceilingEdgeCnt++;
 
-        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
-        relationLog.write(&rel);
+            Relation rel(minRelation.id1, minRelation.id2, totalWeight);
+            relationLog.write(&rel);
+        }
+
+        for (size_t i = 0; i < streamCnt; ++i) {
+            delete relationBuffers[i];
+        }
+        for (size_t i = 0; i < streamCnt; ++i) {
+            std::remove(subGraphFiles[i].c_str());
+        }
     }
     relationLog.flush();
-
-    for (size_t i = 0; i < streamCnt; ++i) {
-        delete relationBuffers[i];
-    }
-    reportAndRemoveFiles(subGraphFiles, "subGraph");
 
     // This path exists to dump relations.bin for weight-histogram analysis, so a
     // silent saturation would quietly distort that histogram. Report it.

@@ -192,6 +192,29 @@ inline size_t getRelationThreshold(int numThreads, int maxRamGiB) {
     return std::max(MIN_THRESHOLD, std::min(threshold, MAX_THRESHOLD));
 }
 
+// Width of one id range in the relations_* routing scheme.
+inline size_t getRouteRangeSize(size_t processedReadCnt, int numThreads) {
+    const size_t threads = static_cast<size_t>(numThreads);
+    return (processedReadCnt > threads) ? (processedReadCnt / threads) : processedReadCnt;
+}
+
+// Which relations_{r}.bin an edge belongs to. Depends only on (id1, id2), which is what lets
+// the merge be split by route: a pair can never appear under two different routes.
+// Routes 0..numThreads-1 and numThreads+1..2*numThreads are each read by a single union-find
+// thread; numThreads is the cross bucket that spans partitions.
+inline size_t routeOf(uint32_t id1, uint32_t id2, int numThreads, size_t rangeSize) {
+    const uint32_t threads = static_cast<uint32_t>(numThreads);
+    if (id1 % threads == id2 % threads) {
+        return static_cast<size_t>(id1 % threads);
+    }
+    // rangeSize is 0 only when there are no reads at all, in which case there are no edges
+    // either; guard anyway so the helper can never divide by zero.
+    if (rangeSize != 0 && id1 / rangeSize == id2 / rangeSize) {
+        return static_cast<size_t>(id1 / rangeSize) + static_cast<size_t>(numThreads);
+    }
+    return static_cast<size_t>(numThreads);
+}
+
 // Soft cap on how many files this process may hold open.
 inline size_t getOpenFileLimit() {
     struct rlimit lim;
@@ -205,12 +228,15 @@ inline size_t getOpenFileLimit() {
 // reserve for the relations_* writers, stdio, and the k-mer readers -- and by a cap that keeps
 // each stream's read buffer large enough for sequential I/O. Anything beyond this is handled
 // by merging in rounds rather than by opening more files.
-inline size_t getMergeFanIn(int numThreads) {
+// `concurrentMergers` routes merge at the same time and each opens its own set of files, so
+// the descriptor budget is split between them.
+inline size_t getMergeFanIn(int numThreads, size_t concurrentMergers) {
     const size_t FAN_IN_CAP = 512;
     const size_t reserved = static_cast<size_t>(numThreads) * 2 + 1 + 64; // relations_* + slack
     const size_t limit = getOpenFileLimit();
     const size_t byFd = (limit > reserved + 8) ? (limit - reserved) : 8;
-    return std::max<size_t>(2, std::min(FAN_IN_CAP, byFd));
+    const size_t mergers = std::max<size_t>(1, concurrentMergers);
+    return std::max<size_t>(2, std::min(FAN_IN_CAP, byFd / mergers));
 }
 
 // m-distribution histogram: reads-per-k-mer bucketed by floor(log2(m)). m can reach the
@@ -235,14 +261,15 @@ static const size_t MERGE_BUFFER_MIN_ELEMS = 4'096;
 // The merge opens one buffer per subGraph_* file, so a fixed per-stream size makes total
 // memory scale with numOfGraph: the historical 1M elements is 12 MB per stream, i.e. 12 GB
 // at 1000 streams. Budget the total against free memory and split it across streams.
-inline size_t getMergeBufferElems(size_t numOfGraph, int maxRamGiB) {
+inline size_t getMergeBufferElems(size_t numOfGraph, int maxRamGiB, size_t concurrentMergers) {
     const size_t MAX_ELEMS = 1'048'576; // 12 MB per stream; the historical fixed size
     if (numOfGraph == 0) {
         return MAX_ELEMS;
     }
 
     const double safetyFactor = 0.5;
-    const size_t budget = (size_t)(getMemoryBudgetBytes(maxRamGiB) * safetyFactor);
+    const size_t mergers = std::max<size_t>(1, concurrentMergers);
+    const size_t budget = (size_t)(getMemoryBudgetBytes(maxRamGiB) * safetyFactor) / mergers;
     const size_t perStream = budget / (numOfGraph * sizeof(Relation));
 
     return std::max(MERGE_BUFFER_MIN_ELEMS, std::min(perStream, MAX_ELEMS));
@@ -287,10 +314,15 @@ public:
 
     void makeSubGraph(size_t processedReadCnt);
     
+    // Writes one file per relations_* route (subGraph_{counter}_{route}) instead of one file
+    // per flush, so the merge can process each route independently and in parallel.
     void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
-                            const size_t counter_now);
+                            const size_t counter_now,
+                            size_t processedReadCnt);
 
-    void mergeGraph(size_t processedReadCnt, std::vector<uint64_t>& edgeWeightHist);
+    // No processedReadCnt: routing now happens in saveSubGraphToFile, which is where the
+    // read count is needed. This function only folds and merges what is already partitioned.
+    void mergeGraph(std::vector<uint64_t>& edgeWeightHist);
 
     // Merge one batch of sorted subgraph files into a single sorted file, summing the weights
     // of duplicate (id1,id2) pairs. Returns the number of records written. Used to fold many
@@ -302,7 +334,14 @@ public:
 
     // Reduce `files` to at most maxFanIn entries by merging in rounds, deleting each batch's
     // inputs as soon as it is folded so peak disk grows by one batch rather than a full copy.
-    void reduceSubGraphFanIn(std::vector<std::string>& files, size_t maxFanIn);
+    // `route` only names the intermediates: routes fold concurrently, so a shared name would
+    // let two of them write the same file and silently mix their edges.
+    void reduceSubGraphFanIn(std::vector<std::string>& files, size_t maxFanIn, size_t route);
+
+    // Merge every subgraph belonging to one route into relations_{route}.bin. Purely
+    // sequential -- mergeGraph runs these concurrently, one route per thread.
+    void mergeRoute(size_t route, size_t bufElems, size_t maxFanIn,
+                    std::vector<uint64_t>& histOut, size_t& mergedOut, size_t& ceilingOut);
 
     static int otsuThreshold(const std::vector<uint64_t>& hist);
 
