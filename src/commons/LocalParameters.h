@@ -102,6 +102,7 @@ public:
     PARAMETER(CONVERGENCE_THRESHOLD)
     PARAMETER(MAX_KMER_FREQ_RATIO)
     PARAMETER(MAX_KMER_READS)
+    PARAMETER(MIN_OVERLAP_RATIO)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
     PARAMETER(READID_COL)
@@ -204,6 +205,7 @@ public:
     float convergenceThreshold;
     float maxKmerFreqRatio;
     int maxKmerReads;
+    float minOverlapRatio;
 
     // Group application
     int scoreCol;

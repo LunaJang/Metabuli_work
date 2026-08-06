@@ -162,20 +162,48 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         std::vector<uint64_t> edgeWeightHist;
         mergeGraph(edgeWeightHist);
 
-        int effectiveCoreEdge = par.coreEdgeWeight;
-        int autoEdge = kneeThreshold(edgeWeightHist, par.minEdgeWeight);
-        if (autoEdge > par.minEdgeWeight && par.kneeScale != 1.0f) {
+        // The knee is always computed, even when unused, so its value can be compared against
+        // whatever is actually applied. edgeWeightHist is built by mergeGraph regardless, so
+        // this costs nothing.
+        int kneeEdge = kneeThreshold(edgeWeightHist, par.minEdgeWeight);
+        if (kneeEdge > par.minEdgeWeight && par.kneeScale != 1.0f) {
             // --knee-scale < 1.0 lowers the core threshold; clamp so Phase 2 stays enabled.
-            autoEdge = static_cast<int>(autoEdge * par.kneeScale + 0.5f);
-            if (autoEdge < par.minEdgeWeight + 1) autoEdge = par.minEdgeWeight + 1;
+            kneeEdge = static_cast<int>(kneeEdge * par.kneeScale + 0.5f);
+            if (kneeEdge < par.minEdgeWeight + 1) kneeEdge = par.minEdgeWeight + 1;
         }
-        if (autoEdge > par.minEdgeWeight) {
-            effectiveCoreEdge = autoEdge;
-            cout << "Auto coreEdgeWeight (knee x" << par.kneeScale << "): "
-                 << effectiveCoreEdge << endl;
-        } else {
-            cout << "Knee: insufficient data, using --core-edge: "
-                 << effectiveCoreEdge << endl;
+
+        // An edge weight counts the k-mers two reads share, so weight / kmersPerRead is the
+        // fraction of a read the two overlap by. That makes the threshold a property of read
+        // geometry rather than of the weight distribution's shape -- unlike the knee, which
+        // tracks the tail's extent and therefore shifts with read length and coverage.
+        const double kmersPerRead = (processedReadCnt > 0)
+            ? static_cast<double>(totalFilteredKmers) / static_cast<double>(processedReadCnt)
+            : 0.0;
+        const int ratioEdge = (par.minOverlapRatio > 0.0f && kmersPerRead > 0.0)
+            ? static_cast<int>(par.minOverlapRatio * kmersPerRead + 0.5)
+            : 0;
+
+        int effectiveCoreEdge = par.coreEdgeWeight;
+        if (ratioEdge > par.minEdgeWeight) {
+            effectiveCoreEdge = ratioEdge;
+            cout << "Core threshold: " << effectiveCoreEdge << " (overlap ratio "
+                 << par.minOverlapRatio << " x " << kmersPerRead << " k-mers/read)"
+                 << " [knee would give " << kneeEdge << "]" << endl;
+        } else if (par.minOverlapRatio > 0.0f) {
+            cout << "Core threshold: overlap ratio " << par.minOverlapRatio << " x "
+                 << kmersPerRead << " k-mers/read = " << ratioEdge
+                 << " is not above --min-edge " << par.minEdgeWeight
+                 << "; falling back" << endl;
+        }
+        if (effectiveCoreEdge == par.coreEdgeWeight) {
+            if (kneeEdge > par.minEdgeWeight) {
+                effectiveCoreEdge = kneeEdge;
+                cout << "Auto coreEdgeWeight (knee x" << par.kneeScale << "): "
+                     << effectiveCoreEdge << endl;
+            } else {
+                cout << "Knee: insufficient data, using --core-edge: "
+                     << effectiveCoreEdge << endl;
+            }
         }
 
         // Phase 1: form core groups with strong edges
@@ -380,6 +408,8 @@ void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
     secondSort = time(nullptr) - secondSort;    
     cout << "Query k-mer sorting (2): " << double(secondSort) << " s" << endl;
     cout << "Filtered k-mer number  : " << storePos - blankCnt << endl;
+    // Accumulate across splits; this point is outside the OpenMP region above, so no race.
+    totalFilteredKmers += storePos - blankCnt;
 }
 
 void GroupGenerator::writeKmers(Buffer<Kmer>& queryKmerBuffer,
@@ -765,27 +795,35 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>&
     const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
     const size_t rangeSize = getRouteRangeSize(processedReadCnt, par.threads);
 
-    std::vector<std::vector<Relation>> byRoute(routeCnt);
+    // byUnit[route][shard]. Every route carries a shard index so the merge's filename rule is
+    // uniform; only the cross bucket actually has more than one.
+    std::vector<std::vector<std::vector<Relation>>> byUnit(routeCnt);
+    for (size_t route = 0; route < routeCnt; ++route) {
+        byUnit[route].resize(shardsForRoute(route, par.threads));
+    }
     for (const auto& [pairKey, weight] : pair2weight) {
         const uint32_t id1 = static_cast<uint32_t>(pairKey >> 32);
         const uint32_t id2 = static_cast<uint32_t>(pairKey & 0xFFFFFFFF);
-        byRoute[routeOf(id1, id2, par.threads, rangeSize)].emplace_back(id1, id2, weight);
+        const size_t route = routeOf(id1, id2, par.threads, rangeSize);
+        byUnit[route][shardOf(id1, byUnit[route].size())].emplace_back(id1, id2, weight);
     }
 
-    // Empty routes still get an empty file: the merge's input list is then simply
-    // subGraph_{0..numOfGraph-1}_{route} with no existence checks.
+    // Empty units still get an empty file: the merge's input list is then simply
+    // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
     for (size_t route = 0; route < routeCnt; ++route) {
-        const string subGraphFileName =
-            outDir + "/subGraph_" + to_string(counter_now) + "_" + to_string(route);
-        FILE * outFile = fopen(subGraphFileName.c_str(), "wb");
-        if (!outFile) {
-            cerr << "Error opening file: " << subGraphFileName << endl;
-            continue;
+        for (size_t shard = 0; shard < byUnit[route].size(); ++shard) {
+            const string subGraphFileName = outDir + "/subGraph_" + to_string(counter_now)
+                                          + "_" + to_string(route) + "_" + to_string(shard);
+            FILE * outFile = fopen(subGraphFileName.c_str(), "wb");
+            if (!outFile) {
+                cerr << "Error opening file: " << subGraphFileName << endl;
+                continue;
+            }
+            std::vector<Relation> & relations = byUnit[route][shard];
+            sort(relations.begin(), relations.end(), Relation::compare);
+            fwrite(relations.data(), sizeof(Relation), relations.size(), outFile);
+            fclose(outFile);
         }
-        std::vector<Relation> & relations = byRoute[route];
-        sort(relations.begin(), relations.end(), Relation::compare);
-        fwrite(relations.data(), sizeof(Relation), relations.size(), outFile);
-        fclose(outFile);
     }
 }
 
@@ -839,7 +877,7 @@ size_t GroupGenerator::mergeSubGraphBatch(const std::vector<std::string> & input
 }
 
 void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_t maxFanIn,
-                                         size_t route) {
+                                         size_t route, size_t shard) {
     if (files.size() <= maxFanIn) {
         return;
     }
@@ -852,9 +890,11 @@ void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_
         for (size_t start = 0; start < files.size(); start += maxFanIn) {
             const size_t end = std::min(start + maxFanIn, files.size());
             const std::vector<std::string> batch(files.begin() + start, files.begin() + end);
-            // The route is part of the name: concurrent routes fold at the same time, and a
-            // shared name would have two of them write the same file.
+            // Route AND shard are part of the name: units fold at the same time, and a shared
+            // name would have two of them write the same file. Route alone is not enough --
+            // the cross bucket's shards all carry the same route.
             const std::string out = outDir + "/subGraph_p" + to_string(route)
+                                  + "_s" + to_string(shard)
                                   + "_r" + to_string(round) + "_" + to_string(batchIdx);
             mergeSubGraphBatch(batch, out, bufElems);
             // Delete this batch now, not after the whole round: peak disk then grows by one
@@ -870,9 +910,10 @@ void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_
     }
 }
 
-void GroupGenerator::mergeRoute(size_t route, size_t bufElems, size_t maxFanIn,
-                                std::vector<uint64_t> & histOut, size_t & mergedOut,
-                                size_t & ceilingOut) {
+void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & outPath,
+                               size_t bufElems, size_t maxFanIn,
+                               std::vector<uint64_t> & histOut, size_t & mergedOut,
+                               size_t & ceilingOut) {
     histOut.assign(65536, 0);
     mergedOut = 0;
     ceilingOut = 0;
@@ -880,9 +921,10 @@ void GroupGenerator::mergeRoute(size_t route, size_t bufElems, size_t maxFanIn,
     std::vector<std::string> files;
     files.reserve(this->numOfGraph);
     for (size_t i = 0; i < this->numOfGraph; ++i) {
-        files.push_back(outDir + "/subGraph_" + to_string(i) + "_" + to_string(route));
+        files.push_back(outDir + "/subGraph_" + to_string(i) + "_" + to_string(route)
+                        + "_" + to_string(shard));
     }
-    reduceSubGraphFanIn(files, maxFanIn, route);
+    reduceSubGraphFanIn(files, maxFanIn, route, shard);
 
     const size_t streamCnt = files.size();
     std::vector<ReadBuffer<Relation> *> readers(streamCnt);
@@ -890,9 +932,9 @@ void GroupGenerator::mergeRoute(size_t route, size_t bufElems, size_t maxFanIn,
         readers[i] = new ReadBuffer<Relation>(files[i], bufElems);
     }
 
-    WriteBuffer<Relation> out(outDir + "/relations_" + to_string(route) + ".bin", 1024 * 1024);
+    WriteBuffer<Relation> out(outPath, 1024 * 1024);
 
-    // No routing decision here: every edge in these files already belongs to this route.
+    // No routing decision here: every edge in these files already belongs to this unit.
     MergeHeap heap;
     for (size_t i = 0; i < streamCnt; ++i) {
         const Relation first = readers[i]->getNext();
@@ -1051,26 +1093,46 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
     time_t before = time(nullptr);
     edgeWeightHist.assign(65536, 0);
 
-    // Routes merge independently: saveSubGraphToFile already split every flush by the
-    // relations_* route, and the route is a function of (id1, id2), so no pair spans two of
-    // them. Each route therefore produces its own relations_{r}.bin with no coordination.
+    // Units merge independently: saveSubGraphToFile already split every flush by
+    // (relations_* route, shard), and both are functions of the ids alone, so no pair spans
+    // two units. Sharding exists because the routing rule funnels ~88% of all edges into the
+    // cross bucket, which would otherwise cap the whole parallel merge at ~1.13x.
     const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
-    const size_t concurrentMergers = std::min(static_cast<size_t>(par.threads), routeCnt);
+    std::vector<std::pair<size_t, size_t>> units; // (route, shard)
+    for (size_t r = 0; r < routeCnt; ++r) {
+        const size_t shardCnt = shardsForRoute(r, par.threads);
+        for (size_t s = 0; s < shardCnt; ++s) {
+            units.emplace_back(r, s);
+        }
+    }
+    const size_t unitCnt = units.size();
+    const size_t concurrentMergers = std::min(static_cast<size_t>(par.threads), unitCnt);
     const size_t maxFanIn = getMergeFanIn(par.threads, concurrentMergers);
     const size_t mergeBufElems = getMergeBufferElems(std::min(this->numOfGraph, maxFanIn),
                                                      par.ramUsage, concurrentMergers);
-    const size_t streamsPerRoute = std::min(this->numOfGraph, maxFanIn);
+    const size_t streamsPerUnit = std::min(this->numOfGraph, maxFanIn);
 
-    cout << "Merge: " << routeCnt << " routes x " << this->numOfGraph << " subgraphs, "
-         << concurrentMergers << " concurrent (fd soft limit " << getOpenFileLimit()
+    // A shard writes to a temp; the cross bucket's shards are concatenated afterwards.
+    // Concatenation is legal because the relations_* consumers scan the file end to end and
+    // never depend on ordering.
+    auto unitOutPath = [&](size_t route, size_t shard) {
+        return (shardsForRoute(route, par.threads) == 1)
+             ? (outDir + "/relations_" + to_string(route) + ".bin")
+             : (outDir + "/relations_" + to_string(route) + "_s" + to_string(shard) + ".tmp");
+    };
+
+    cout << "Merge: " << unitCnt << " units (" << routeCnt << " routes, cross bucket sharded x"
+         << shardsForRoute(static_cast<size_t>(par.threads), par.threads) << ") x "
+         << this->numOfGraph << " subgraphs, " << concurrentMergers
+         << " concurrent (fd soft limit " << getOpenFileLimit()
          << ", fan-in " << maxFanIn << ")" << endl;
-    cout << "Merge read buffers: " << streamsPerRoute << " streams x " << mergeBufElems
-         << " Relations per route, "
-         << humanBytes(static_cast<uint64_t>(streamsPerRoute) * mergeBufElems
+    cout << "Merge read buffers: " << streamsPerUnit << " streams x " << mergeBufElems
+         << " Relations per unit, "
+         << humanBytes(static_cast<uint64_t>(streamsPerUnit) * mergeBufElems
                        * sizeof(Relation) * concurrentMergers)
          << " total" << endl;
     if (this->numOfGraph > maxFanIn) {
-        cout << "Folding each route's " << this->numOfGraph << " subgraphs down to <= "
+        cout << "Folding each unit's " << this->numOfGraph << " subgraphs down to <= "
              << maxFanIn << endl;
     }
     if (mergeBufElems == MERGE_BUFFER_MIN_ELEMS) {
@@ -1078,47 +1140,90 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
              << "-element floor. Merging will be I/O bound." << endl;
     }
 
-    // Each route deletes its own inputs as it finishes, so total subgraph bytes are measured
+    // Each unit deletes its own inputs as it finishes, so total subgraph bytes are measured
     // up front to keep the [disk] report the single-pass merge used to print.
     uint64_t subGraphBytes = 0;
     for (size_t i = 0; i < this->numOfGraph; ++i) {
-        for (size_t r = 0; r < routeCnt; ++r) {
+        for (size_t u = 0; u < unitCnt; ++u) {
             struct stat st;
-            const string name = outDir + "/subGraph_" + to_string(i) + "_" + to_string(r);
+            const string name = outDir + "/subGraph_" + to_string(i) + "_"
+                              + to_string(units[u].first) + "_" + to_string(units[u].second);
             if (stat(name.c_str(), &st) == 0) {
                 subGraphBytes += static_cast<uint64_t>(st.st_size);
             }
         }
     }
 
-    std::vector<std::vector<uint64_t>> routeHist(routeCnt);
-    std::vector<size_t> routeMerged(routeCnt, 0);
-    std::vector<size_t> routeCeiling(routeCnt, 0);
-    std::vector<double> routeSeconds(routeCnt, 0.0);
+    std::vector<std::vector<uint64_t>> unitHist(unitCnt);
+    std::vector<size_t> unitMerged(unitCnt, 0);
+    std::vector<size_t> unitCeiling(unitCnt, 0);
+    std::vector<double> unitSeconds(unitCnt, 0.0);
 
-    // schedule(dynamic): routes carry very different loads -- the cross bucket in particular
-    // collects every edge whose ids fall in different partitions.
+    // schedule(dynamic): units still carry different loads even after sharding.
     #pragma omp parallel for schedule(dynamic) num_threads(concurrentMergers)
-    for (size_t r = 0; r < routeCnt; ++r) {
-        const time_t routeStart = time(nullptr);
-        mergeRoute(r, mergeBufElems, maxFanIn, routeHist[r], routeMerged[r], routeCeiling[r]);
-        routeSeconds[r] = double(time(nullptr) - routeStart);
+    for (size_t u = 0; u < unitCnt; ++u) {
+        const time_t unitStart = time(nullptr);
+        mergeUnit(units[u].first, units[u].second, unitOutPath(units[u].first, units[u].second),
+                  mergeBufElems, maxFanIn, unitHist[u], unitMerged[u], unitCeiling[u]);
+        unitSeconds[u] = double(time(nullptr) - unitStart);
+    }
+
+    // Fold the cross bucket's shard temps into its relations_*.bin.
+    {
+        const size_t crossRoute = static_cast<size_t>(par.threads);
+        const size_t crossShards = shardsForRoute(crossRoute, par.threads);
+        if (crossShards > 1) {
+            const string finalPath = outDir + "/relations_" + to_string(crossRoute) + ".bin";
+            ofstream dst(finalPath, std::ios::binary);
+            if (!dst.is_open()) {
+                cerr << "Error opening file: " << finalPath << endl;
+            } else {
+                for (size_t s = 0; s < crossShards; ++s) {
+                    const string part = unitOutPath(crossRoute, s);
+                    ifstream in(part, std::ios::binary);
+                    // Streaming an empty rdbuf sets failbit on the destination, so guard it.
+                    if (in.is_open() && in.peek() != std::ifstream::traits_type::eof()) {
+                        dst << in.rdbuf();
+                    }
+                }
+                dst.close();
+                for (size_t s = 0; s < crossShards; ++s) {
+                    std::remove(unitOutPath(crossRoute, s).c_str());
+                }
+            }
+        }
     }
 
     size_t ceilingEdgeCnt = 0; // edges whose merged weight sits at the uint16 ceiling
     size_t mergedEdgeCnt = 0;  // distinct (id1,id2) pairs after merging
-    size_t slowestRoute = 0;
-    for (size_t r = 0; r < routeCnt; ++r) {
-        mergedEdgeCnt += routeMerged[r];
-        ceilingEdgeCnt += routeCeiling[r];
+    size_t heaviest = 0;
+    for (size_t u = 0; u < unitCnt; ++u) {
+        mergedEdgeCnt += unitMerged[u];
+        ceilingEdgeCnt += unitCeiling[u];
         for (size_t w = 0; w < edgeWeightHist.size(); ++w) {
-            edgeWeightHist[w] += routeHist[r][w];
+            edgeWeightHist[w] += unitHist[u][w];
         }
-        if (routeSeconds[r] > routeSeconds[slowestRoute]) { slowestRoute = r; }
+        if (unitMerged[u] > unitMerged[heaviest]) { heaviest = u; }
     }
-    cout << "[edges] slowest route " << slowestRoute << ": " << routeSeconds[slowestRoute]
-         << " s, " << routeMerged[slowestRoute] << " edges" << endl;
-    cout << "[disk] subGraph: " << (this->numOfGraph * routeCnt) << " files, "
+
+    // Report the load split by EDGE COUNT, not just by time. On small inputs every unit
+    // reports 0 s, which is how a 88%-of-everything unit stayed invisible before.
+    {
+        std::vector<size_t> order(unitCnt);
+        for (size_t u = 0; u < unitCnt; ++u) { order[u] = u; }
+        std::sort(order.begin(), order.end(),
+                  [&](size_t a, size_t b) { return unitMerged[a] > unitMerged[b]; });
+        cout << "[edges] unit load (top 3 of " << unitCnt << "), max share "
+             << (mergedEdgeCnt ? 100.0 * static_cast<double>(unitMerged[heaviest])
+                                     / static_cast<double>(mergedEdgeCnt) : 0.0)
+             << "%:" << endl;
+        for (size_t i = 0; i < order.size() && i < 3; ++i) {
+            const size_t u = order[i];
+            cout << "[edges]   route " << units[u].first << " shard " << units[u].second
+                 << ": " << unitMerged[u] << " edges, " << unitSeconds[u] << " s" << endl;
+        }
+    }
+    cout << "[disk] subGraph: " << (this->numOfGraph * unitCnt) << " files, "
          << humanBytes(subGraphBytes) << " freed" << endl;
 
     cout << "[edges] merged into " << mergedEdgeCnt << " distinct edges ("
@@ -1145,10 +1250,17 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     // whole is segmented by route -- this dump exists for weight-histogram analysis, which
     // does not depend on global ordering. The merge itself stays a linear scan.
     const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
+    std::vector<std::pair<size_t, size_t>> units; // (route, shard)
+    for (size_t r = 0; r < routeCnt; ++r) {
+        const size_t shardCnt = shardsForRoute(r, par.threads);
+        for (size_t s = 0; s < shardCnt; ++s) {
+            units.emplace_back(r, s);
+        }
+    }
     const size_t maxFanIn = getMergeFanIn(par.threads, 1);
     const size_t mergeBufElems = getMergeBufferElems(std::min(this->numOfGraph, maxFanIn),
                                                      par.ramUsage, 1);
-    cout << "Merge: " << routeCnt << " routes x " << this->numOfGraph
+    cout << "Merge: " << units.size() << " units x " << this->numOfGraph
          << " subgraphs, sequential (fd soft limit " << getOpenFileLimit()
          << ", fan-in " << maxFanIn << ")" << endl;
 
@@ -1156,13 +1268,16 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
 
     size_t ceilingEdgeCnt = 0; // edges whose merged weight sits at the uint16 ceiling
 
-    for (size_t route = 0; route < routeCnt; ++route) {
+    for (size_t u = 0; u < units.size(); ++u) {
+        const size_t route = units[u].first;
+        const size_t shard = units[u].second;
         std::vector<std::string> subGraphFiles;
         subGraphFiles.reserve(this->numOfGraph);
         for (size_t i = 0; i < this->numOfGraph; ++i) {
-            subGraphFiles.push_back(outDir + "/subGraph_" + to_string(i) + "_" + to_string(route));
+            subGraphFiles.push_back(outDir + "/subGraph_" + to_string(i) + "_"
+                                    + to_string(route) + "_" + to_string(shard));
         }
-        reduceSubGraphFanIn(subGraphFiles, maxFanIn, route);
+        reduceSubGraphFanIn(subGraphFiles, maxFanIn, route, shard);
 
         const size_t streamCnt = subGraphFiles.size();
         std::vector<ReadBuffer<Relation> *> relationBuffers(streamCnt);

@@ -215,6 +215,25 @@ inline size_t routeOf(uint32_t id1, uint32_t id2, int numThreads, size_t rangeSi
     return static_cast<size_t>(numThreads);
 }
 
+// How many shards a route is split into for merging. Only the cross bucket needs it: the
+// routing rule sends ~88% of all edges there (measured), so merging it as one unit caps the
+// whole parallel merge at ~1.13x no matter how many threads are available.
+inline size_t shardsForRoute(size_t route, int numThreads) {
+    if (numThreads < 1) {
+        return 1;
+    }
+    return (route == static_cast<size_t>(numThreads)) ? static_cast<size_t>(numThreads) : 1;
+}
+
+// Which shard of its route an edge belongs to. Keyed on id1 ALONE -- keying on anything
+// derived from both ids would let one pair land in two shards and split its weight.
+inline size_t shardOf(uint32_t id1, size_t shardCnt) {
+    if (shardCnt <= 1) {
+        return 0;
+    }
+    return static_cast<size_t>(id1 % static_cast<uint32_t>(shardCnt));
+}
+
 // Soft cap on how many files this process may hold open.
 inline size_t getOpenFileLimit() {
     struct rlimit lim;
@@ -295,6 +314,12 @@ protected:
     bool boundariesInitialized = false;
     bool useOnlyTrueRelations = false; // for debug
 
+    // Filter-surviving k-mers, accumulated across splits. Divided by the read count it gives
+    // k-mers per read, which is the scale the Phase 1 edge-weight threshold is expressed in:
+    // an edge weight is the number of k-mers two reads share, so weight/kmersPerRead is the
+    // fraction of a read the two overlap by.
+    size_t totalFilteredKmers = 0;
+
 public:
     GroupGenerator(LocalParameters & par);
 
@@ -334,14 +359,16 @@ public:
 
     // Reduce `files` to at most maxFanIn entries by merging in rounds, deleting each batch's
     // inputs as soon as it is folded so peak disk grows by one batch rather than a full copy.
-    // `route` only names the intermediates: routes fold concurrently, so a shared name would
-    // let two of them write the same file and silently mix their edges.
-    void reduceSubGraphFanIn(std::vector<std::string>& files, size_t maxFanIn, size_t route);
+    // `route`/`shard` only name the intermediates: units fold concurrently, so a shared name
+    // would let two of them write the same file and silently mix their edges.
+    void reduceSubGraphFanIn(std::vector<std::string>& files, size_t maxFanIn,
+                             size_t route, size_t shard);
 
-    // Merge every subgraph belonging to one route into relations_{route}.bin. Purely
-    // sequential -- mergeGraph runs these concurrently, one route per thread.
-    void mergeRoute(size_t route, size_t bufElems, size_t maxFanIn,
-                    std::vector<uint64_t>& histOut, size_t& mergedOut, size_t& ceilingOut);
+    // Merge every subgraph belonging to one (route, shard) unit into `outPath`. Purely
+    // sequential -- mergeGraph runs these concurrently, one unit per thread.
+    void mergeUnit(size_t route, size_t shard, const std::string& outPath,
+                   size_t bufElems, size_t maxFanIn,
+                   std::vector<uint64_t>& histOut, size_t& mergedOut, size_t& ceilingOut);
 
     static int otsuThreshold(const std::vector<uint64_t>& hist);
 

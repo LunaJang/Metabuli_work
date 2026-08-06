@@ -246,6 +246,16 @@ LocalParameters::LocalParameters() :
                 typeid(int),
                 (void *) &maxKmerReads,
                 "^[0-9]+$"),
+        MIN_OVERLAP_RATIO(MIN_OVERLAP_RATIO_ID,
+                "--min-overlap-ratio",
+                "Phase 1 core threshold as a fraction of k-mers per read (0=use --core-edge)",
+                "Phase 1 core threshold as a fraction of k-mers per read (0=use --core-edge). "
+                "An edge weight is the number of k-mers two reads share, so this is the minimum "
+                "overlap two reads must have to be grouped. Unlike knee detection it does not "
+                "depend on the shape of the weight distribution, so it transfers across datasets.",
+                typeid(float),
+                (void *) &minOverlapRatio,
+                "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         TARGET_TAX_ID(TARGET_TAX_ID_ID,
                "--tax-id",
                "Tax. ID of clade to be extracted",
@@ -625,6 +635,7 @@ LocalParameters::LocalParameters() :
     groupingIter = 15;
     maxKmerFreqRatio = 0.0f;
     maxKmerReads = 0;
+    minOverlapRatio = 0.0f;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
@@ -740,6 +751,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&NEIGHBOR_KMERS);
     groupGeneration.push_back(&MAX_KMER_FREQ_RATIO);
     groupGeneration.push_back(&MAX_KMER_READS);
+    groupGeneration.push_back(&MIN_OVERLAP_RATIO);
     groupGeneration.push_back(&NUM_ITERATION);
     groupGeneration.push_back(&CONVERGENCE_THRESHOLD);
     groupGeneration.push_back(&PRINT_LOG);

@@ -5,7 +5,11 @@
 #include "common.h"
 
 void setGroupGenerationDefaults(LocalParameters & par){    
-    par.neighborKmers = 0;
+    // Drops k-mers adjacent to a common-k-mer hit, not just the hit itself. On the fixture
+    // this removes 17% of k-mers but only 0.7% of edges -- it lowers weights rather than
+    // deleting pairs, so it is not a disk-volume lever. --min-overlap-ratio scales with the
+    // surviving k-mer count and absorbs the shift; a fixed threshold would not.
+    par.neighborKmers = 1;
     par.groupingIter = 10;
     par.minEdgeWeight = 10;
     par.convergenceThreshold = 0.01f;
@@ -16,6 +20,10 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // off by default and kept only as a secondary net.
     par.maxKmerFreqRatio = 0.0f;
     par.maxKmerReads = 1000; // provisional; C(1000,2) = 499,500 edges per k-mer
+
+    // Phase 1 core threshold as a fraction of k-mers per read. Provisional: on the fixture
+    // 0.4 lands near where knee detection used to. Pending gradeGroup measurement.
+    par.minOverlapRatio = 0.4f;
     par.syncmer = 1;
     par.smerLen = 5;
     par.seqMode = 2;    
