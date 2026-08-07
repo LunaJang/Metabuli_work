@@ -209,6 +209,12 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         // Phase 1: form core groups with strong edges
         makeGroups(effectiveCoreEdge, processedReadCnt, groupInfo, queryGroupInfo);
 
+        // Phase 1.5: merge units connected by several independent weak edges
+        if (par.minSupport > 0 && effectiveCoreEdge > par.minEdgeWeight) {
+            mergeBySupport(effectiveCoreEdge, par.minEdgeWeight, par.minSupport,
+                           processedReadCnt, groupInfo, queryGroupInfo);
+        }
+
         // Phase 2: link Phase-1 singletons among themselves with weak edges
         if (effectiveCoreEdge > par.minEdgeWeight) {
             std::vector<bool> isSingleton(processedReadCnt + 1, false);
@@ -1554,6 +1560,142 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
     cout << "Query groups created successfully: " << groupInfo.size() << " groups." << endl;
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
+}
+
+// Phase 1.5 -- see the declaration in GroupGenerator.h for the rationale.
+//
+// A "unit" is a Phase-1 core group (labelled by its minimum read id) or, for a read that Phase 1
+// left alone, the read itself. Group ids are read ids of grouped reads, so a singleton's own id can
+// never collide with a group id. Weak edges are those in (weakThr, coreThr] -- above Phase 2's
+// floor, below the core threshold. Support is counted per unit pair; pairs reaching minSupport are
+// merged. Pairs where both sides are singletons are skipped: distinct edges are merged upstream, so
+// two reads share exactly one edge and can never reach a support of 2. That also keeps the counting
+// map bounded to pairs involving at least one multi-read group.
+void GroupGenerator::mergeBySupport(int coreThr,
+                                   int weakThr,
+                                   int minSupport,
+                                   size_t processedReadCnt,
+                                   unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
+                                   vector<uint32_t> &queryGroupInfo) {
+    cout << "Phase 1.5: merging units with >= " << minSupport
+         << " weak links (weight in (" << weakThr << ", " << coreThr << "])..." << endl;
+    time_t t0 = time(nullptr);
+
+    const size_t groupsBefore = groupInfo.size();
+
+    // unit[i]: Phase-1 group id, or the read's own id when Phase 1 left it alone.
+    std::vector<uint32_t> unit(processedReadCnt + 1, 0);
+    for (uint32_t i = 1; i <= processedReadCnt; ++i) {
+        unit[i] = queryGroupInfo[i] ? queryGroupInfo[i] : i;
+    }
+
+    // Counting map memory guard. Entries are ~24 B in unordered_map, so the cap below is a few GB.
+    // On overflow, existing keys keep accumulating and new ones are dropped -- support can then only
+    // be under-counted, never over-counted, so a merge is never invented. The count is reported.
+    const size_t SUPPORT_PAIR_CAP = 200000000;
+    const size_t perThreadCap = std::max<size_t>(1, SUPPORT_PAIR_CAP / std::max(1, par.threads));
+
+    std::unordered_map<uint64_t, uint32_t> support;
+    size_t weakEdgeCnt = 0, droppedPairs = 0;
+
+    auto packPair = [](uint32_t a, uint32_t b) -> uint64_t {
+        return (a < b) ? ((uint64_t)a << 32 | b) : ((uint64_t)b << 32 | a);
+    };
+
+    auto countFile = [&](const std::string& fname,
+                         std::unordered_map<uint64_t, uint32_t>& local,
+                         size_t cap, size_t& weakCnt, size_t& dropped) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            const uint32_t id1 = r.id1, id2 = r.id2;
+            if (id1 == 0 || id2 == 0) continue;
+            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+            const int w = static_cast<int>(r.weight);
+            if (w <= weakThr || w > coreThr) continue;
+            if (queryGroupInfo[id1] == 0 && queryGroupInfo[id2] == 0) continue;
+            const uint32_t u = unit[id1], v = unit[id2];
+            if (u == v) continue;
+            weakCnt++;
+            const uint64_t key = packPair(u, v);
+            auto it = local.find(key);
+            if (it != local.end()) {
+                it->second++;
+            } else if (local.size() < cap) {
+                local.emplace(key, 1u);
+            } else {
+                dropped++;
+            }
+        }
+    };
+
+    #pragma omp parallel num_threads(par.threads)
+    {
+        const int threadIdx = omp_get_thread_num();
+        std::unordered_map<uint64_t, uint32_t> local;
+        size_t localWeak = 0, localDropped = 0;
+
+        countFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin",
+                  local, perThreadCap, localWeak, localDropped);
+        countFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin",
+                  local, perThreadCap, localWeak, localDropped);
+
+        #pragma omp critical
+        {
+            for (const auto& kv : local) support[kv.first] += kv.second;
+            weakEdgeCnt += localWeak;
+            droppedPairs += localDropped;
+        }
+    }
+    countFile(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin",
+              support, SUPPORT_PAIR_CAP, weakEdgeCnt, droppedPairs);
+
+    // Merge: start from the Phase-1 components, then add the supported pairs.
+    DisjointSet ds(processedReadCnt);
+    for (uint32_t i = 1; i <= processedReadCnt; ++i) {
+        if (queryGroupInfo[i] != 0 && queryGroupInfo[i] != i) {
+            ds.unionSets(i, queryGroupInfo[i]);
+        }
+    }
+    size_t mergedPairs = 0;
+    for (const auto& kv : support) {
+        if (kv.second < static_cast<uint32_t>(minSupport)) continue;
+        const uint32_t u = static_cast<uint32_t>(kv.first >> 32);
+        const uint32_t v = static_cast<uint32_t>(kv.first & 0xFFFFFFFFull);
+        ds.unionSets(u, v);
+        mergedPairs++;
+    }
+
+    // A Phase-1 group of exactly one read (its own label) never entered the disjoint set above, so
+    // re-mark those reads as grouped to keep them out of Phase 2's singleton pass.
+    for (uint32_t i = 1; i <= processedReadCnt; ++i) {
+        if (queryGroupInfo[i] != 0) ds.grouped[i] = true;
+    }
+
+    // Relabel every component by its minimum read id, as Phase 1 does.
+    groupInfo.clear();
+    std::fill(queryGroupInfo.begin(), queryGroupInfo.end(), 0u);
+    std::unordered_map<uint32_t, uint32_t> rootToMin;
+    for (uint32_t i = 1; i < ds.parent.size(); ++i) {
+        if (!ds.grouped[i]) continue;
+        const uint32_t root = ds.find(i);
+        auto it = rootToMin.find(root);
+        if (it == rootToMin.end() || i < it->second) rootToMin[root] = i;
+    }
+    for (uint32_t i = 1; i < ds.parent.size(); ++i) {
+        if (!ds.grouped[i]) continue;
+        const uint32_t groupId = rootToMin[ds.find(i)];
+        groupInfo[groupId].insert(i);
+        queryGroupInfo[i] = groupId;
+    }
+
+    cout << "Phase 1.5: " << weakEdgeCnt << " weak edges over " << support.size()
+         << " unit pairs, " << mergedPairs << " pairs reached support " << minSupport
+         << "; groups " << groupsBefore << " -> " << groupInfo.size();
+    if (droppedPairs) {
+        cout << " [pair cap hit, " << droppedPairs << " observations dropped -- support undercounted]";
+    }
+    cout << endl;
+    cout << "Phase 1.5 done: " << double(time(nullptr) - t0) << " s" << endl;
 }
 
 void GroupGenerator::makeGroupsPhase2(

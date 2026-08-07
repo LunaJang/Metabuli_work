@@ -301,6 +301,16 @@ LocalParameters::LocalParameters() :
                    typeid(float),
                    (void *) &kneeScale,
                    "^[0-9]*\\.?[0-9]+$"),
+        MIN_SUPPORT(MIN_SUPPORT_ID,
+                    "--min-support",
+                    "Weak links needed to merge two core groups (Phase 1.5)",
+                    "Number of independent weak edges required before two Phase-1 units are merged "
+                    "(Phase 1.5). A weak edge carries too few shared k-mers to trust on its own, but "
+                    "several independent ones between the same pair of units do not arise by chance. "
+                    "0 disables Phase 1.5.",
+                    typeid(int),
+                    (void *) &minSupport,
+                    "^[0-9]+$"),
         MIN_VOTE_SCORE(MIN_VOTE_SCORE_ID,
                     "--min-vote-score",
                     "Min. classification score to vote.",
@@ -636,6 +646,7 @@ LocalParameters::LocalParameters() :
     maxKmerFreqRatio = 0.0f;
     maxKmerReads = 0;
     minOverlapRatio = 0.0f;
+    minSupport = 0;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
@@ -752,6 +763,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MAX_KMER_FREQ_RATIO);
     groupGeneration.push_back(&MAX_KMER_READS);
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);
+    groupGeneration.push_back(&MIN_SUPPORT);
     groupGeneration.push_back(&NUM_ITERATION);
     groupGeneration.push_back(&CONVERGENCE_THRESHOLD);
     groupGeneration.push_back(&PRINT_LOG);

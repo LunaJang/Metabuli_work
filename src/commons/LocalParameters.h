@@ -103,6 +103,7 @@ public:
     PARAMETER(MAX_KMER_FREQ_RATIO)
     PARAMETER(MAX_KMER_READS)
     PARAMETER(MIN_OVERLAP_RATIO)
+    PARAMETER(MIN_SUPPORT)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
     PARAMETER(READID_COL)
@@ -206,6 +207,7 @@ public:
     float maxKmerFreqRatio;
     int maxKmerReads;
     float minOverlapRatio;
+    int minSupport;
 
     // Group application
     int scoreCol;

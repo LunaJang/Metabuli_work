@@ -405,6 +405,19 @@ public:
                     size_t processedReadCnt,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                     vector<uint32_t> &queryGroupInfo);
+    // Phase 1.5: merge Phase-1 units that are joined by several independent weak edges.
+    // A single weak edge (few shared k-mers) is indistinguishable from chance sharing across
+    // repeats or conserved regions; several between the same pair of units are not. Counting
+    // support at the unit level -- rather than testing node-level triangles -- is what makes
+    // this affordable: two singletons can only ever have one edge between them, so every pair
+    // worth counting involves at least one multi-read core group.
+    void mergeBySupport(int coreThr,
+                        int weakThr,
+                        int minSupport,
+                        size_t processedReadCnt,
+                        std::unordered_map<uint32_t, std::unordered_set<uint32_t>> &groupInfo,
+                        std::vector<uint32_t> &queryGroupInfo);
+
 
     void makeGroupsPhase2(int groupKmerThr,
                           size_t processedReadCnt,
