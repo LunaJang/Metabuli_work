@@ -95,11 +95,9 @@ public:
     
     // Group generation
     PARAMETER(NEIGHBOR_KMERS)
-    PARAMETER(NUM_ITERATION)
     PARAMETER(MIN_EDGE_WEIGHT)
     PARAMETER(CORE_EDGE_WEIGHT)
     PARAMETER(KNEE_SCALE)
-    PARAMETER(CONVERGENCE_THRESHOLD)
     PARAMETER(MAX_KMER_FREQ_RATIO)
     PARAMETER(MAX_KMER_READS)
     PARAMETER(MIN_OVERLAP_RATIO)
@@ -202,8 +200,6 @@ public:
     int coreEdgeWeight;
     float kneeScale;
     int neighborKmers;
-    int groupingIter;
-    float convergenceThreshold;
     float maxKmerFreqRatio;
     int maxKmerReads;
     float minOverlapRatio;

@@ -215,20 +215,6 @@ LocalParameters::LocalParameters() :
                 typeid(int),
                 (void *) &neighborKmers,
                 "[0-4]"),
-        NUM_ITERATION(NUM_ITERATION_ID,
-                "--num-iteration",
-                "Number of iterations for grouping",
-                "Number of iterations for grouping",
-                typeid(int),
-                (void *) &groupingIter,
-                "^(0|[1-9]|1[0-5])$"),
-        CONVERGENCE_THRESHOLD(CONVERGENCE_THRESHOLD_ID,
-                "--convergence-thr",
-                "Convergence threshold for adaptive grouping",
-                "Stop adaptive grouping when membership change ratio falls below this value (0.0-1.0)",
-                typeid(float),
-                (void *) &convergenceThreshold,
-                "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         MAX_KMER_FREQ_RATIO(MAX_KMER_FREQ_RATIO_ID,
                 "--max-kmer-freq-ratio",
                 "Skip k-mers shared by more than this fraction of reads (0.0=disabled)",
@@ -645,8 +631,6 @@ LocalParameters::LocalParameters() :
     minEdgeWeight = 5;
     coreEdgeWeight = 10;
     kneeScale = 1.0f;
-    convergenceThreshold = 0.001;
-    groupingIter = 15;
     maxKmerFreqRatio = 0.0f;
     maxKmerReads = 0;
     minOverlapRatio = 0.3f;
@@ -757,7 +741,6 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MATCH_PER_KMER);  
     groupGeneration.push_back(&PARAM_MASK_RESIDUES);
     groupGeneration.push_back(&PARAM_MASK_PROBABILTY);
-    groupGeneration.push_back(&VALIDATE_INPUT);
     groupGeneration.push_back(&SYNCMER);
     groupGeneration.push_back(&SMER_LEN);
     groupGeneration.push_back(&MIN_EDGE_WEIGHT);
@@ -768,8 +751,6 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MAX_KMER_READS);
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);
     groupGeneration.push_back(&MIN_SUPPORT);
-    groupGeneration.push_back(&NUM_ITERATION);
-    groupGeneration.push_back(&CONVERGENCE_THRESHOLD);
     groupGeneration.push_back(&PRINT_LOG);
 
     //groupApplication

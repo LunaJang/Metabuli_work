@@ -119,11 +119,6 @@ public:
     }
 };
 
-static inline bool keepEdgeGeo(uint16_t w, uint16_t tu, uint16_t tv) {
-    // w >= sqrt(tu*tv)  <=>  w*w >= tu*tv
-    return (uint64_t)w * (uint64_t)w >= (uint64_t)tu * (uint64_t)tv;
-}
-
 // Saturating accumulation into a uint16 edge weight: clamps at UINT16_MAX
 // instead of wrapping. Relation::weight is uint16_t, so both the per-subgraph
 // count and the cross-subgraph sum can exceed 65535; a wrapped weight would
@@ -383,24 +378,10 @@ public:
                    size_t bufElems, size_t maxFanIn,
                    std::vector<uint64_t>& histOut, size_t& mergedOut, size_t& ceilingOut);
 
-    static int otsuThreshold(const std::vector<uint64_t>& hist);
-
     static int kneeThreshold(const std::vector<uint64_t>& hist, int minWeight);
 
     void mergeGraph_one(size_t processedReadCnt);
     
-    void computeNodeDegree(int groupKmerThr, 
-                           size_t processedReadCnt, 
-                           std::vector<uint32_t>& degree);
-                           
-    void computeGroupQuarterDegree(const std::vector<uint32_t>& queryGroupInfo,
-                                  const std::vector<uint32_t>& degree,
-                                  std::unordered_map<uint32_t, uint32_t>& groupQuarterDeg);
-    
-    void makeGroupsAdaptive(const vector<uint16_t>& nodeThr,
-                            size_t processedReadCnt,
-                            vector<uint32_t>& queryGroupInfo);         
-
     void makeGroups(int groupKmerThr,
                     size_t processedReadCnt,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
@@ -428,12 +409,6 @@ public:
     void saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                           const vector<uint32_t>& queryGroupInfo);
     
-    uint16_t degreeToThr(uint32_t quarterDegree) const {
-        float predCoverage = quarterDegree * 0.5f;
-        float thr = predCoverage * 3.5f;
-        return static_cast<uint16_t>(std::max(1.0f, std::min(thr, 150.0f))); 
-    }
-
 };
 
 

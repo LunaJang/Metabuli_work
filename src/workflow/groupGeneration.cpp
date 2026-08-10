@@ -10,13 +10,11 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // deleting pairs, so it is not a disk-volume lever. --min-overlap-ratio scales with the
     // surviving k-mer count and absorbs the shift; a fixed threshold would not.
     par.neighborKmers = 1;
-    par.groupingIter = 10;
     // Phase 2 floor. Sweeping it over 10/5/1 on the species-inclusion benchmark left the useful
     // signal identical (reads landing in their species' dominant group: 0.08602/0.08602/0.08607);
     // it only trades coverage against concentration. 5 is picked for the query reduction it buys
     // (4.1x vs 3.2x at 10) without the purity loss seen at 1.
     par.minEdgeWeight = 5;
-    par.convergenceThreshold = 0.01f;
     // Absolute cap is the primary brake on Sum C(m,2): it bounds a single k-mer's edge
     // contribution regardless of read count. The ratio threshold scales with the dataset
     // (readCnt * ratio), so one value cannot fit both a 5k-read and a 62M-read run --
