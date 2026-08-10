@@ -236,6 +236,26 @@ LocalParameters::LocalParameters() :
                 typeid(float),
                 (void *) &maxKmerFreqRatio,
                 "^0(\\.[0-9]+)?|1(\\.0+)?$"),
+        MAX_KMER_READS(MAX_KMER_READS_ID,
+                "--max-kmer-reads",
+                "Skip k-mers shared by more than this many reads (0=disabled)",
+                "Skip k-mers shared by more than this many reads (0=disabled). "
+                "Absolute cap, so it bounds the C(m,2) edges a single k-mer can emit "
+                "regardless of dataset size. Unlike --max-kmer-freq-ratio, whose threshold "
+                "scales with the read count.",
+                typeid(int),
+                (void *) &maxKmerReads,
+                "^[0-9]+$"),
+        MIN_OVERLAP_RATIO(MIN_OVERLAP_RATIO_ID,
+                "--min-overlap-ratio",
+                "Phase 1 core threshold as a fraction of k-mers per read (0=use --core-edge)",
+                "Phase 1 core threshold as a fraction of k-mers per read (0=use --core-edge). "
+                "An edge weight is the number of k-mers two reads share, so this is the minimum "
+                "overlap two reads must have to be grouped. Unlike knee detection it does not "
+                "depend on the shape of the weight distribution, so it transfers across datasets.",
+                typeid(float),
+                (void *) &minOverlapRatio,
+                "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         TARGET_TAX_ID(TARGET_TAX_ID_ID,
                "--tax-id",
                "Tax. ID of clade to be extracted",
@@ -281,6 +301,16 @@ LocalParameters::LocalParameters() :
                    typeid(float),
                    (void *) &kneeScale,
                    "^[0-9]*\\.?[0-9]+$"),
+        MIN_SUPPORT(MIN_SUPPORT_ID,
+                    "--min-support",
+                    "Weak links needed to merge two core groups (Phase 1.5)",
+                    "Number of independent weak edges required before two Phase-1 units are merged "
+                    "(Phase 1.5). A weak edge carries too few shared k-mers to trust on its own, but "
+                    "several independent ones between the same pair of units do not arise by chance. "
+                    "0 disables Phase 1.5.",
+                    typeid(int),
+                    (void *) &minSupport,
+                    "^[0-9]+$"),
         MIN_VOTE_SCORE(MIN_VOTE_SCORE_ID,
                     "--min-vote-score",
                     "Min. classification score to vote.",
@@ -613,6 +643,10 @@ LocalParameters::LocalParameters() :
     kneeScale = 1.0f;
     convergenceThreshold = 0.001;
     groupingIter = 15;
+    maxKmerFreqRatio = 0.0f;
+    maxKmerReads = 0;
+    minOverlapRatio = 0.0f;
+    minSupport = 0;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
@@ -727,6 +761,9 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&KNEE_SCALE);
     groupGeneration.push_back(&NEIGHBOR_KMERS);
     groupGeneration.push_back(&MAX_KMER_FREQ_RATIO);
+    groupGeneration.push_back(&MAX_KMER_READS);
+    groupGeneration.push_back(&MIN_OVERLAP_RATIO);
+    groupGeneration.push_back(&MIN_SUPPORT);
     groupGeneration.push_back(&NUM_ITERATION);
     groupGeneration.push_back(&CONVERGENCE_THRESHOLD);
     groupGeneration.push_back(&PRINT_LOG);
