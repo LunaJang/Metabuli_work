@@ -307,7 +307,7 @@ LocalParameters::LocalParameters() :
                     "Number of independent weak edges required before two Phase-1 units are merged "
                     "(Phase 1.5). A weak edge carries too few shared k-mers to trust on its own, but "
                     "several independent ones between the same pair of units do not arise by chance. "
-                    "0 disables Phase 1.5.",
+                    "0 disables Phase 1.5, which is on by default.",
                     typeid(int),
                     (void *) &minSupport,
                     "^[0-9]+$"),
@@ -636,17 +636,21 @@ LocalParameters::LocalParameters() :
     rank = "";
     higherRankFile = 0;
 
-    // Group generation
+    // Group generation. The three thresholds below are the operating point picked on the
+    // species-inclusion benchmark (61.7 M reads): overlap ratio 0.3 (core threshold 15 there),
+    // Phase 2 floor 5, Phase 1.5 support 2. Sweeping the Phase 2 floor over 10/5/1 left the
+    // useful signal untouched -- it only trades coverage against concentration -- while support
+    // was the one knob that moved it, and it also flattens the sensitivity to the core threshold.
     neighborKmers = 1;
-    minEdgeWeight = 1;
+    minEdgeWeight = 5;
     coreEdgeWeight = 10;
     kneeScale = 1.0f;
     convergenceThreshold = 0.001;
     groupingIter = 15;
     maxKmerFreqRatio = 0.0f;
     maxKmerReads = 0;
-    minOverlapRatio = 0.0f;
-    minSupport = 0;
+    minOverlapRatio = 0.3f;
+    minSupport = 2;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
