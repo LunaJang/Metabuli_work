@@ -297,6 +297,17 @@ LocalParameters::LocalParameters() :
                     typeid(int),
                     (void *) &minSupport,
                     "^[0-9]+$"),
+        MAX_TMP_DISK(MAX_TMP_DISK_ID,
+                     "--max-tmp-disk",
+                     "Peak disk (MiB) the intermediate files may occupy (0: 80% of free space)",
+                     "Upper bound on how much space the subGraph_* intermediates may hold at once. "
+                     "It is a safety cap, not a performance target: when the data fits under it "
+                     "nothing changes, and only a run that would otherwise fill the filesystem pays "
+                     "for folding early. Results are identical either way. 0 derives the cap from "
+                     "the free space at the output directory when the run starts.",
+                     typeid(int),
+                     (void *) &maxTmpDiskMiB,
+                     "^[0-9]+$"),
         MIN_VOTE_SCORE(MIN_VOTE_SCORE_ID,
                     "--min-vote-score",
                     "Min. classification score to vote.",
@@ -635,6 +646,7 @@ LocalParameters::LocalParameters() :
     maxKmerReads = 0;
     minOverlapRatio = 0.3f;
     minSupport = 2;
+    maxTmpDiskMiB = 0;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
@@ -751,6 +763,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MAX_KMER_READS);
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);
     groupGeneration.push_back(&MIN_SUPPORT);
+    groupGeneration.push_back(&MAX_TMP_DISK);
     groupGeneration.push_back(&PRINT_LOG);
 
     //groupApplication

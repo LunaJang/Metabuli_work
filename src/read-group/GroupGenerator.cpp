@@ -506,6 +506,26 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Flush threshold: " << RELATION_THRESHOLD << " pairs/thread (memory budget "
          << humanBytes(getMemoryBudgetBytes(par.ramUsage)) << ", --max-ram "
          << par.ramUsage << " GiB)" << endl;
+
+    // Disk counterpart of the memory budget above. A safety ceiling, not a target: a run that
+    // fits under it behaves exactly as it does without one.
+    const size_t tmpDiskBudget = getTmpDiskBudgetBytes(outDir, par.maxTmpDiskMiB);
+    if (par.maxTmpDiskMiB > 0) {
+        cout << "Tmp disk budget: " << humanBytes(tmpDiskBudget)
+             << " (--max-tmp-disk " << par.maxTmpDiskMiB << " MiB)" << endl;
+    } else if (tmpDiskBudget == TMP_DISK_UNLIMITED) {
+        cout << "[WARN] could not measure free space at " << outDir
+             << "; running without a tmp disk cap. Pass --max-tmp-disk to set one." << endl;
+    } else {
+        cout << "Tmp disk budget: " << humanBytes(tmpDiskBudget) << " (auto: 80% of "
+             << humanBytes(getFreeDiskBytes(outDir)) << " free at " << outDir << ")" << endl;
+    }
+
+    // Second fold trigger, independent of the budget: the merge can only open so many streams
+    // per unit, so a prefix longer than the fan-in has to be folded regardless of disk. Note
+    // that getMergeFanIn looks at the fd limit and the thread count only -- it knows nothing
+    // about how much data is on disk, which is why the budget above is the primary trigger.
+    const size_t foldFanIn = getMergeFanIn(par.threads, static_cast<size_t>(par.threads));
     std::atomic<int> counter(0);
 
     // High-frequency k-mers are dropped by --max-kmer-freq-ratio. Record which ones so the
@@ -570,7 +590,10 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             DeltaIdxReader* reader = new DeltaIdxReader(diffFile, infoFile, 1024 * 1024, 1024 * 1024);
             deltaIdxReaders.push_back(reader);
             currentKmers.push_back(reader->next());
+            // Denominator of the emit progress used to project the write volume.
+            kmerValuesTotal.fetch_add(reader->getTotalValueNum(), std::memory_order_relaxed);
         }
+        uint64_t localValuesDone = 0;
 
         vector<uint32_t> currentQueryIds;
         currentQueryIds.reserve(1024);
@@ -592,6 +615,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                     if (seqId != UINT32_MAX && seqId <= processedReadCnt) {
                         currentQueryIds.emplace_back(seqId);
                     }
+                    ++localValuesDone;
                     currentKmers[file] = deltaIdxReaders[file]->next();
                     if (deltaIdxReaders[file]->isCompleted()) {
                         currentKmers[file].value = UINT64_MAX;
@@ -643,6 +667,15 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 localEmittedEdges += pair2weight.size();
                 saveSubGraphToFile(pair2weight, counter_now, processedReadCnt);
                 pair2weight.clear();
+                // Publish progress before the guards read it, so the projection matches the
+                // bytes that have just been written.
+                kmerValuesDone.fetch_add(localValuesDone, std::memory_order_relaxed);
+                localValuesDone = 0;
+                checkDiskHeadroom();
+                // Fold what is already complete instead of letting the whole emit pile up.
+                // No barrier: this thread folds only the finished prefix while the others keep
+                // writing indices above it, so the two never touch the same file.
+                maybeFoldEmitted(tmpDiskBudget, foldFanIn);
             }
         }
         if (!pair2weight.empty()) {
@@ -781,9 +814,26 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // Edge-volume summary. maxKeptM is the worst per-k-mer case that survived the skip:
     // that single k-mer contributed C(maxKeptM, 2) edges, so it is the knob to watch when
     // tuning --max-kmer-freq-ratio against a disk budget.
+    const uint64_t rawEdgeBytes = static_cast<uint64_t>(emittedEdgeCnt) * sizeof(Relation);
+    const uint64_t diskEdgeBytes = this->subGraphBytesOnDisk.load(std::memory_order_relaxed);
     cout << "[edges] emitted " << emittedEdgeCnt << " edge records into "
          << this->numOfGraph << " subgraphs ("
-         << humanBytes(static_cast<uint64_t>(emittedEdgeCnt) * sizeof(Relation)) << " before merge)" << endl;
+         << humanBytes(rawEdgeBytes) << " before merge, "
+         << humanBytes(diskEdgeBytes) << " on disk, zstd level " << RELATION_ZSTD_LEVEL;
+    if (diskEdgeBytes > 0) {
+        cout << ", " << fixed << setprecision(2)
+             << (static_cast<double>(rawEdgeBytes) / static_cast<double>(diskEdgeBytes)) << "x";
+    }
+    cout << ")" << endl;
+    // What the run actually held at once, which is the number a shared filesystem cares about.
+    // "0 folds" means the data fit under the budget and nothing was folded early -- the path
+    // this build takes when there is room, identical to the one before incremental folding.
+    cout << "[disk] peak subGraph footprint: "
+         << humanBytes(this->subGraphPeakBytes.load(std::memory_order_relaxed)) << " (budget "
+         << (getTmpDiskBudgetBytes(outDir, par.maxTmpDiskMiB) == TMP_DISK_UNLIMITED
+             ? string("unlimited")
+             : humanBytes(getTmpDiskBudgetBytes(outDir, par.maxTmpDiskMiB)))
+         << ", " << this->foldRounds << " folds)" << endl;
     cout << "[edges] largest kept k-mer: m = " << maxKeptM << " -> "
          << (static_cast<double>(maxKeptM) * static_cast<double>(maxKeptM > 0 ? maxKeptM - 1 : 0) * 0.5)
          << " edges from that k-mer alone" << endl;
@@ -811,37 +861,206 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>&
         const uint32_t id1 = static_cast<uint32_t>(pairKey >> 32);
         const uint32_t id2 = static_cast<uint32_t>(pairKey & 0xFFFFFFFF);
         const size_t route = routeOf(id1, id2, par.threads, rangeSize);
-        byUnit[route][shardOf(id1, byUnit[route].size())].emplace_back(id1, id2, weight);
+        byUnit[route][shardOf(id1, byUnit[route].size())].push_back(makeRelation(id1, id2, weight));
     }
 
     // Empty units still get an empty file: the merge's input list is then simply
     // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
+    uint64_t compressedBytes = 0;
     for (size_t route = 0; route < routeCnt; ++route) {
         for (size_t shard = 0; shard < byUnit[route].size(); ++shard) {
-            const string subGraphFileName = outDir + "/subGraph_" + to_string(counter_now)
-                                          + "_" + to_string(route) + "_" + to_string(shard);
-            FILE * outFile = fopen(subGraphFileName.c_str(), "wb");
-            if (!outFile) {
-                cerr << "Error opening file: " << subGraphFileName << endl;
-                continue;
-            }
+            const string subGraphFileName = subGraphName(counter_now, route, shard);
             std::vector<Relation> & relations = byUnit[route][shard];
             sort(relations.begin(), relations.end(), Relation::compare);
-            fwrite(relations.data(), sizeof(Relation), relations.size(), outFile);
-            fclose(outFile);
+            // A failed write used to be reported and skipped. It is fatal now: the merge would
+            // otherwise read a file that is missing or short and produce a silently wrong graph.
+            RelationWriter out(subGraphFileName);
+            for (size_t i = 0; i < relations.size(); ++i) {
+                out.write(relations[i]);
+            }
+            out.finish();
+            compressedBytes += out.compressedBytes();
         }
     }
+    subGraphBytesOnDisk.fetch_add(compressedBytes, std::memory_order_relaxed);
+    noteSubGraphBytes(static_cast<int64_t>(compressedBytes));
+    // Only now, with every unit file of this flush closed, may the folder see this index.
+    markEmitComplete(counter_now);
+}
+
+void GroupGenerator::noteSubGraphBytes(int64_t delta) {
+    const int64_t live = subGraphLiveBytes.fetch_add(delta, std::memory_order_relaxed) + delta;
+    if (live <= 0) {
+        return;
+    }
+    const uint64_t liveBytes = static_cast<uint64_t>(live);
+    uint64_t peak = subGraphPeakBytes.load(std::memory_order_relaxed);
+    while (liveBytes > peak
+           && !subGraphPeakBytes.compare_exchange_weak(peak, liveBytes,
+                                                       std::memory_order_relaxed)) {
+        // compare_exchange_weak refreshed `peak`; retry until it stops growing.
+    }
+}
+
+void GroupGenerator::checkDiskHeadroom() {
+    const size_t freeBytes = getFreeDiskBytes(outDir);
+    if (freeBytes == 0) {
+        return; // cannot measure; getTmpDiskBudgetBytes already warned about that
+    }
+
+    // Hard guard first. It needs no estimate, so it holds even when the projection is wrong.
+    const size_t reserve = getDiskReserveBytes(outDir);
+    if (freeBytes <= reserve) {
+        cerr << "[ERROR] out of disk space at " << outDir << ": "
+             << humanBytes(freeBytes) << " free, keeping " << humanBytes(reserve)
+             << " in reserve.\n"
+             << "        Intermediates hold " << humanBytes(subGraphBytesOnDisk.load())
+             << " so far. Point the output directory at a larger filesystem, or lower\n"
+             << "        --max-kmer-reads (currently " << par.maxKmerReads
+             << ") to cut the edge volume -- see the [mhist] table for what each cap costs."
+             << endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // Projection. Warn once, do not stop: folding decouples the footprint from the total.
+    if (volumeWarned.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    const uint64_t total = kmerValuesTotal.load(std::memory_order_relaxed);
+    const uint64_t done = kmerValuesDone.load(std::memory_order_relaxed);
+    if (total == 0 || done == 0) {
+        return;
+    }
+    const double progress = static_cast<double>(done) / static_cast<double>(total);
+    if (progress < 0.02 || progress >= 1.0) {
+        return; // too early to extrapolate, or already finished
+    }
+    const double projected = static_cast<double>(subGraphBytesOnDisk.load()) / progress;
+    if (projected <= static_cast<double>(freeBytes)) {
+        return;
+    }
+    int expected = 0;
+    if (!volumeWarned.compare_exchange_strong(expected, 1)) {
+        return; // another thread is printing it
+    }
+    cout << "[WARN] at " << fixed << setprecision(1) << (progress * 100.0)
+         << "% of the emit, the intermediates project to "
+         << humanBytes(static_cast<uint64_t>(projected)) << " in total but only "
+         << humanBytes(freeBytes) << " is free at " << outDir << ".\n"
+         << "       Folding keeps what is held at once well below that total, so the run may\n"
+         << "       still finish. If it does not, lower --max-kmer-reads (currently "
+         << par.maxKmerReads << ") -- the [mhist] table prints what each cap would cost --\n"
+         << "       or use a larger filesystem. This early in the run the projection is rough\n"
+         << "       and tends to overshoot; it is a heads-up, not a verdict." << endl;
+}
+
+void GroupGenerator::markEmitComplete(size_t flushIdx) {
+    std::lock_guard<std::mutex> guard(foldMutex);
+    if (emitDone.size() <= flushIdx) {
+        emitDone.resize(flushIdx + 1, 0);
+    }
+    emitDone[flushIdx] = 1;
+    while (emitWatermark < emitDone.size() && emitDone[emitWatermark] != 0) {
+        ++emitWatermark;
+    }
+}
+
+void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
+    const int64_t live = subGraphLiveBytes.load(std::memory_order_relaxed);
+    const bool overBudget = tmpDiskBudget != TMP_DISK_UNLIMITED
+                            && live > 0
+                            && static_cast<size_t>(live) >= tmpDiskBudget;
+
+    // Cheap pre-check outside the lock. The authoritative test is repeated under it.
+    if (!overBudget) {
+        std::lock_guard<std::mutex> guard(foldMutex);
+        if (emitWatermark - foldedUpTo < maxFanIn) {
+            return;
+        }
+    }
+
+    std::unique_lock<std::mutex> guard(foldMutex, std::try_to_lock);
+    if (!guard.owns_lock()) {
+        return; // another thread is folding; keep emitting instead of waiting on it
+    }
+
+    const size_t from = foldedUpTo;
+    const size_t to = emitWatermark;
+    // Nothing to gain from folding a single flush: it would rewrite the same records.
+    if (to - from < 2) {
+        return;
+    }
+
+    const size_t round = foldRounds++;
+    foldedUpTo = to;
+    if (foldedOutputs.empty()) {
+        foldedOutputs.resize(unitCount());
+    }
+
+    const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
+    // One extra stream per unit for the previous fold's output, which is re-folded below.
+    const size_t bufElems = getMergeBufferElems(to - from + 1, par.ramUsage, 1);
+    size_t foldedFiles = 0;
+    for (size_t route = 0; route < routeCnt; ++route) {
+        const size_t shardCnt = shardsForRoute(route, par.threads);
+        for (size_t shard = 0; shard < shardCnt; ++shard) {
+            // Earlier folds' outputs go back in. Folding only the new flushes would let those
+            // outputs pile up untouched, and the live footprint would climb past the budget one
+            // fold at a time. Re-folding keeps exactly one file per unit, so the footprint
+            // tracks the merged-so-far size -- the floor no amount of folding can go below.
+            std::vector<std::string> & folded = foldedOutputs[unitIndexOf(route, shard)];
+            std::vector<std::string> inputs = folded;
+            inputs.reserve(inputs.size() + (to - from));
+            for (size_t i = from; i < to; ++i) {
+                inputs.push_back(subGraphName(i, route, shard));
+            }
+            // A distinct prefix from reduceSubGraphFanIn's subGraph_p*: that one numbers its
+            // rounds independently during the final merge, and a shared name would let the two
+            // overwrite each other.
+            const std::string output = outDir + "/subGraph_f" + to_string(round)
+                                     + "_" + to_string(route) + "_" + to_string(shard);
+            mergeSubGraphBatch(inputs, output, bufElems);
+
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                noteSubGraphBytes(-static_cast<int64_t>(FileUtil::getFileSize(inputs[i])));
+                std::remove(inputs[i].c_str());
+            }
+            noteSubGraphBytes(static_cast<int64_t>(FileUtil::getFileSize(output)));
+            folded.assign(1, output);
+            ++foldedFiles;
+        }
+    }
+
+    cout << "[disk] fold " << round << ": flushes [" << from << ", " << to << ") -> "
+         << foldedFiles << " files, live "
+         << humanBytes(static_cast<uint64_t>(std::max<int64_t>(0, subGraphLiveBytes.load())))
+         << endl;
+}
+
+// No lock: this runs after makeSubGraph's parallel region has joined, so folding is over and
+// foldedUpTo/foldedOutputs are stable.
+std::vector<std::string> GroupGenerator::unitInputFiles(size_t route, size_t shard) const {
+    std::vector<std::string> files;
+    const size_t unit = unitIndexOf(route, shard);
+    if (unit < foldedOutputs.size()) {
+        files = foldedOutputs[unit];
+    }
+    files.reserve(files.size() + (this->numOfGraph - foldedUpTo));
+    for (size_t i = foldedUpTo; i < this->numOfGraph; ++i) {
+        files.push_back(subGraphName(i, route, shard));
+    }
+    return files;
 }
 
 size_t GroupGenerator::mergeSubGraphBatch(const std::vector<std::string> & inputs,
                                           const std::string & output,
                                           size_t bufElems) {
-    std::vector<ReadBuffer<Relation> *> readers(inputs.size());
+    std::vector<std::unique_ptr<RelationReader>> readers(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
-        readers[i] = new ReadBuffer<Relation>(inputs[i], bufElems);
+        readers[i].reset(new RelationReader(inputs[i], bufElems));
     }
 
-    WriteBuffer<Relation> out(output, 1024 * 1024);
+    RelationWriter out(output);
 
     MergeHeap heap;
     for (size_t i = 0; i < readers.size(); ++i) {
@@ -870,15 +1089,11 @@ size_t GroupGenerator::mergeSubGraphBatch(const std::vector<std::string> & input
                 heap.push(entry);
             }
         }
-        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
-        out.write(&rel);
+        out.write(makeRelation(minRelation.id1, minRelation.id2, totalWeight));
         ++written;
     }
-    out.flush();
+    out.finish();
 
-    for (size_t i = 0; i < readers.size(); ++i) {
-        delete readers[i];
-    }
     return written;
 }
 
@@ -917,6 +1132,7 @@ void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_
 }
 
 void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & outPath,
+                               const std::vector<std::string> & inputFiles,
                                size_t bufElems, size_t maxFanIn,
                                std::vector<uint64_t> & histOut, size_t & mergedOut,
                                size_t & ceilingOut) {
@@ -924,20 +1140,17 @@ void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & o
     mergedOut = 0;
     ceilingOut = 0;
 
-    std::vector<std::string> files;
-    files.reserve(this->numOfGraph);
-    for (size_t i = 0; i < this->numOfGraph; ++i) {
-        files.push_back(outDir + "/subGraph_" + to_string(i) + "_" + to_string(route)
-                        + "_" + to_string(shard));
-    }
+    std::vector<std::string> files = inputFiles;
     reduceSubGraphFanIn(files, maxFanIn, route, shard);
 
     const size_t streamCnt = files.size();
-    std::vector<ReadBuffer<Relation> *> readers(streamCnt);
+    std::vector<std::unique_ptr<RelationReader>> readers(streamCnt);
     for (size_t i = 0; i < streamCnt; ++i) {
-        readers[i] = new ReadBuffer<Relation>(files[i], bufElems);
+        readers[i].reset(new RelationReader(files[i], bufElems));
     }
 
+    // Output is relations_*, which makeGroups/mergeBySupport/makeGroupsPhase2 read with
+    // ReadBuffer<Relation>. That format stays raw -- only the subGraph_* inputs above change.
     WriteBuffer<Relation> out(outPath, 1024 * 1024);
 
     // No routing decision here: every edge in these files already belongs to this unit.
@@ -971,14 +1184,17 @@ void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & o
         mergedOut++;
         if (totalWeight > 0) histOut[totalWeight]++;
 
-        Relation rel(minRelation.id1, minRelation.id2, totalWeight);
+        // Zeroed in place, not via a helper's return value -- see mergeGraph_one for why.
+        Relation rel;
+        std::memset(static_cast<void *>(&rel), 0, sizeof(rel));
+        rel.id1 = minRelation.id1;
+        rel.id2 = minRelation.id2;
+        rel.weight = totalWeight;
         out.write(&rel);
     }
     out.flush();
 
-    for (size_t i = 0; i < streamCnt; ++i) {
-        delete readers[i];
-    }
+    readers.clear(); // close every input before unlinking it
     for (size_t i = 0; i < streamCnt; ++i) {
         std::remove(files[i].c_str());
     }
@@ -1067,9 +1283,9 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
     const size_t unitCnt = units.size();
     const size_t concurrentMergers = std::min(static_cast<size_t>(par.threads), unitCnt);
     const size_t maxFanIn = getMergeFanIn(par.threads, concurrentMergers);
-    const size_t mergeBufElems = getMergeBufferElems(std::min(this->numOfGraph, maxFanIn),
+    const size_t mergeBufElems = getMergeBufferElems(std::min(this->unitStreamCount(), maxFanIn),
                                                      par.ramUsage, concurrentMergers);
-    const size_t streamsPerUnit = std::min(this->numOfGraph, maxFanIn);
+    const size_t streamsPerUnit = std::min(this->unitStreamCount(), maxFanIn);
 
     // A shard writes to a temp; the cross bucket's shards are concatenated afterwards.
     // Concatenation is legal because the relations_* consumers scan the file end to end and
@@ -1080,7 +1296,7 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
              : (outDir + "/relations_" + to_string(route) + "_s" + to_string(shard) + ".tmp");
     };
 
-    const size_t peakFds = concurrentMergers * mergeFdsPerUnit(std::min(this->numOfGraph, maxFanIn));
+    const size_t peakFds = concurrentMergers * mergeFdsPerUnit(std::min(this->unitStreamCount(), maxFanIn));
     cout << "Merge: " << unitCnt << " units (" << routeCnt << " routes, cross bucket sharded x"
          << shardsForRoute(static_cast<size_t>(par.threads), par.threads) << ") x "
          << this->numOfGraph << " subgraphs, " << concurrentMergers
@@ -1128,6 +1344,7 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
     for (size_t u = 0; u < unitCnt; ++u) {
         const time_t unitStart = time(nullptr);
         mergeUnit(units[u].first, units[u].second, unitOutPath(units[u].first, units[u].second),
+                  unitInputFiles(units[u].first, units[u].second),
                   mergeBufElems, maxFanIn, unitHist[u], unitMerged[u], unitCeiling[u]);
         unitSeconds[u] = double(time(nullptr) - unitStart);
     }
@@ -1222,7 +1439,7 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
         }
     }
     const size_t maxFanIn = getMergeFanIn(par.threads, 1);
-    const size_t mergeBufElems = getMergeBufferElems(std::min(this->numOfGraph, maxFanIn),
+    const size_t mergeBufElems = getMergeBufferElems(std::min(this->unitStreamCount(), maxFanIn),
                                                      par.ramUsage, 1);
     cout << "Merge: " << units.size() << " units x " << this->numOfGraph
          << " subgraphs, sequential (fd soft limit " << getOpenFileLimit()
@@ -1235,19 +1452,14 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     for (size_t u = 0; u < units.size(); ++u) {
         const size_t route = units[u].first;
         const size_t shard = units[u].second;
-        std::vector<std::string> subGraphFiles;
-        subGraphFiles.reserve(this->numOfGraph);
-        for (size_t i = 0; i < this->numOfGraph; ++i) {
-            subGraphFiles.push_back(outDir + "/subGraph_" + to_string(i) + "_"
-                                    + to_string(route) + "_" + to_string(shard));
-        }
+        std::vector<std::string> subGraphFiles = unitInputFiles(route, shard);
         reduceSubGraphFanIn(subGraphFiles, maxFanIn, route, shard);
 
         const size_t streamCnt = subGraphFiles.size();
-        std::vector<ReadBuffer<Relation> *> relationBuffers(streamCnt);
+        std::vector<std::unique_ptr<RelationReader>> relationBuffers(streamCnt);
         std::vector<Relation> currentRelations(streamCnt);
         for (size_t i = 0; i < streamCnt; ++i) {
-            relationBuffers[i] = new ReadBuffer<Relation>(subGraphFiles[i], mergeBufElems);
+            relationBuffers[i].reset(new RelationReader(subGraphFiles[i], mergeBufElems));
             currentRelations[i] = relationBuffers[i]->getNext();
             if (currentRelations[i] == Relation()) {
                 currentRelations[i] = Relation(UINT32_MAX, UINT32_MAX, UINT16_MAX);
@@ -1274,13 +1486,18 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
             }
             if (totalWeight == UINT16_MAX) ceilingEdgeCnt++;
 
-            Relation rel(minRelation.id1, minRelation.id2, totalWeight);
+            // Zero in place rather than copying from a helper's return value: a return-by-value
+            // copy is free to leave the padding indeterminate, and this file is written byte
+            // for byte.
+            Relation rel;
+            std::memset(static_cast<void *>(&rel), 0, sizeof(rel));
+            rel.id1 = minRelation.id1;
+            rel.id2 = minRelation.id2;
+            rel.weight = totalWeight;
             relationLog.write(&rel);
         }
 
-        for (size_t i = 0; i < streamCnt; ++i) {
-            delete relationBuffers[i];
-        }
+        relationBuffers.clear(); // close every input before unlinking it
         for (size_t i = 0; i < streamCnt; ++i) {
             std::remove(subGraphFiles[i].c_str());
         }

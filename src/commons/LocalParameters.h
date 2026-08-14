@@ -102,6 +102,7 @@ public:
     PARAMETER(MAX_KMER_READS)
     PARAMETER(MIN_OVERLAP_RATIO)
     PARAMETER(MIN_SUPPORT)
+    PARAMETER(MAX_TMP_DISK)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
     PARAMETER(READID_COL)
@@ -204,6 +205,7 @@ public:
     int maxKmerReads;
     float minOverlapRatio;
     int minSupport;
+    int maxTmpDiskMiB;
 
     // Group application
     int scoreCol;

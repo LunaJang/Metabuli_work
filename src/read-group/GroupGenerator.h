@@ -14,8 +14,15 @@
 #include <atomic>
 #include <sys/sysinfo.h>
 #include <sys/resource.h>
+#include <sys/statvfs.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cerrno>
+#include <cstring>
+#include <memory>
+#include <mutex>
 #include <algorithm>
+#include <zstd.h>
 #include "IndexCreator.h"
 #include "SeqIterator.h"
 #include "NcbiTaxonomy.h"
@@ -50,6 +57,244 @@ struct Relation {
     bool operator==(const Relation& other) const {
         return id1 == other.id1 && id2 == other.id2;
     }
+};
+
+// Relation is 12 bytes but only 10 carry payload; the compiler never initialises the trailing
+// two. They are written to disk verbatim, so leaving them undefined makes the intermediate files
+// differ byte for byte between runs even when every record is identical -- which is exactly what
+// happened to relations.bin once the surrounding code changed and the stack slot stopped being
+// reused. Build every record that reaches a file through here.
+// The void* cast is the documented way to memset a class type without -Wclass-memaccess.
+inline Relation makeRelation(uint32_t id1, uint32_t id2, uint16_t weight) {
+    Relation rel;
+    std::memset(static_cast<void *>(&rel), 0, sizeof(rel));
+    rel.id1 = id1;
+    rel.id2 = id2;
+    rel.weight = weight;
+    return rel;
+}
+
+// Sequential Relation streams for the subGraph_* files ONLY. relations_* keeps using
+// ReadBuffer/WriteBuffer<Relation>: giving the two a different type is the point, so that a
+// change to the subgraph representation cannot silently reach the files makeGroups reads.
+//
+// On-disk layout: one zstd stream per file, nothing else. Records go in as raw Relation bytes,
+// so the two padding bytes of every 12-byte struct are zeros the compressor removes for free.
+// Streaming (not one-shot) because a flush can carry 200 M records -- one-shot would need a
+// 2.4 GB input and a matching output buffer, while the streaming API bounds both.
+//
+// Every failure is fatal. saveSubGraphToFile used to print to cerr and continue, which let a
+// 21-hour run finish with a zero exit code and an empty result after 70,399 writes had failed.
+static const int RELATION_ZSTD_LEVEL = 1;             // ~500 MB/s/core; emit runs near 100 MB/s
+static const size_t RELATION_WRITE_ELEMS = 65'536;    // 768 KB of records per compressor feed
+
+static inline void relationStreamFatal(const std::string & path, const char * action) {
+    std::cerr << "Error " << action << " file: " << path
+              << " (" << strerror(errno) << ")" << std::endl;
+    exit(EXIT_FAILURE);
+}
+
+static inline void relationStreamZstdFatal(const std::string & path, const char * action,
+                                           size_t code) {
+    std::cerr << "Error " << action << " file: " << path
+              << " (zstd: " << ZSTD_getErrorName(code) << ")" << std::endl;
+    exit(EXIT_FAILURE);
+}
+
+// Fixed per-stream cost of the codec, on top of the caller's record buffer. Charged to the
+// merge memory budget in getMergeBufferElems so the disk representation and the memory
+// representation are not silently conflated.
+inline size_t relationStreamFixedBytes() {
+    return ZSTD_DStreamInSize();
+}
+
+struct ZstdCStreamDeleter {
+    void operator()(ZSTD_CStream * s) const { ZSTD_freeCStream(s); }
+};
+
+struct ZstdDStreamDeleter {
+    void operator()(ZSTD_DStream * s) const { ZSTD_freeDStream(s); }
+};
+
+class RelationWriter {
+public:
+    explicit RelationWriter(const std::string & filePath)
+        : path(filePath), fp(fopen(filePath.c_str(), "wb")), cstream(ZSTD_createCStream()),
+          records(), outBuf(ZSTD_CStreamOutSize()), bytesOnDisk(0) {
+        if (fp == nullptr) {
+            relationStreamFatal(path, "opening");
+        }
+        if (!cstream) {
+            relationStreamFatal(path, "allocating a compressor for");
+        }
+        const size_t init = ZSTD_initCStream(cstream.get(), RELATION_ZSTD_LEVEL);
+        if (ZSTD_isError(init)) {
+            relationStreamZstdFatal(path, "initializing the compressor for", init);
+        }
+        records.reserve(RELATION_WRITE_ELEMS);
+    }
+
+    RelationWriter(const RelationWriter &) = delete;
+    RelationWriter & operator=(const RelationWriter &) = delete;
+
+    ~RelationWriter() { finish(); }
+
+    void write(const Relation & rel) {
+        records.push_back(rel);
+        if (records.size() >= RELATION_WRITE_ELEMS) {
+            feedCompressor();
+        }
+    }
+
+    // Idempotent so the destructor can act as a safety net after an explicit call.
+    void finish() {
+        if (fp == nullptr) {
+            return;
+        }
+        feedCompressor();
+
+        size_t remaining = 0;
+        do {
+            ZSTD_outBuffer out = { outBuf.data(), outBuf.size(), 0 };
+            remaining = ZSTD_endStream(cstream.get(), &out);
+            if (ZSTD_isError(remaining)) {
+                relationStreamZstdFatal(path, "finishing", remaining);
+            }
+            writeOut(out.pos);
+        } while (remaining != 0);
+
+        FILE * const closing = fp;
+        fp = nullptr;
+        if (fclose(closing) != 0) {
+            relationStreamFatal(path, "closing");
+        }
+    }
+
+    size_t compressedBytes() const { return bytesOnDisk; }
+
+private:
+    void feedCompressor() {
+        if (records.empty()) {
+            return;
+        }
+        ZSTD_inBuffer in = { records.data(), records.size() * sizeof(Relation), 0 };
+        while (in.pos < in.size) {
+            ZSTD_outBuffer out = { outBuf.data(), outBuf.size(), 0 };
+            const size_t code = ZSTD_compressStream(cstream.get(), &out, &in);
+            if (ZSTD_isError(code)) {
+                relationStreamZstdFatal(path, "compressing into", code);
+            }
+            writeOut(out.pos);
+        }
+        records.clear();
+    }
+
+    void writeOut(size_t bytes) {
+        if (bytes == 0) {
+            return;
+        }
+        if (fwrite(outBuf.data(), 1, bytes, fp) != bytes) {
+            relationStreamFatal(path, "writing to");
+        }
+        bytesOnDisk += bytes;
+    }
+
+    std::string path;
+    FILE * fp;
+    std::unique_ptr<ZSTD_CStream, ZstdCStreamDeleter> cstream;
+    std::vector<Relation> records; // reserve() fixes the capacity, so push_back never reallocates
+    std::vector<char> outBuf;
+    size_t bytesOnDisk;
+};
+
+class RelationReader {
+public:
+    RelationReader(const std::string & filePath, size_t blockElems)
+        : path(filePath), fp(fopen(filePath.c_str(), "rb")), dstream(ZSTD_createDStream()),
+          inBuf(ZSTD_DStreamInSize()), inFilled(0), inPos(0),
+          outBytes((blockElems == 0 ? 1 : blockElems) * sizeof(Relation)),
+          outFilled(0), outPos(0), sourceDrained(false) {
+        if (fp == nullptr) {
+            relationStreamFatal(path, "opening");
+        }
+        if (!dstream) {
+            relationStreamFatal(path, "allocating a decompressor for");
+        }
+        const size_t init = ZSTD_initDStream(dstream.get());
+        if (ZSTD_isError(init)) {
+            relationStreamZstdFatal(path, "initializing the decompressor for", init);
+        }
+    }
+
+    RelationReader(const RelationReader &) = delete;
+    RelationReader & operator=(const RelationReader &) = delete;
+
+    ~RelationReader() {
+        if (fp != nullptr) {
+            fclose(fp);
+        }
+    }
+
+    // Returns a default Relation at end of stream, matching ReadBuffer<Relation>'s contract so
+    // the callers' `if (!(next == Relation()))` termination test still holds. Relation::operator==
+    // ignores weight, so the sentinel is really (id1,id2) == (0,0) -- an edge that cannot exist,
+    // because writeKmers globalizes query IDs as 1-based (sequenceID += processedReadCnt).
+    Relation getNext() {
+        if (outFilled - outPos < sizeof(Relation) && !fill()) {
+            return Relation();
+        }
+        Relation rel;
+        memcpy(&rel, outBytes.data() + outPos, sizeof(Relation));
+        outPos += sizeof(Relation);
+        return rel;
+    }
+
+private:
+    // Decompress until at least one whole record is buffered. A record can straddle two
+    // decompressor outputs, so the leftover tail is carried to the front instead of dropped.
+    bool fill() {
+        const size_t leftover = outFilled - outPos;
+        if (leftover > 0 && outPos > 0) {
+            memmove(outBytes.data(), outBytes.data() + outPos, leftover);
+        }
+        outFilled = leftover;
+        outPos = 0;
+
+        while (outFilled < sizeof(Relation)) {
+            if (inPos >= inFilled) {
+                if (sourceDrained) {
+                    return false;
+                }
+                inFilled = fread(inBuf.data(), 1, inBuf.size(), fp);
+                inPos = 0;
+                if (inFilled == 0) {
+                    sourceDrained = true;
+                    return false;
+                }
+            }
+
+            ZSTD_inBuffer in = { inBuf.data(), inFilled, inPos };
+            ZSTD_outBuffer out = { outBytes.data(), outBytes.size(), outFilled };
+            const size_t code = ZSTD_decompressStream(dstream.get(), &out, &in);
+            if (ZSTD_isError(code)) {
+                relationStreamZstdFatal(path, "decompressing", code);
+            }
+            inPos = in.pos;
+            outFilled = out.pos;
+        }
+        return true;
+    }
+
+    std::string path;
+    FILE * fp;
+    std::unique_ptr<ZSTD_DStream, ZstdDStreamDeleter> dstream;
+    std::vector<char> inBuf;
+    size_t inFilled;
+    size_t inPos;
+    std::vector<char> outBytes;
+    size_t outFilled;
+    size_t outPos;
+    bool sourceDrained;
 };
 
 class DisjointSet {
@@ -171,6 +416,68 @@ inline size_t getMemoryBudgetBytes(int maxRamGiB) {
     }
     const size_t declared = static_cast<size_t>(maxRamGiB) * 1024 * 1024 * 1024;
     return std::min(availableBytes, declared);
+}
+
+// Free space at `path`, or 0 when it cannot be measured. Same platform-guard shape as
+// getAvailableMemoryBytes: a value we cannot trust is reported as "unknown", not guessed.
+inline size_t getFreeDiskBytes(const std::string & path) {
+#if defined(__linux__) || defined(__APPLE__)
+    struct statvfs info;
+    if (statvfs(path.c_str(), &info) != 0) {
+        return 0;
+    }
+    return static_cast<size_t>(info.f_bavail) * static_cast<size_t>(info.f_frsize);
+#else
+    (void) path;
+    return 0;
+#endif
+}
+
+// Returned when no cap applies -- either the user asked for none or free space is unknown.
+static const size_t TMP_DISK_UNLIMITED = SIZE_MAX;
+
+// Total capacity of the filesystem holding `path`, or 0 when it cannot be measured.
+inline size_t getTotalDiskBytes(const std::string & path) {
+#if defined(__linux__) || defined(__APPLE__)
+    struct statvfs info;
+    if (statvfs(path.c_str(), &info) != 0) {
+        return 0;
+    }
+    return static_cast<size_t>(info.f_blocks) * static_cast<size_t>(info.f_frsize);
+#else
+    (void) path;
+    return 0;
+#endif
+}
+
+// Space the run refuses to consume. Folding bounds the footprint but cannot bound it below the
+// merged graph, so a hard floor is still needed -- this is what actually keeps the run from
+// filling somebody else's filesystem. 2% of the volume, clamped so it is neither trivial on a
+// laptop nor wasteful on a 100 TB array.
+inline size_t getDiskReserveBytes(const std::string & path) {
+    const size_t MIN_RESERVE = 64ULL * 1024 * 1024;
+    const size_t MAX_RESERVE = 1024ULL * 1024 * 1024;
+    const size_t total = getTotalDiskBytes(path);
+    if (total == 0) {
+        return MIN_RESERVE;
+    }
+    return std::max(MIN_RESERVE, std::min(MAX_RESERVE, total / 50));
+}
+
+// Disk counterpart of getMemoryBudgetBytes. Note what this value is NOT: it is not a
+// performance target. Anchoring it at a small fraction of free space would make a laptop fold
+// constantly while leaving a 100 TB filesystem unprotected, and would make the same data behave
+// differently depending on what else happens to sit on the disk. 80% is a safety ceiling: a run
+// that fits under it never folds early and takes the same path it takes today.
+inline size_t getTmpDiskBudgetBytes(const std::string & outDir, int maxTmpDiskMiB) {
+    if (maxTmpDiskMiB > 0) {
+        return static_cast<size_t>(maxTmpDiskMiB) * 1024 * 1024;
+    }
+    const size_t freeBytes = getFreeDiskBytes(outDir);
+    if (freeBytes == 0) {
+        return TMP_DISK_UNLIMITED;
+    }
+    return freeBytes / 100 * 80;
 }
 
 inline size_t getRelationThreshold(int numThreads, int maxRamGiB) {
@@ -297,7 +604,14 @@ inline size_t getMergeBufferElems(size_t numOfGraph, int maxRamGiB, size_t concu
     const double safetyFactor = 0.5;
     const size_t mergers = std::max<size_t>(1, concurrentMergers);
     const size_t budget = (size_t)(getMemoryBudgetBytes(maxRamGiB) * safetyFactor) / mergers;
-    const size_t perStream = budget / (numOfGraph * sizeof(Relation));
+
+    // Disk bytes and memory bytes are not the same thing here. Each compressed stream also
+    // holds a fixed decompressor input window; charge that first, then split what is left
+    // across the record buffers. Conflating the two is how the merge blew past its fd budget
+    // once before (see research.md, 2026-08-06 (2)).
+    const size_t fixedCost = relationStreamFixedBytes() * numOfGraph;
+    const size_t forRecords = (budget > fixedCost) ? (budget - fixedCost) : 0;
+    const size_t perStream = forRecords / (numOfGraph * sizeof(Relation));
 
     return std::max(MERGE_BUFFER_MIN_ELEMS, std::min(perStream, MAX_ELEMS));
 }
@@ -318,6 +632,38 @@ protected:
 
     size_t numOfSplits = 0;
     size_t numOfGraph = 0;
+    // Bytes the subGraph_* files actually occupy. saveSubGraphToFile runs on every emit
+    // thread, hence the atomic. Compared against emittedEdgeCnt * sizeof(Relation) it gives
+    // the compression ratio the run achieved.
+    std::atomic<uint64_t> subGraphBytesOnDisk{0};
+
+    // --- Incremental fold state -------------------------------------------------------------
+    // The merge used to start only after every flush had been written, so peak disk was the
+    // whole emit. Folding a completed prefix while emission continues bounds it instead.
+    //
+    // A flush index is handed out by counter.fetch_add BEFORE its files exist, so "written" is
+    // tracked separately: emitDone[i] is set once all of flush i's unit files are closed, and
+    // emitWatermark walks the contiguous prefix of those. Only that prefix may be folded --
+    // folding across a hole would list a file that has not been written yet.
+    std::mutex foldMutex;                                // guards the five members below
+    std::vector<char> emitDone;
+    size_t emitWatermark = 0;                            // flushes [0, emitWatermark) are complete
+    size_t foldedUpTo = 0;                               // flushes [0, foldedUpTo) folded away
+    size_t foldRounds = 0;
+    std::vector<std::vector<std::string>> foldedOutputs; // [unit] -> folded file names
+
+    // Live footprint of subGraph_* and its high-water mark. Signed because a fold subtracts its
+    // inputs before adding its output.
+    std::atomic<int64_t> subGraphLiveBytes{0};
+    std::atomic<uint64_t> subGraphPeakBytes{0};
+
+    // Emit progress, for projecting the total write volume. The [mhist] table cannot serve here:
+    // it is only assembled after the parallel region joins. These two are updated as k-mers are
+    // consumed, so a projection is available while the emit is still running.
+    std::atomic<uint64_t> kmerValuesTotal{0};
+    std::atomic<uint64_t> kmerValuesDone{0};
+    std::atomic<int> volumeWarned{0};   // the projection warning is printed at most once
+
     std::vector<uint64_t> kmerBoundaries;
     bool boundariesInitialized = false;
     bool useOnlyTrueRelations = false; // for debug
@@ -374,9 +720,62 @@ public:
 
     // Merge every subgraph belonging to one (route, shard) unit into `outPath`. Purely
     // sequential -- mergeGraph runs these concurrently, one unit per thread.
+    // `files` comes from unitInputFiles(): incremental folding replaces a prefix of the flushes
+    // with folded files, so the unit's inputs can no longer be derived from numOfGraph alone.
     void mergeUnit(size_t route, size_t shard, const std::string& outPath,
+                   const std::vector<std::string>& files,
                    size_t bufElems, size_t maxFanIn,
                    std::vector<uint64_t>& histOut, size_t& mergedOut, size_t& ceilingOut);
+
+    // --- Incremental fold ---------------------------------------------------------------
+    // Units are numbered route-major with a fixed stride so the index is a pure function of
+    // (route, shard); routes that carry one shard simply leave their extra slots unused.
+    size_t shardStride() const {
+        return shardsForRoute(static_cast<size_t>(par.threads), par.threads);
+    }
+    size_t unitCount() const {
+        return (static_cast<size_t>(par.threads) * 2 + 1) * shardStride();
+    }
+    size_t unitIndexOf(size_t route, size_t shard) const {
+        return route * shardStride() + shard;
+    }
+    std::string subGraphName(size_t flushIdx, size_t route, size_t shard) const {
+        return outDir + "/subGraph_" + std::to_string(flushIdx) + "_" + std::to_string(route)
+             + "_" + std::to_string(shard);
+    }
+
+    // Live-footprint bookkeeping. `delta` is positive for a file written, negative for one
+    // removed; the high-water mark is what the [disk] summary reports.
+    void noteSubGraphBytes(int64_t delta);
+
+    // Called once every unit file of `flushIdx` is closed. Advances the contiguous watermark.
+    void markEmitComplete(size_t flushIdx);
+
+    // Two guards, checked at every flush.
+    //  - projection: extrapolate the write volume from emit progress and warn once if it will
+    //    not fit. Only a warning: folding routinely keeps the footprint far below the total,
+    //    so a projected overflow does not mean the run must fail.
+    //  - headroom: if the filesystem's actual free space falls to the reserve, stop. This one
+    //    depends on no estimate, which is what makes it the real guarantee.
+    void checkDiskHeadroom();
+
+    // Fold the completed-but-unfolded prefix when the live footprint reaches `tmpDiskBudget`,
+    // or when that prefix alone would exceed the merge's fan-in. Returns without doing anything
+    // if another thread is already folding -- the caller just keeps emitting.
+    void maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn);
+
+    // Every file the merge must read for one unit: folded outputs first, then the flushes that
+    // were never folded.
+    std::vector<std::string> unitInputFiles(size_t route, size_t shard) const;
+
+    // How many streams one unit contributes to the merge. Every unit folds on the same rounds
+    // and keeps the same unfolded tail, so one unit's count answers for all of them. This --
+    // not numOfGraph -- is what the fan-in and buffer budgets have to be sized against once
+    // folding has replaced part of the flush range.
+    size_t unitStreamCount() const {
+        const size_t folded = foldedOutputs.empty() ? 0 : foldedOutputs[0].size();
+        return folded + (numOfGraph - foldedUpTo);
+    }
 
     static int kneeThreshold(const std::vector<uint64_t>& hist, int minWeight);
 

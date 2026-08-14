@@ -33,6 +33,11 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // core 25 -> 15 gained 73%; with it, 8%. 2 and 3 are within noise of each other; 2 leaves
     // 10% fewer groups.
     par.minSupport = 2;
+    // Peak disk the subGraph_* intermediates may hold at once. 0 derives it from the free space
+    // at the output directory (80%). A safety ceiling, not a performance target -- a run that
+    // fits under it never folds early, so machines with room pay nothing for it. This function
+    // overrides LocalParameters' own initialisation, so both places have to agree.
+    par.maxTmpDiskMiB = 0;
     par.syncmer = 1;
     par.smerLen = 5;
     par.seqMode = 2;    
