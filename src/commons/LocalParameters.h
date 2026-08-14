@@ -94,14 +94,10 @@ public:
     PARAMETER(PARAM_OUTDIR)
     
     // Group generation
-    PARAMETER(NEIGHBOR_KMERS)
-    PARAMETER(MIN_EDGE_WEIGHT)
-    PARAMETER(CORE_EDGE_WEIGHT)
-    PARAMETER(KNEE_SCALE)
-    PARAMETER(MAX_KMER_FREQ_RATIO)
+    PARAMETER(WEAK_BAND_RATIO)
     PARAMETER(MAX_KMER_READS)
     PARAMETER(MIN_OVERLAP_RATIO)
-    PARAMETER(MIN_SUPPORT)
+    PARAMETER(MERGE_SUPPORT_RATIO)
     PARAMETER(MAX_TMP_DISK)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
@@ -196,15 +192,12 @@ public:
     int extractMode;
     std::string outputDir;
     
-    // Group generation
-    int minEdgeWeight;
-    int coreEdgeWeight;
-    float kneeScale;
-    int neighborKmers;
-    float maxKmerFreqRatio;
-    int maxKmerReads;
-    float minOverlapRatio;
-    int minSupport;
+    // Group generation. Every algorithm threshold here is dimensionless: it is a ratio, so one
+    // value carries the same meaning across datasets with different read lengths and coverage.
+    float weakBandRatio;      // weak-band lower bound as a fraction of the core threshold
+    int maxKmerReads;         // resource brake, not an algorithm knob
+    float minOverlapRatio;    // core threshold as a fraction of k-mers per read
+    float mergeSupportRatio;  // Phase 1.5 support as a fraction of the smaller unit's read count
     int maxTmpDiskMiB;
 
     // Group application

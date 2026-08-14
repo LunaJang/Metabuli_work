@@ -208,37 +208,24 @@ LocalParameters::LocalParameters() :
                 typeid(bool),
                 (void *) &em,
                 ""),
-        NEIGHBOR_KMERS(NEIGHBOR_KMERS_ID,
-                "--neighbor-kmers",
-                "Discard common k-mer's neighbors",
-                "Discard common k-mer's neighbors",
-                typeid(int),
-                (void *) &neighborKmers,
-                "[0-4]"),
-        MAX_KMER_FREQ_RATIO(MAX_KMER_FREQ_RATIO_ID,
-                "--max-kmer-freq-ratio",
-                "Skip k-mers shared by more than this fraction of reads (0.0=disabled)",
-                "Skip k-mers shared by more than this fraction of reads (0.0=disabled)",
-                typeid(float),
-                (void *) &maxKmerFreqRatio,
-                "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         MAX_KMER_READS(MAX_KMER_READS_ID,
                 "--max-kmer-reads",
                 "Skip k-mers shared by more than this many reads (0=disabled)",
                 "Skip k-mers shared by more than this many reads (0=disabled). "
                 "Absolute cap, so it bounds the C(m,2) edges a single k-mer can emit "
-                "regardless of dataset size. Unlike --max-kmer-freq-ratio, whose threshold "
-                "scales with the read count.",
+                "regardless of dataset size. A fraction of the read count cannot do that: "
+                "one value would have to fit both a 5k-read and a 62M-read run.",
                 typeid(int),
                 (void *) &maxKmerReads,
                 "^[0-9]+$"),
         MIN_OVERLAP_RATIO(MIN_OVERLAP_RATIO_ID,
                 "--min-overlap-ratio",
-                "Phase 1 core threshold as a fraction of k-mers per read (0=use --core-edge)",
-                "Phase 1 core threshold as a fraction of k-mers per read (0=use --core-edge). "
+                "Phase 1 core threshold as a fraction of k-mers per read",
+                "Phase 1 core threshold as a fraction of k-mers per read. "
                 "An edge weight is the number of k-mers two reads share, so this is the minimum "
-                "overlap two reads must have to be grouped. Unlike knee detection it does not "
-                "depend on the shape of the weight distribution, so it transfers across datasets.",
+                "overlap two reads must have to be grouped. Being a ratio it does not depend on "
+                "read length or coverage, so one value transfers across datasets. Must be > 0: "
+                "there is no absolute fallback.",
                 typeid(float),
                 (void *) &minOverlapRatio,
                 "^0(\\.[0-9]+)?|1(\\.0+)?$"),
@@ -263,40 +250,32 @@ LocalParameters::LocalParameters() :
                     typeid(std::string),
                     (void *) &outputDir,
                     "^.*$"),
-        MIN_EDGE_WEIGHT(MIN_EDGE_WEIGHT_ID,
-                        "--min-edge",
-                        "Min. edge weight for read grouping",
-                        "Min. edge weight for read grouping",
-                        typeid(int),
-                        (void *) &minEdgeWeight,
-                        "^[0-9]+$"),
-        CORE_EDGE_WEIGHT(CORE_EDGE_WEIGHT_ID,
-                         "--core-edge",
-                         "Min. edge weight for core group formation (Phase 1)",
-                         "Min. edge weight for core group formation (Phase 1). "
-                         "Reads sharing fewer k-mers than this threshold are not grouped in Phase 1.",
-                         typeid(int),
-                         (void *) &coreEdgeWeight,
-                         "^[0-9]+$"),
-        KNEE_SCALE(KNEE_SCALE_ID,
-                   "--knee-scale",
-                   "Scale factor applied to the auto-detected knee (Phase 1)",
-                   "Scale factor applied to the auto-detected knee threshold (Phase 1). "
-                   "Values below 1.0 lower the core threshold (larger cores, fewer singletons); "
-                   "1.0 keeps the raw knee. Ignored when knee detection falls back to --core-edge.",
-                   typeid(float),
-                   (void *) &kneeScale,
-                   "^[0-9]*\\.?[0-9]+$"),
-        MIN_SUPPORT(MIN_SUPPORT_ID,
-                    "--min-support",
-                    "Weak links needed to merge two core groups (Phase 1.5)",
-                    "Number of independent weak edges required before two Phase-1 units are merged "
-                    "(Phase 1.5). A weak edge carries too few shared k-mers to trust on its own, but "
-                    "several independent ones between the same pair of units do not arise by chance. "
-                    "0 disables Phase 1.5, which is on by default.",
-                    typeid(int),
-                    (void *) &minSupport,
-                    "^[0-9]+$"),
+        WEAK_BAND_RATIO(WEAK_BAND_RATIO_ID,
+                        "--weak-band-ratio",
+                        "Weak-band lower bound as a fraction of the core threshold",
+                        "Lower bound of the weak band, given as a fraction of the Phase 1 core "
+                        "threshold: weak edges are those with weight in (ratio x core, core]. The "
+                        "same value is Phase 2's floor for linking singletons. Expressing it as a "
+                        "ratio keeps the band's width proportional to the core threshold, so one "
+                        "value means the same thing on datasets with different read lengths -- an "
+                        "absolute weight does not. Must be in (0, 1).",
+                        typeid(float),
+                        (void *) &weakBandRatio,
+                        "^[0-9]*\\.?[0-9]+$"),
+        MERGE_SUPPORT_RATIO(MERGE_SUPPORT_RATIO_ID,
+                    "--merge-support-ratio",
+                    "Phase 1.5 support as a fraction of the smaller unit's reads (0=count edges)",
+                    "How much weak-link support two Phase-1 units need before they are merged "
+                    "(Phase 1.5), as a fraction of the smaller unit's read count. The support "
+                    "counted is the number of distinct reads on the smaller side that carry a weak "
+                    "link to the other unit, so the requirement scales with unit size: chance links "
+                    "from repeats grow with the product of the two unit sizes and would otherwise "
+                    "clear any fixed count on high-coverage data. A floor of 2 always applies. "
+                    "0 disables the ratio and falls back to counting weak edges with that floor, "
+                    "which is the pre-ratio behaviour.",
+                    typeid(float),
+                    (void *) &mergeSupportRatio,
+                    "^[0-9]*\\.?[0-9]+$"),
         MAX_TMP_DISK(MAX_TMP_DISK_ID,
                      "--max-tmp-disk",
                      "Peak disk (MiB) the intermediate files may occupy (0: 80% of free space)",
@@ -633,19 +612,15 @@ LocalParameters::LocalParameters() :
     rank = "";
     higherRankFile = 0;
 
-    // Group generation. The three thresholds below are the operating point picked on the
-    // species-inclusion benchmark (61.7 M reads): overlap ratio 0.3 (core threshold 15 there),
-    // Phase 2 floor 5, Phase 1.5 support 2. Sweeping the Phase 2 floor over 10/5/1 left the
-    // useful signal untouched -- it only trades coverage against concentration -- while support
-    // was the one knob that moved it, and it also flattens the sensitivity to the core threshold.
-    neighborKmers = 1;
-    minEdgeWeight = 5;
-    coreEdgeWeight = 10;
-    kneeScale = 1.0f;
-    maxKmerFreqRatio = 0.0f;
+    // Group generation. Both thresholds are ratios so that one value transfers across datasets;
+    // the operating point comes from the species-inclusion benchmark (61.7 M reads, 49.6 k-mers
+    // per read -> core threshold 15, weak band (5, 15]). 5/15 = 0.3333 is where --weak-band-ratio
+    // comes from. See setGroupGenerationDefaults(), which overrides these for the grouping
+    // workflow -- both places have to agree.
     maxKmerReads = 0;
     minOverlapRatio = 0.3f;
-    minSupport = 2;
+    weakBandRatio = 0.3333f;
+    mergeSupportRatio = 0.0f;
     maxTmpDiskMiB = 0;
 
     buildUnirefDb.push_back(&UNIREF_XML);
@@ -750,19 +725,13 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&PARAM_THREADS);
     groupGeneration.push_back(&SEQ_MODE);
     groupGeneration.push_back(&RAM_USAGE);
-    groupGeneration.push_back(&MATCH_PER_KMER);  
-    groupGeneration.push_back(&PARAM_MASK_RESIDUES);
-    groupGeneration.push_back(&PARAM_MASK_PROBABILTY);
+    groupGeneration.push_back(&MATCH_PER_KMER);
     groupGeneration.push_back(&SYNCMER);
     groupGeneration.push_back(&SMER_LEN);
-    groupGeneration.push_back(&MIN_EDGE_WEIGHT);
-    groupGeneration.push_back(&CORE_EDGE_WEIGHT);
-    groupGeneration.push_back(&KNEE_SCALE);
-    groupGeneration.push_back(&NEIGHBOR_KMERS);
-    groupGeneration.push_back(&MAX_KMER_FREQ_RATIO);
     groupGeneration.push_back(&MAX_KMER_READS);
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);
-    groupGeneration.push_back(&MIN_SUPPORT);
+    groupGeneration.push_back(&WEAK_BAND_RATIO);
+    groupGeneration.push_back(&MERGE_SUPPORT_RATIO);
     groupGeneration.push_back(&MAX_TMP_DISK);
     groupGeneration.push_back(&PRINT_LOG);
 

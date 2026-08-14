@@ -88,6 +88,16 @@ inline Relation makeRelation(uint32_t id1, uint32_t id2, uint16_t weight) {
 static const int RELATION_ZSTD_LEVEL = 1;             // ~500 MB/s/core; emit runs near 100 MB/s
 static const size_t RELATION_WRITE_ELEMS = 65'536;    // 768 KB of records per compressor feed
 
+// How far either side of a common-k-mer hit is discarded along with the hit. Constant rather than
+// a parameter: on the fixture it removes 17% of k-mers but only 0.7% of edges, so it lowers
+// weights instead of deleting pairs and there is nothing to tune. --min-overlap-ratio scales with
+// the surviving k-mer count and absorbs the shift.
+static const int COMMON_KMER_NEIGHBOR_SPAN = 1;
+
+// Two units are never merged on a single weak link, whatever --merge-support-ratio resolves to.
+// One link is what chance sharing across a repeat looks like.
+static const uint32_t MERGE_SUPPORT_FLOOR = 2;
+
 static inline void relationStreamFatal(const std::string & path, const char * action) {
     std::cerr << "Error " << action << " file: " << path
               << " (" << strerror(errno) << ")" << std::endl;
@@ -701,7 +711,7 @@ public:
 
     // No processedReadCnt: routing now happens in saveSubGraphToFile, which is where the
     // read count is needed. This function only folds and merges what is already partitioned.
-    void mergeGraph(std::vector<uint64_t>& edgeWeightHist);
+    void mergeGraph();
 
     // Merge one batch of sorted subgraph files into a single sorted file, summing the weights
     // of duplicate (id1,id2) pairs. Returns the number of records written. Used to fold many
@@ -725,7 +735,7 @@ public:
     void mergeUnit(size_t route, size_t shard, const std::string& outPath,
                    const std::vector<std::string>& files,
                    size_t bufElems, size_t maxFanIn,
-                   std::vector<uint64_t>& histOut, size_t& mergedOut, size_t& ceilingOut);
+                   size_t& mergedOut, size_t& ceilingOut);
 
     // --- Incremental fold ---------------------------------------------------------------
     // Units are numbered route-major with a fixed stride so the index is a pure function of
@@ -777,8 +787,6 @@ public:
         return folded + (numOfGraph - foldedUpTo);
     }
 
-    static int kneeThreshold(const std::vector<uint64_t>& hist, int minWeight);
-
     void mergeGraph_one(size_t processedReadCnt);
     
     void makeGroups(int groupKmerThr,
@@ -791,9 +799,16 @@ public:
     // support at the unit level -- rather than testing node-level triangles -- is what makes
     // this affordable: two singletons can only ever have one edge between them, so every pair
     // worth counting involves at least one multi-read core group.
+    //
+    // `supportRatio` > 0 requires the support to scale with the smaller unit's read count, and
+    // switches the count from weak edges to the distinct reads on the smaller side that carry
+    // one. Both changes matter: chance links grow with |u| * |v|, so a fixed count is met
+    // automatically on high-coverage data, and one repeat-bearing read linked to many reads of
+    // the other unit produces many edges but only one distinct read. 0 keeps the plain edge
+    // count with the floor alone, which is the pre-ratio behaviour.
     void mergeBySupport(int coreThr,
                         int weakThr,
-                        int minSupport,
+                        float supportRatio,
                         size_t processedReadCnt,
                         std::unordered_map<uint32_t, std::unordered_set<uint32_t>> &groupInfo,
                         std::vector<uint32_t> &queryGroupInfo);

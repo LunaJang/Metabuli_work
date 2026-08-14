@@ -3,36 +3,33 @@
 #include "LocalParameters.h"
 #include "FileUtil.h"
 #include "common.h"
+#include <fstream>
+#include <string>
 
-void setGroupGenerationDefaults(LocalParameters & par){    
-    // Drops k-mers adjacent to a common-k-mer hit, not just the hit itself. On the fixture
-    // this removes 17% of k-mers but only 0.7% of edges -- it lowers weights rather than
-    // deleting pairs, so it is not a disk-volume lever. --min-overlap-ratio scales with the
-    // surviving k-mer count and absorbs the shift; a fixed threshold would not.
-    par.neighborKmers = 1;
-    // Phase 2 floor. Sweeping it over 10/5/1 on the species-inclusion benchmark left the useful
-    // signal identical (reads landing in their species' dominant group: 0.08602/0.08602/0.08607);
-    // it only trades coverage against concentration. 5 is picked for the query reduction it buys
-    // (4.1x vs 3.2x at 10) without the purity loss seen at 1.
-    par.minEdgeWeight = 5;
-    // Absolute cap is the primary brake on Sum C(m,2): it bounds a single k-mer's edge
-    // contribution regardless of read count. The ratio threshold scales with the dataset
-    // (readCnt * ratio), so one value cannot fit both a 5k-read and a 62M-read run --
-    // 0.0001 skipped everything on the former and 11 k-mers on the latter. Ratio is left
-    // off by default and kept only as a secondary net.
-    par.maxKmerFreqRatio = 0.0f;
+void setGroupGenerationDefaults(LocalParameters & par){
+    // Absolute cap on reads per k-mer -- the primary brake on Sum C(m,2). It bounds a single
+    // k-mer's edge contribution regardless of read count, which is why it is kept as a resource
+    // knob rather than expressed as a fraction of the read count: a fraction cannot fit both a
+    // 5k-read and a 62M-read run (0.0001 skipped everything on the former and 11 k-mers on the
+    // latter, which is why --max-kmer-freq-ratio was dropped).
     par.maxKmerReads = 1000; // provisional; C(1000,2) = 499,500 edges per k-mer
 
     // Phase 1 core threshold as a fraction of k-mers per read. Measured on the species-inclusion
     // benchmark (61.7 M reads, 49.6 k-mers/read -> core threshold 15): 0.3 is the peak, with 0.2,
-    // 0.4 and 0.5 all below it. Note the usable range starts above --min-edge / k-mers-per-read;
-    // a ratio resolving to <= --min-edge is rejected and knee detection takes over instead.
+    // 0.4 and 0.5 all below it.
     par.minOverlapRatio = 0.3f;
-    // Phase 1.5 support threshold -- the one knob that moved the useful signal (+62% at a fixed
-    // Phase 1 and 2), and it also flattens the sensitivity to the core threshold: without it,
-    // core 25 -> 15 gained 73%; with it, 8%. 2 and 3 are within noise of each other; 2 leaves
-    // 10% fewer groups.
-    par.minSupport = 2;
+    // Weak-band lower bound as a fraction of the core threshold, also Phase 2's floor.
+    // 5/15 = 0.3333 reproduces the species-inclusion operating point, where the band was (5, 15].
+    // The absolute 5 it replaces meant different things per dataset: 5/15 = 0.333 of the core on
+    // that benchmark but 5/34 = 0.147 on CAMI2 marine, so marine's band was three times as wide
+    // in absolute terms and Phase 1.5 there absorbed far more chance links.
+    par.weakBandRatio = 0.3333f;
+    // Phase 1.5 support as a fraction of the smaller unit's read count. 0 keeps the pre-ratio
+    // behaviour (count weak edges, floor 2), which is the measured operating point; the ratio is
+    // opt-in until a value is measured on marine. Sweeping the old absolute support over 2/3 was
+    // within noise, but it is not scale-free -- chance links between units A and B grow with
+    // |A| * |B|, so a fixed count is met automatically once coverage is high.
+    par.mergeSupportRatio = 0.0f;
     // Peak disk the subGraph_* intermediates may hold at once. 0 derives it from the free space
     // at the output directory (80%). A safety ceiling, not a performance target -- a run that
     // fits under it never folds early, so machines with room pay nothing for it. This function
@@ -58,6 +55,61 @@ int groupGeneration(int argc, const char **argv, const Command& command)
         par.kmerFormat = 3;
     } else {
         par.kmerFormat = 5;
+    }
+
+    // Both algorithm thresholds are ratios and there is no absolute fallback for either, so a
+    // value outside its usable range has to stop the run rather than silently pick something else.
+    if (par.minOverlapRatio <= 0.0f) {
+        cerr << "Error: --min-overlap-ratio must be > 0 (given " << par.minOverlapRatio << ")." << endl;
+        cerr << "       The Phase 1 core threshold is derived from it as ratio x k-mers per read;" << endl;
+        cerr << "       there is no absolute threshold to fall back to." << endl;
+        return 1;
+    }
+    if (par.weakBandRatio <= 0.0f || par.weakBandRatio >= 1.0f) {
+        cerr << "Error: --weak-band-ratio must be in (0, 1) (given " << par.weakBandRatio << ")." << endl;
+        cerr << "       It is the weak band's lower bound as a fraction of the core threshold:" << endl;
+        cerr << "       at 0 the band would swallow every edge, at 1 it would be empty." << endl;
+        return 1;
+    }
+    if (par.mergeSupportRatio < 0.0f || par.mergeSupportRatio > 1.0f) {
+        cerr << "Error: --merge-support-ratio must be in [0, 1] (given " << par.mergeSupportRatio << ")." << endl;
+        cerr << "       It is a fraction of the smaller unit's read count; above 1 no pair can" << endl;
+        cerr << "       ever qualify. 0 disables the ratio and keeps the plain floor of 2." << endl;
+        return 1;
+    }
+
+    // The query k-mers have to be built the same way as the common k-mer DB, or the two k-mer
+    // spaces do not line up and the common-k-mer filter silently removes nothing. DBs built
+    // before this record existed cannot be checked; warn instead of failing on those.
+    {
+        const std::string dbDir = par.filenames[1 + (par.seqMode == 2)];
+        const std::string paramFile = dbDir + "/kmer_params";
+        if (FileUtil::fileExists(paramFile.c_str())) {
+            int dbSyncmer = -1, dbSmerLen = -1, dbKmerFormat = -1;
+            std::ifstream in(paramFile);
+            std::string key;
+            int value = 0;
+            while (in >> key >> value) {
+                if (key == "syncmer") { dbSyncmer = value; }
+                else if (key == "smer_len") { dbSmerLen = value; }
+                else if (key == "kmer_format") { dbKmerFormat = value; }
+            }
+            if (dbSyncmer != par.syncmer || dbSmerLen != par.smerLen || dbKmerFormat != par.kmerFormat) {
+                cerr << "Error: k-mer settings do not match the common k-mer DB at " << dbDir << "." << endl;
+                cerr << "       DB:      --syncmer " << dbSyncmer << " --smer-len " << dbSmerLen
+                     << " (k-mer format " << dbKmerFormat << ")" << endl;
+                cerr << "       Request: --syncmer " << par.syncmer << " --smer-len " << par.smerLen
+                     << " (k-mer format " << par.kmerFormat << ")" << endl;
+                cerr << "       Rebuild the DB with these settings, or pass the DB's settings." << endl;
+                return 1;
+            }
+        } else {
+            cerr << "[WARN] " << paramFile << " is missing, so the DB's k-mer settings cannot be"
+                 << " checked against --syncmer " << par.syncmer << " --smer-len " << par.smerLen
+                 << "." << endl;
+            cerr << "[WARN] The DB predates the check. A mismatch would make the common k-mer"
+                 << " filter remove nothing, silently." << endl;
+        }
     }
 
     if (par.seqMode == 2) {

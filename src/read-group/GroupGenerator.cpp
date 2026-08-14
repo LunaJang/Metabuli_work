@@ -159,69 +159,56 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
     if (printLog) {
         mergeGraph_one(processedReadCnt);
     } else {
-        std::vector<uint64_t> edgeWeightHist;
-        mergeGraph(edgeWeightHist);
-
-        // The knee is always computed, even when unused, so its value can be compared against
-        // whatever is actually applied. edgeWeightHist is built by mergeGraph regardless, so
-        // this costs nothing.
-        int kneeEdge = kneeThreshold(edgeWeightHist, par.minEdgeWeight);
-        if (kneeEdge > par.minEdgeWeight && par.kneeScale != 1.0f) {
-            // --knee-scale < 1.0 lowers the core threshold; clamp so Phase 2 stays enabled.
-            kneeEdge = static_cast<int>(kneeEdge * par.kneeScale + 0.5f);
-            if (kneeEdge < par.minEdgeWeight + 1) kneeEdge = par.minEdgeWeight + 1;
-        }
+        mergeGraph();
 
         // An edge weight counts the k-mers two reads share, so weight / kmersPerRead is the
-        // fraction of a read the two overlap by. That makes the threshold a property of read
-        // geometry rather than of the weight distribution's shape -- unlike the knee, which
-        // tracks the tail's extent and therefore shifts with read length and coverage.
+        // fraction of a read the two overlap by. That makes the core threshold a property of read
+        // geometry: one ratio means the same overlap on every dataset, which an absolute weight
+        // does not. There is no fallback -- --min-overlap-ratio is validated to be > 0 before the
+        // run starts, so a threshold that cannot be formed is a hard error, not a switch to some
+        // other rule.
         const double kmersPerRead = (processedReadCnt > 0)
             ? static_cast<double>(totalFilteredKmers) / static_cast<double>(processedReadCnt)
             : 0.0;
-        const int ratioEdge = (par.minOverlapRatio > 0.0f && kmersPerRead > 0.0)
-            ? static_cast<int>(par.minOverlapRatio * kmersPerRead + 0.5)
-            : 0;
+        const int coreThr = static_cast<int>(par.minOverlapRatio * kmersPerRead + 0.5);
+        if (coreThr < 2) {
+            cerr << "Error: core threshold resolves to " << coreThr << " (overlap ratio "
+                 << par.minOverlapRatio << " x " << kmersPerRead << " k-mers/read)." << endl;
+            cerr << "       It must be at least 2, or every shared k-mer would form a core edge"
+                 << " and no weak band would exist." << endl;
+            cerr << "       Raise --min-overlap-ratio, or check that the common k-mer filter did"
+                 << " not remove nearly every k-mer." << endl;
+            exit(EXIT_FAILURE);
+        }
 
-        int effectiveCoreEdge = par.coreEdgeWeight;
-        if (ratioEdge > par.minEdgeWeight) {
-            effectiveCoreEdge = ratioEdge;
-            cout << "Core threshold: " << effectiveCoreEdge << " (overlap ratio "
-                 << par.minOverlapRatio << " x " << kmersPerRead << " k-mers/read)"
-                 << " [knee would give " << kneeEdge << "]" << endl;
-        } else if (par.minOverlapRatio > 0.0f) {
-            cout << "Core threshold: overlap ratio " << par.minOverlapRatio << " x "
-                 << kmersPerRead << " k-mers/read = " << ratioEdge
-                 << " is not above --min-edge " << par.minEdgeWeight
-                 << "; falling back" << endl;
-        }
-        if (effectiveCoreEdge == par.coreEdgeWeight) {
-            if (kneeEdge > par.minEdgeWeight) {
-                effectiveCoreEdge = kneeEdge;
-                cout << "Auto coreEdgeWeight (knee x" << par.kneeScale << "): "
-                     << effectiveCoreEdge << endl;
-            } else {
-                cout << "Knee: insufficient data, using --core-edge: "
-                     << effectiveCoreEdge << endl;
-            }
-        }
+        // Weak band lower bound, as a fraction of the core threshold. Keeping it proportional is
+        // the point: an absolute 5 was 5/15 = 0.333 of the core on the species-inclusion benchmark
+        // but 5/34 = 0.147 on CAMI2 marine, so marine's band was three times wider in absolute
+        // terms and Phase 1.5 there took in far more chance links. The clamps only guard rounding:
+        // the band has to contain at least one weight and stay below the core threshold.
+        int weakThr = static_cast<int>(par.weakBandRatio * coreThr + 0.5f);
+        if (weakThr < 1) { weakThr = 1; }
+        if (weakThr >= coreThr) { weakThr = coreThr - 1; }
+
+        cout << "Core threshold: " << coreThr << " (overlap ratio " << par.minOverlapRatio
+             << " x " << kmersPerRead << " k-mers/read)" << endl;
+        cout << "Weak band: (" << weakThr << ", " << coreThr << "] (ratio " << par.weakBandRatio
+             << " x core " << coreThr << "); Phase 2 floor " << weakThr << endl;
 
         // Phase 1: form core groups with strong edges
-        makeGroups(effectiveCoreEdge, processedReadCnt, groupInfo, queryGroupInfo);
+        makeGroups(coreThr, processedReadCnt, groupInfo, queryGroupInfo);
 
-        // Phase 1.5: merge units connected by several independent weak edges
-        if (par.minSupport > 0 && effectiveCoreEdge > par.minEdgeWeight) {
-            mergeBySupport(effectiveCoreEdge, par.minEdgeWeight, par.minSupport,
-                           processedReadCnt, groupInfo, queryGroupInfo);
-        }
+        // Phase 1.5: merge units joined by several independent weak links
+        mergeBySupport(coreThr, weakThr, par.mergeSupportRatio,
+                       processedReadCnt, groupInfo, queryGroupInfo);
 
         // Phase 2: link Phase-1 singletons among themselves with weak edges
-        if (effectiveCoreEdge > par.minEdgeWeight) {
+        {
             std::vector<bool> isSingleton(processedReadCnt + 1, false);
             for (uint32_t i = 1; i <= processedReadCnt; i++) {
                 if (queryGroupInfo[i] == 0) isSingleton[i] = true;
             }
-            makeGroupsPhase2(par.minEdgeWeight, processedReadCnt, isSingleton, groupInfo, queryGroupInfo);
+            makeGroupsPhase2(weakThr, processedReadCnt, isSingleton, groupInfo, queryGroupInfo);
         }
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
@@ -388,11 +375,11 @@ void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
             // same seq
             else{
                 // copy
-                if (int64_t(qKmers.buffer[lookingPos].qInfo.pos) < int(matchBuffer.buffer[matchIdx].second) - par.neighborKmers){
+                if (int64_t(qKmers.buffer[lookingPos].qInfo.pos) < int(matchBuffer.buffer[matchIdx].second) - COMMON_KMER_NEIGHBOR_SPAN){
                     qKmers.buffer[storePos++] = qKmers.buffer[lookingPos++];
                 }
                 // next target check
-                else if(int(matchBuffer.buffer[matchIdx].second) + par.neighborKmers < int64_t(qKmers.buffer[lookingPos].qInfo.pos)){
+                else if(int(matchBuffer.buffer[matchIdx].second) + COMMON_KMER_NEIGHBOR_SPAN < int64_t(qKmers.buffer[lookingPos].qInfo.pos)){
                     matchIdx++;
                 }
                 // pass
@@ -549,17 +536,12 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     std::vector<uint64_t> mHistKmers(M_HIST_BUCKETS, 0);
     std::vector<uint64_t> mHistPairs(M_HIST_BUCKETS, 0);
 
-    // Skip thresholds, resolved once. The ratio threshold is floored at 2: readCnt * ratio
-    // truncates to 0 whenever it is below 1, and "m > 0" skips every k-mer including m = 1,
-    // which yields zero edges and zero groups. That is never the intent.
-    const size_t ratioThr = (par.maxKmerFreqRatio > 0.0f)
-        ? std::max<size_t>(2, static_cast<size_t>(static_cast<double>(processedReadCnt) * par.maxKmerFreqRatio))
-        : 0;
+    // Skip threshold, resolved once. Absolute rather than a fraction of the read count: a
+    // fraction cannot fit both a 5k-read and a 62M-read run, which is why --max-kmer-freq-ratio
+    // was removed (0.0001 skipped everything on the former and 11 k-mers on the latter).
     const size_t absThr = (par.maxKmerReads > 0) ? static_cast<size_t>(par.maxKmerReads) : 0;
-    cout << "[skip] thresholds: --max-kmer-reads "
-         << (absThr > 0 ? to_string(absThr) : string("off"))
-         << ", --max-kmer-freq-ratio " << par.maxKmerFreqRatio
-         << " (m > " << (ratioThr > 0 ? to_string(ratioThr) : string("off")) << ")" << endl;
+    cout << "[skip] threshold: --max-kmer-reads "
+         << (absThr > 0 ? to_string(absThr) : string("off")) << endl;
 
     #pragma omp parallel num_threads(par.threads)
     {
@@ -637,7 +619,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 localHistPairs[bucket] += static_cast<uint64_t>(m) * static_cast<uint64_t>(m - 1) / 2;
             }
 
-            if ((absThr > 0 && m > absThr) || (ratioThr > 0 && m > ratioThr)) {
+            if (absThr > 0 && m > absThr) {
                 skippedPart << minKmer << "\t" << m << "\n";
                 localSkippedCnt++;
                 localSumM += m;
@@ -738,10 +720,10 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << ", sum m: " << skippedSumM
              << ", est. dropped read-pairs: " << skippedPairEst << ")" << endl;
         cout << "[skip] see " << outDir << "/skipped_kmers" << endl;
-    } else if (absThr == 0 && ratioThr == 0) {
-        cout << "[skip] 0 k-mers skipped (both thresholds off)" << endl;
+    } else if (absThr == 0) {
+        cout << "[skip] 0 k-mers skipped (--max-kmer-reads off)" << endl;
     } else {
-        cout << "[skip] 0 k-mers skipped (no k-mer exceeded the thresholds)" << endl;
+        cout << "[skip] 0 k-mers skipped (no k-mer exceeded the threshold)" << endl;
     }
 
     // k-mer files are fully consumed by the merge above; report + remove to free disk.
@@ -1134,9 +1116,7 @@ void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_
 void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & outPath,
                                const std::vector<std::string> & inputFiles,
                                size_t bufElems, size_t maxFanIn,
-                               std::vector<uint64_t> & histOut, size_t & mergedOut,
-                               size_t & ceilingOut) {
-    histOut.assign(65536, 0);
+                               size_t & mergedOut, size_t & ceilingOut) {
     mergedOut = 0;
     ceilingOut = 0;
 
@@ -1182,7 +1162,6 @@ void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & o
         }
         if (totalWeight == UINT16_MAX) ceilingOut++;
         mergedOut++;
-        if (totalWeight > 0) histOut[totalWeight]++;
 
         // Zeroed in place, not via a helper's return value -- see mergeGraph_one for why.
         Relation rel;
@@ -1200,73 +1179,9 @@ void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & o
     }
 }
 
-int GroupGenerator::kneeThreshold(const std::vector<uint64_t>& hist, int minWeight) {
-    const int wLo = minWeight + 1;                 // Phase 1 only cuts above minWeight
- 
-    // Scan the usable domain: total edges, highest non-empty weight, distinct bins.
-    uint64_t N = 0;
-    int wmax = 0;
-    int nonzero = 0;
-    for (int w = wLo; w < static_cast<int>(hist.size()); w++) {
-        if (hist[w] > 0) {
-            N += hist[w];
-            wmax = w;
-            nonzero++;
-        }
-    }
-    if (N == 0) return 0;                           // no edges above minWeight
-    if (nonzero < 3 || wmax <= minWeight) return 0; // too few points to form a curve
- 
-    // --- robust wHi: anchor the chord's top end where enough edges actually
-    // support that weight, instead of at the single largest (possibly
-    // near-empty outlier) weight bin. minSamples floors at 100 edges or
-    // 0.05% of N, whichever is larger, so it scales with dataset size.
-    const uint64_t minSamples = std::max<uint64_t>(100, static_cast<uint64_t>(N * 0.0005));
-    uint64_t survFromTop = 0;
-    int wHi = wLo;
-    for (int w = wmax; w >= wLo; w--) {
-        survFromTop += hist[w];
-        if (survFromTop >= minSamples) {
-            wHi = w;
-            break;
-        }
-    }
-    if (wHi <= wLo) return 0;                       // not enough support anywhere above wLo
- 
-    // survFromTop was accumulated top-down from wmax to wHi, so it already
-    // equals surv(wHi) = #edges with weight >= wHi.
-    const uint64_t survHi = survFromTop;
-    // --- end robust wHi ---
- 
-    const double xden = static_cast<double>(wHi - wLo);
-    const double yden = static_cast<double>(N - survHi);
-    if (xden <= 0.0 || yden <= 0.0) return 0;       // degenerate curve
- 
-    // CCDF surv(w) = #edges with weight >= w, monotone decreasing. After normalizing
-    // x,y to [0,1] (endpoints (0,1) and (1,0)), the convex curve lies below the chord
-    // y = 1 - x; the knee is the point of maximum distance below that chord.
-    double bestDist = -1.0;
-    int knee = 0;
-    uint64_t cumBelow = 0;                          // edges with weight in [wLo, w)
-    for (int w = wLo; w <= wHi; w++) {
-        const uint64_t surv = N - cumBelow;
-        const double xn = static_cast<double>(w - wLo) / xden;
-        const double yn = (static_cast<double>(surv) - static_cast<double>(survHi)) / yden;
-        const double dist = (1.0 - xn) - yn;
-        if (dist > bestDist) {
-            bestDist = dist;
-            knee = w;
-        }
-        cumBelow += hist[w];
-    }
- 
-    return (knee > minWeight) ? knee : 0;
-}
-
-void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
+void GroupGenerator::mergeGraph() {
     cout << "Merging subgraphs" << endl;
     time_t before = time(nullptr);
-    edgeWeightHist.assign(65536, 0);
 
     // Units merge independently: saveSubGraphToFile already split every flush by
     // (relations_* route, shard), and both are functions of the ids alone, so no pair spans
@@ -1334,7 +1249,6 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
         }
     }
 
-    std::vector<std::vector<uint64_t>> unitHist(unitCnt);
     std::vector<size_t> unitMerged(unitCnt, 0);
     std::vector<size_t> unitCeiling(unitCnt, 0);
     std::vector<double> unitSeconds(unitCnt, 0.0);
@@ -1345,7 +1259,7 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
         const time_t unitStart = time(nullptr);
         mergeUnit(units[u].first, units[u].second, unitOutPath(units[u].first, units[u].second),
                   unitInputFiles(units[u].first, units[u].second),
-                  mergeBufElems, maxFanIn, unitHist[u], unitMerged[u], unitCeiling[u]);
+                  mergeBufElems, maxFanIn, unitMerged[u], unitCeiling[u]);
         unitSeconds[u] = double(time(nullptr) - unitStart);
     }
 
@@ -1381,9 +1295,6 @@ void GroupGenerator::mergeGraph(std::vector<uint64_t>& edgeWeightHist) {
     for (size_t u = 0; u < unitCnt; ++u) {
         mergedEdgeCnt += unitMerged[u];
         ceilingEdgeCnt += unitCeiling[u];
-        for (size_t w = 0; w < edgeWeightHist.size(); ++w) {
-            edgeWeightHist[w] += unitHist[u][w];
-        }
         if (unitMerged[u] > unitMerged[heaviest]) { heaviest = u; }
     }
 
@@ -1608,18 +1519,39 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 // A "unit" is a Phase-1 core group (labelled by its minimum read id) or, for a read that Phase 1
 // left alone, the read itself. Group ids are read ids of grouped reads, so a singleton's own id can
 // never collide with a group id. Weak edges are those in (weakThr, coreThr] -- above Phase 2's
-// floor, below the core threshold. Support is counted per unit pair; pairs reaching minSupport are
-// merged. Pairs where both sides are singletons are skipped: distinct edges are merged upstream, so
-// two reads share exactly one edge and can never reach a support of 2. That also keeps the counting
-// map bounded to pairs involving at least one multi-read group.
+// floor, below the core threshold. Pairs where both sides are singletons are skipped: distinct edges
+// are merged upstream, so two reads share exactly one edge and can never reach a support of 2. That
+// also keeps the counting map bounded to pairs involving at least one multi-read group.
+//
+// Pass 1 counts weak EDGES per unit pair. With supportRatio == 0 that count, against the floor, is
+// the whole rule. With supportRatio > 0 the requirement becomes a fraction of the smaller unit's
+// read count and pass 2 recounts the qualifying pairs by DISTINCT READS on the smaller side. Both
+// changes are needed together:
+//   - the requirement has to scale, because chance links between units u and v grow with
+//     |u| * |v|; a fixed count is met automatically once coverage is high.
+//   - the count has to be distinct reads, because one repeat-bearing read linked to 50 reads of the
+//     other unit yields 50 edges but explains only one read -- exactly the case being excluded.
+// Pass 1's edge count is an upper bound on pass 2's distinct-read count, so it is a sound prefilter:
+// a pair that fails on edges cannot pass on distinct reads.
+//
+// Unit sizes are the STATIC Phase-1 sizes, never the disjoint set's evolving component sizes. The
+// support map is an unordered_map, so the order in which pairs are merged is unspecified; a
+// size test against a changing component would make the output depend on that order.
 void GroupGenerator::mergeBySupport(int coreThr,
                                    int weakThr,
-                                   int minSupport,
+                                   float supportRatio,
                                    size_t processedReadCnt,
                                    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
                                    vector<uint32_t> &queryGroupInfo) {
-    cout << "Phase 1.5: merging units with >= " << minSupport
-         << " weak links (weight in (" << weakThr << ", " << coreThr << "])..." << endl;
+    const bool useRatio = (supportRatio > 0.0f);
+    if (useRatio) {
+        cout << "Phase 1.5: merging units whose smaller side has >= max(" << MERGE_SUPPORT_FLOOR
+             << ", " << supportRatio << " x its read count) distinct reads carrying a weak link"
+             << " (weight in (" << weakThr << ", " << coreThr << "])..." << endl;
+    } else {
+        cout << "Phase 1.5: merging units with >= " << MERGE_SUPPORT_FLOOR
+             << " weak links (weight in (" << weakThr << ", " << coreThr << "])..." << endl;
+    }
     time_t t0 = time(nullptr);
 
     const size_t groupsBefore = groupInfo.size();
@@ -1628,6 +1560,13 @@ void GroupGenerator::mergeBySupport(int coreThr,
     std::vector<uint32_t> unit(processedReadCnt + 1, 0);
     for (uint32_t i = 1; i <= processedReadCnt; ++i) {
         unit[i] = queryGroupInfo[i] ? queryGroupInfo[i] : i;
+    }
+
+    // Static Phase-1 unit sizes, indexed by unit id (which is a read id, hence in range).
+    std::vector<uint32_t> unitSize;
+    if (useRatio) {
+        unitSize.assign(processedReadCnt + 1, 0u);
+        for (uint32_t i = 1; i <= processedReadCnt; ++i) { unitSize[unit[i]]++; }
     }
 
     // Counting map memory guard. Entries are ~24 B in unordered_map, so the cap below is a few GB.
@@ -1690,6 +1629,122 @@ void GroupGenerator::mergeBySupport(int coreThr,
     countFile(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin",
               support, SUPPORT_PAIR_CAP, weakEdgeCnt, droppedPairs);
 
+    // Support required of a pair. Without the ratio this is the bare floor, which is the rule the
+    // benchmark operating point was measured with.
+    auto requiredSupport = [&](uint32_t u, uint32_t v) -> uint32_t {
+        if (!useRatio) { return MERGE_SUPPORT_FLOOR; }
+        const uint32_t smaller = std::min(unitSize[u], unitSize[v]);
+        const double need = std::ceil(static_cast<double>(supportRatio) * static_cast<double>(smaller));
+        const uint32_t needed = (need >= static_cast<double>(UINT32_MAX))
+            ? UINT32_MAX : static_cast<uint32_t>(need);
+        return std::max(MERGE_SUPPORT_FLOOR, needed);
+    };
+
+    // Which side of a pair the distinct reads are counted on. Sizes decide it; equal sizes fall back
+    // to the smaller unit id so the choice does not depend on map order.
+    auto smallSideOf = [&](uint32_t u, uint32_t v) -> uint32_t {
+        if (unitSize[u] != unitSize[v]) { return (unitSize[u] < unitSize[v]) ? u : v; }
+        return std::min(u, v);
+    };
+
+    // Pairs that cleared pass 1. With the ratio on, this is only a prefilter -- pass 2 recounts them
+    // by distinct reads, which can only be smaller.
+    std::unordered_map<uint64_t, uint32_t> candidates; // pair -> required support
+    for (const auto& kv : support) {
+        const uint32_t u = static_cast<uint32_t>(kv.first >> 32);
+        const uint32_t v = static_cast<uint32_t>(kv.first & 0xFFFFFFFFull);
+        const uint32_t need = requiredSupport(u, v);
+        if (kv.second >= need) { candidates.emplace(kv.first, need); }
+    }
+
+    // Pass 2: distinct reads on the smaller side, for candidate pairs only.
+    std::unordered_set<uint64_t> satisfied;
+    size_t droppedReads = 0;
+    if (useRatio && !candidates.empty()) {
+        // Read-set memory guard, same contract as SUPPORT_PAIR_CAP: on overflow new reads are
+        // dropped, so a count can only fall short and a merge is never invented.
+        const size_t PASS2_READ_CAP = 200000000;
+        const size_t perThreadReadCap = std::max<size_t>(1, PASS2_READ_CAP / std::max(1, par.threads));
+
+        // A pair is satisfied as soon as `required` distinct reads are seen, so a thread that stops
+        // inserting at that point cannot make any pair's union fall short: no thread stops earlier.
+        auto distinctFile = [&](const std::string& fname,
+                                std::unordered_map<uint64_t, std::unordered_set<uint32_t>>& local,
+                                std::unordered_set<uint64_t>& localSatisfied,
+                                size_t cap, size_t& held, size_t& dropped) {
+            ReadBuffer<Relation> rb(fname, 1024 * 1024);
+            for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+                const uint32_t id1 = r.id1, id2 = r.id2;
+                if (id1 == 0 || id2 == 0) continue;
+                if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
+                const int w = static_cast<int>(r.weight);
+                if (w <= weakThr || w > coreThr) continue;
+                if (queryGroupInfo[id1] == 0 && queryGroupInfo[id2] == 0) continue;
+                const uint32_t u = unit[id1], v = unit[id2];
+                if (u == v) continue;
+                const uint64_t key = packPair(u, v);
+                const auto cand = candidates.find(key);
+                if (cand == candidates.end()) continue;
+                if (localSatisfied.count(key)) continue;
+                const uint32_t small = smallSideOf(u, v);
+                const uint32_t readId = (unit[id1] == small) ? id1 : id2;
+                if (held >= cap) { dropped++; continue; }
+                auto& reads = local[key];
+                if (reads.insert(readId).second) { held++; }
+                if (reads.size() >= cand->second) {
+                    localSatisfied.insert(key);
+                    held -= reads.size();
+                    local.erase(key);
+                }
+            }
+        };
+
+        size_t heldReads = 0;
+        std::unordered_map<uint64_t, std::unordered_set<uint32_t>> partial;
+        #pragma omp parallel num_threads(par.threads)
+        {
+            const int threadIdx = omp_get_thread_num();
+            std::unordered_map<uint64_t, std::unordered_set<uint32_t>> local;
+            std::unordered_set<uint64_t> localSatisfied;
+            size_t localHeld = 0, localDropped = 0;
+
+            distinctFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin",
+                         local, localSatisfied, perThreadReadCap, localHeld, localDropped);
+            distinctFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin",
+                         local, localSatisfied, perThreadReadCap, localHeld, localDropped);
+
+            #pragma omp critical
+            {
+                satisfied.insert(localSatisfied.begin(), localSatisfied.end());
+                for (const auto& kv : local) {
+                    partial[kv.first].insert(kv.second.begin(), kv.second.end());
+                }
+                heldReads += localHeld;
+                droppedReads += localDropped;
+            }
+        }
+        // Unions can have crossed the requirement even when no single thread's share did.
+        for (auto it = partial.begin(); it != partial.end(); ) {
+            if (it->second.size() >= candidates[it->first]) {
+                satisfied.insert(it->first);
+                it = partial.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        distinctFile(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin",
+                     partial, satisfied, PASS2_READ_CAP, heldReads, droppedReads);
+
+        cout << "Phase 1.5: " << candidates.size() << " candidate pairs, " << satisfied.size()
+             << " reached the distinct-read requirement (" << heldReads
+             << " reads still held for the rest)";
+        if (droppedReads) {
+            cout << " [read cap hit, " << droppedReads
+                 << " observations dropped -- support undercounted]";
+        }
+        cout << endl;
+    }
+
     // Merge: start from the Phase-1 components, then add the supported pairs.
     DisjointSet ds(processedReadCnt);
     for (uint32_t i = 1; i <= processedReadCnt; ++i) {
@@ -1698,8 +1753,8 @@ void GroupGenerator::mergeBySupport(int coreThr,
         }
     }
     size_t mergedPairs = 0;
-    for (const auto& kv : support) {
-        if (kv.second < static_cast<uint32_t>(minSupport)) continue;
+    for (const auto& kv : candidates) {
+        if (useRatio && satisfied.count(kv.first) == 0) continue;
         const uint32_t u = static_cast<uint32_t>(kv.first >> 32);
         const uint32_t v = static_cast<uint32_t>(kv.first & 0xFFFFFFFFull);
         ds.unionSets(u, v);
@@ -1730,7 +1785,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
     }
 
     cout << "Phase 1.5: " << weakEdgeCnt << " weak edges over " << support.size()
-         << " unit pairs, " << mergedPairs << " pairs reached support " << minSupport
+         << " unit pairs, " << mergedPairs << " pairs merged"
          << "; groups " << groupsBefore << " -> " << groupInfo.size();
     if (droppedPairs) {
         cout << " [pair cap hit, " << droppedPairs << " observations dropped -- support undercounted]";
