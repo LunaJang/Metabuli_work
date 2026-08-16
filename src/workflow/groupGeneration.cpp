@@ -13,6 +13,10 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // 5k-read and a 62M-read run (0.0001 skipped everything on the former and 11 k-mers on the
     // latter, which is why --max-kmer-freq-ratio was dropped).
     par.maxKmerReads = 1000; // provisional; C(1000,2) = 499,500 edges per k-mer
+    // Automatic selection of the cap above from the reads-per-k-mer distribution. Off for now:
+    // --max-kmer-reads is set, and an explicit cap wins, so this changes nothing until the
+    // default above is dropped to 0.
+    par.maxKmerQuantile = 0.0f;
 
     // Phase 1 core threshold as a fraction of k-mers per read. Measured on the species-inclusion
     // benchmark (61.7 M reads, 49.6 k-mers/read -> core threshold 15): 0.3 is the peak, with 0.2,
@@ -69,6 +73,12 @@ int groupGeneration(int argc, const char **argv, const Command& command)
         cerr << "Error: --weak-band-ratio must be in (0, 1) (given " << par.weakBandRatio << ")." << endl;
         cerr << "       It is the weak band's lower bound as a fraction of the core threshold:" << endl;
         cerr << "       at 0 the band would swallow every edge, at 1 it would be empty." << endl;
+        return 1;
+    }
+    if (par.maxKmerQuantile < 0.0f || par.maxKmerQuantile > 1.0f) {
+        cerr << "Error: --max-kmer-quantile must be in [0, 1] (given " << par.maxKmerQuantile << ")." << endl;
+        cerr << "       It is the share of k-mers (counted over those in at least two reads)" << endl;
+        cerr << "       that the reads-per-k-mer cap keeps. 0 disables the automatic cap." << endl;
         return 1;
     }
     if (par.mergeSupportRatio < 0.0f || par.mergeSupportRatio > 1.0f) {

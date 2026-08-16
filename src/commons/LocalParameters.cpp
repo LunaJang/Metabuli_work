@@ -218,6 +218,19 @@ LocalParameters::LocalParameters() :
                 typeid(int),
                 (void *) &maxKmerReads,
                 "^[0-9]+$"),
+        MAX_KMER_QUANTILE(MAX_KMER_QUANTILE_ID,
+                "--max-kmer-quantile",
+                "Share of k-mers the reads-per-k-mer cap keeps (0=disabled)",
+                "Picks --max-kmer-reads from the data instead of a fixed number: the cap becomes "
+                "the smallest power-of-two bound covering this share of the k-mers that occur in "
+                "at least two reads. A k-mer's read count tracks per-genome coverage, not the "
+                "size of the dataset, so one constant cannot fit two datasets while one quantile "
+                "can. Measuring the distribution costs one extra pass over the k-mer files. "
+                "Ignored when --max-kmer-reads is given; 0 disables it, leaving no cap unless "
+                "--max-kmer-reads is set.",
+                typeid(float),
+                (void *) &maxKmerQuantile,
+                "^[0-9]*\\.?[0-9]+$"),
         MIN_OVERLAP_RATIO(MIN_OVERLAP_RATIO_ID,
                 "--min-overlap-ratio",
                 "Phase 1 core threshold as a fraction of k-mers per read",
@@ -618,6 +631,7 @@ LocalParameters::LocalParameters() :
     // comes from. See setGroupGenerationDefaults(), which overrides these for the grouping
     // workflow -- both places have to agree.
     maxKmerReads = 0;
+    maxKmerQuantile = 0.0f;
     minOverlapRatio = 0.3f;
     weakBandRatio = 0.3333f;
     mergeSupportRatio = 0.0f;
@@ -729,6 +743,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&SYNCMER);
     groupGeneration.push_back(&SMER_LEN);
     groupGeneration.push_back(&MAX_KMER_READS);
+    groupGeneration.push_back(&MAX_KMER_QUANTILE);
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);
     groupGeneration.push_back(&WEAK_BAND_RATIO);
     groupGeneration.push_back(&MERGE_SUPPORT_RATIO);

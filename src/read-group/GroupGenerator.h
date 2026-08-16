@@ -596,6 +596,45 @@ static inline size_t mHistBucket(size_t m) {
     return bucket; // floor(log2(m)) for m >= 1; 0 for m == 0
 }
 
+// Smallest log2-bucket upper bound (3, 7, 15, 31, ...) covering `quantile` of the k-mers with
+// m >= 2, i.e. the cap that keeps that share of distinct k-mers and drops the tail above it.
+//
+// The normaliser is the k-mer count, not the pair count. m does not scale with the size of the
+// dataset -- it scales with per-genome coverage, so a fraction of the read count cannot serve
+// (which is why --max-kmer-freq-ratio was removed). Weighting by pairs would not work either:
+// on CAMI2 strain-madness a single bucket holds 52% of all pair occurrences, so a pair-weighted
+// quantile cuts into the body. The k-mer count is what locates the body/tail boundary.
+//
+// Returns 0 for "no cap": the quantile is outside (0, 1), the histogram is empty, or the
+// distribution never reaches the quantile. Pure function of the histogram, so two runs over the
+// same data pick the same cap regardless of thread count.
+static inline size_t capFromQuantile(const std::vector<uint64_t> & mHistKmers, float quantile) {
+    if (!(quantile > 0.0f) || !(quantile < 1.0f)) {
+        return 0;
+    }
+    uint64_t total = 0;
+    for (size_t b = 0; b < mHistKmers.size(); ++b) {
+        total += mHistKmers[b];
+    }
+    if (total == 0) {
+        return 0;
+    }
+    const double target = static_cast<double>(total) * static_cast<double>(quantile);
+    uint64_t cumulative = 0;
+    for (size_t b = 0; b < mHistKmers.size(); ++b) {
+        cumulative += mHistKmers[b];
+        if (static_cast<double>(cumulative) >= target) {
+            // Bucket b holds m in [2^b, 2^(b+1) - 1]; the cap is that range's upper bound.
+            // Shifting by 63 or more is undefined, and a cap that large caps nothing anyway.
+            if (b + 1 >= 63) {
+                return 0;
+            }
+            return (static_cast<size_t>(1) << (b + 1)) - 1;
+        }
+    }
+    return 0;
+}
+
 // Floor for mergeGraph's per-stream read buffer. Reaching it means numOfGraph is so large
 // that even the memory budget cannot give each stream a useful buffer; mergeGraph warns,
 // and the real fix is multi-round merging (not implemented).
@@ -702,7 +741,80 @@ public:
                                                          size_t offset);
 
     void makeSubGraph(size_t processedReadCnt);
-    
+
+    // Walks one thread's kmer_delta_*/kmer_info_* files in k-mer order and hands each distinct
+    // k-mer's sorted, deduplicated read ids to `onKmer`. Template rather than std::function: the
+    // callback fires once per distinct k-mer (452 M times on CAMI2 strain-madness) and the scan
+    // steps through 4.9e9 k-mer instances, so an indirect call per k-mer is not free.
+    //
+    // `valuesScanned` is incremented, never assigned. makeSubGraph publishes it into
+    // kmerValuesDone at every flush and then zeroes it, and the disk projection depends on that
+    // cadence -- the callback runs inside this loop, so it can reset the counter itself.
+    //
+    // kmerValuesTotal is accumulated here, once per reader. A caller that runs the scan twice
+    // has to reset it in between, or the projection's denominator doubles.
+    template <typename OnKmer>
+    void scanKmerRuns(int threadIdx, size_t processedReadCnt, uint64_t & valuesScanned,
+                      OnKmer && onKmer) {
+        std::vector<std::unique_ptr<DeltaIdxReader>> readers;
+        readers.reserve(numOfSplits);
+        std::vector<Kmer> currentKmers;
+        currentKmers.reserve(numOfSplits);
+        for (size_t i = 0; i < numOfSplits; ++i) {
+            const std::string diffFile = outDir + "/kmer_delta_" + std::to_string(i)
+                                       + "_" + std::to_string(threadIdx);
+            const std::string infoFile = outDir + "/kmer_info_" + std::to_string(i)
+                                       + "_" + std::to_string(threadIdx);
+            readers.push_back(std::unique_ptr<DeltaIdxReader>(
+                new DeltaIdxReader(diffFile, infoFile, 1024 * 1024, 1024 * 1024)));
+            currentKmers.push_back(readers.back()->next());
+            // Denominator of the emit progress used to project the write volume.
+            kmerValuesTotal.fetch_add(readers.back()->getTotalValueNum(), std::memory_order_relaxed);
+        }
+
+        std::vector<uint32_t> queryIds;
+        queryIds.reserve(1024);
+
+        while (true) {
+            // Find the smallest k-mer
+            uint64_t minKmer = UINT64_MAX;
+            for (size_t file = 0; file < numOfSplits; ++file) {
+                if (!readers[file]->isCompleted()) {
+                    minKmer = std::min(minKmer, currentKmers[file].value);
+                }
+            }
+            if (minKmer == UINT64_MAX) break;
+
+            queryIds.clear();
+            for (size_t file = 0; file < numOfSplits; ++file) {
+                while (currentKmers[file].value == minKmer) {
+                    const uint32_t seqId = currentKmers[file].tInfo.taxId; // query ID is in taxId
+                    if (seqId != UINT32_MAX && seqId <= processedReadCnt) {
+                        queryIds.emplace_back(seqId);
+                    }
+                    ++valuesScanned;
+                    currentKmers[file] = readers[file]->next();
+                    if (readers[file]->isCompleted()) {
+                        currentKmers[file].value = UINT64_MAX;
+                        break;
+                    }
+                }
+            }
+
+            std::sort(queryIds.begin(), queryIds.end());
+            queryIds.erase(std::unique(queryIds.begin(), queryIds.end()), queryIds.end());
+            onKmer(minKmer, queryIds);
+        }
+    }
+
+    // Counting pre-pass: the same scan with no edge emission, so the reads-per-k-mer distribution
+    // is known before makeSubGraph has to choose a cap. Only k-mers with m >= 2 are counted,
+    // which is the domain the [mhist] table reports.
+    void scanMHistogram(size_t processedReadCnt,
+                        std::vector<uint64_t> & mHistKmers,
+                        std::vector<uint64_t> & mHistPairs);
+
+
     // Writes one file per relations_* route (subGraph_{counter}_{route}) instead of one file
     // per flush, so the merge can process each route independently and in parallel.
     void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,

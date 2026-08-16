@@ -96,6 +96,7 @@ public:
     // Group generation
     PARAMETER(WEAK_BAND_RATIO)
     PARAMETER(MAX_KMER_READS)
+    PARAMETER(MAX_KMER_QUANTILE)
     PARAMETER(MIN_OVERLAP_RATIO)
     PARAMETER(MERGE_SUPPORT_RATIO)
     PARAMETER(MAX_TMP_DISK)
@@ -195,7 +196,8 @@ public:
     // Group generation. Every algorithm threshold here is dimensionless: it is a ratio, so one
     // value carries the same meaning across datasets with different read lengths and coverage.
     float weakBandRatio;      // weak-band lower bound as a fraction of the core threshold
-    int maxKmerReads;         // resource brake, not an algorithm knob
+    int maxKmerReads;         // explicit reads-per-k-mer cap; 0 defers to maxKmerQuantile
+    float maxKmerQuantile;    // share of k-mers (m >= 2) the cap keeps; picks maxKmerReads
     float minOverlapRatio;    // core threshold as a fraction of k-mers per read
     float mergeSupportRatio;  // Phase 1.5 support as a fraction of the smaller unit's read count
     int maxTmpDiskMiB;

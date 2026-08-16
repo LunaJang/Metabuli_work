@@ -485,6 +485,43 @@ std::vector<std::pair<size_t, size_t>> GroupGenerator::getKmerRanges(const Buffe
     return ranges;
 }
 
+void GroupGenerator::scanMHistogram(size_t processedReadCnt,
+                                    std::vector<uint64_t> & mHistKmers,
+                                    std::vector<uint64_t> & mHistPairs) {
+    mHistKmers.assign(M_HIST_BUCKETS, 0);
+    mHistPairs.assign(M_HIST_BUCKETS, 0);
+
+    // Same partitioning as the emit pass: thread t owns k-mer value range t, so the per-thread
+    // histograms are over disjoint k-mers and their sum is order-independent. Two runs with
+    // different --threads therefore produce the same histogram, and the same cap.
+    #pragma omp parallel num_threads(par.threads)
+    {
+        const int threadIdx = omp_get_thread_num();
+        std::vector<uint64_t> localKmers(M_HIST_BUCKETS, 0);
+        std::vector<uint64_t> localPairs(M_HIST_BUCKETS, 0);
+        uint64_t localValues = 0;
+
+        scanKmerRuns(threadIdx, processedReadCnt, localValues,
+                     [&](uint64_t, const std::vector<uint32_t> & queryIds) {
+            const size_t m = queryIds.size();
+            if (m < 2) {
+                return;
+            }
+            const size_t bucket = mHistBucket(m);
+            localKmers[bucket]++;
+            localPairs[bucket] += static_cast<uint64_t>(m) * static_cast<uint64_t>(m - 1) / 2;
+        });
+
+        #pragma omp critical
+        {
+            for (size_t b = 0; b < M_HIST_BUCKETS; ++b) {
+                mHistKmers[b] += localKmers[b];
+                mHistPairs[b] += localPairs[b];
+            }
+        }
+    }
+}
+
 void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
@@ -536,12 +573,53 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     std::vector<uint64_t> mHistKmers(M_HIST_BUCKETS, 0);
     std::vector<uint64_t> mHistPairs(M_HIST_BUCKETS, 0);
 
-    // Skip threshold, resolved once. Absolute rather than a fraction of the read count: a
-    // fraction cannot fit both a 5k-read and a 62M-read run, which is why --max-kmer-freq-ratio
-    // was removed (0.0001 skipped everything on the former and 11 k-mers on the latter).
-    const size_t absThr = (par.maxKmerReads > 0) ? static_cast<size_t>(par.maxKmerReads) : 0;
+    // Skip threshold, resolved once. An explicit --max-kmer-reads wins and skips the pre-pass
+    // entirely; otherwise --max-kmer-quantile picks the cap from the reads-per-k-mer
+    // distribution, which has to be measured before any edge is emitted. The cap stays an
+    // absolute m, only its choice becomes a property of the data: m does not scale with the
+    // size of the dataset but with per-genome coverage, so neither a hand-picked constant nor a
+    // fraction of the read count transfers (--max-kmer-freq-ratio failed on exactly that).
+    size_t absThr = (par.maxKmerReads > 0) ? static_cast<size_t>(par.maxKmerReads) : 0;
+    bool capIsAuto = false;
+    if (par.maxKmerReads <= 0 && par.maxKmerQuantile > 0.0f && par.maxKmerQuantile < 1.0f) {
+        cout << "[skip] pre-pass: measuring the reads-per-k-mer distribution..." << endl;
+        const time_t preStart = time(nullptr);
+        std::vector<uint64_t> preHistKmers;
+        std::vector<uint64_t> preHistPairs;
+        scanMHistogram(processedReadCnt, preHistKmers, preHistPairs);
+        // The pre-pass counted every k-mer value once already; the emit pass counts them again.
+        // Leaving both in would double the denominator the disk projection divides by.
+        kmerValuesTotal.store(0, std::memory_order_relaxed);
+
+        absThr = capFromQuantile(preHistKmers, par.maxKmerQuantile);
+        capIsAuto = (absThr > 0);
+
+        uint64_t totalKmers = 0, totalPairs = 0, keptKmers = 0, keptPairs = 0;
+        for (size_t b = 0; b < M_HIST_BUCKETS; ++b) {
+            totalKmers += preHistKmers[b];
+            totalPairs += preHistPairs[b];
+            // Bucket b covers m in [2^b, 2^(b+1) - 1]; it survives when its top is under the cap.
+            const bool kept = (absThr == 0)
+                || (b + 1 < 63 && ((static_cast<size_t>(1) << (b + 1)) - 1) <= absThr);
+            if (kept) {
+                keptKmers += preHistKmers[b];
+                keptPairs += preHistPairs[b];
+            }
+        }
+        cout << "[skip] pre-pass done: " << double(time(nullptr) - preStart) << " s, "
+             << totalKmers << " k-mers with m >= 2" << endl;
+        cout << "[skip] auto cap " << (absThr > 0 ? to_string(absThr) : string("none"))
+             << " (quantile " << par.maxKmerQuantile << "): keeps "
+             << (totalKmers ? 100.0 * static_cast<double>(keptKmers)
+                                    / static_cast<double>(totalKmers) : 0.0)
+             << "% of k-mers, "
+             << (totalPairs ? 100.0 * static_cast<double>(keptPairs)
+                                    / static_cast<double>(totalPairs) : 0.0)
+             << "% of pair occurrences" << endl;
+    }
     cout << "[skip] threshold: --max-kmer-reads "
-         << (absThr > 0 ? to_string(absThr) : string("off")) << endl;
+         << (absThr > 0 ? to_string(absThr) : string("off"))
+         << (capIsAuto ? " (auto)" : "") << endl;
 
     #pragma omp parallel num_threads(par.threads)
     {
@@ -564,51 +642,10 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         std::vector<uint64_t> localHistPairs(M_HIST_BUCKETS, 0);
         uint64_t localKeptPairs = 0;
 
-        std::vector<DeltaIdxReader*> deltaIdxReaders;
-        std::vector<Kmer> currentKmers;
-        for (size_t i = 0; i < this->numOfSplits; i++) {
-            string diffFile = outDir + "/kmer_delta_" + to_string(i) + "_" + to_string(threadIdx);
-            string infoFile = outDir + "/kmer_info_"  + to_string(i) + "_" + to_string(threadIdx);
-            DeltaIdxReader* reader = new DeltaIdxReader(diffFile, infoFile, 1024 * 1024, 1024 * 1024);
-            deltaIdxReaders.push_back(reader);
-            currentKmers.push_back(reader->next());
-            // Denominator of the emit progress used to project the write volume.
-            kmerValuesTotal.fetch_add(reader->getTotalValueNum(), std::memory_order_relaxed);
-        }
         uint64_t localValuesDone = 0;
 
-        vector<uint32_t> currentQueryIds;
-        currentQueryIds.reserve(1024);
-
-        while (true) {
-            // Find the smallest k-mer
-            uint64_t minKmer = UINT64_MAX;
-            for (size_t file = 0; file < this->numOfSplits; ++file) {
-                if (!deltaIdxReaders[file]->isCompleted()) {
-                    minKmer = min(minKmer, currentKmers[file].value);
-                }
-            }
-            if (minKmer == UINT64_MAX) break;
-
-            currentQueryIds.clear();
-            for (size_t file = 0; file < this->numOfSplits; ++file) {
-                while (currentKmers[file].value == minKmer) {
-                    uint32_t seqId = currentKmers[file].tInfo.taxId; // query ID is stored in taxId field
-                    if (seqId != UINT32_MAX && seqId <= processedReadCnt) {
-                        currentQueryIds.emplace_back(seqId);
-                    }
-                    ++localValuesDone;
-                    currentKmers[file] = deltaIdxReaders[file]->next();
-                    if (deltaIdxReaders[file]->isCompleted()) {
-                        currentKmers[file].value = UINT64_MAX;
-                        break;
-                    }
-                }
-            }
-
-            std::sort(currentQueryIds.begin(), currentQueryIds.end());
-            auto last = std::unique(currentQueryIds.begin(), currentQueryIds.end());
-            currentQueryIds.erase(last, currentQueryIds.end());
+        scanKmerRuns(threadIdx, processedReadCnt, localValuesDone,
+                     [&](uint64_t minKmer, const std::vector<uint32_t> & currentQueryIds) {
             const size_t m = currentQueryIds.size();
 
             // Histogram every k-mer, skipped or not, so the summary table can answer
@@ -625,7 +662,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 localSumM += m;
                 if (m > localMaxM) { localMaxM = m; }
                 localPairEst += static_cast<double>(m) * static_cast<double>(m - 1) * 0.5;
-                continue;
+                return; // `continue` before the scan became a callback
             }
             // Every read pair sharing this k-mer gets an edge: the full C(m,2) clique.
             // Edge weight therefore counts shared k-mers directly, which is what the
@@ -659,16 +696,14 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 // writing indices above it, so the two never touch the same file.
                 maybeFoldEmitted(tmpDiskBudget, foldFanIn);
             }
-        }
+        });
+
         if (!pair2weight.empty()) {
             size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
             localEmittedEdges += pair2weight.size();
             saveSubGraphToFile(pair2weight, counter_now, processedReadCnt);
         } else {
             cout << "Thread " << threadIdx << " has no relations to write." << endl;
-        }
-        for (size_t file = 0; file < this->numOfSplits; file++) {
-            delete deltaIdxReaders[file];
         }
         skippedPart.close();
 
