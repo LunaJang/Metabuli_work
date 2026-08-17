@@ -918,9 +918,14 @@ public:
     // automatically on high-coverage data, and one repeat-bearing read linked to many reads of
     // the other unit produces many edges but only one distinct read. 0 keeps the plain edge
     // count with the floor alone, which is the pre-ratio behaviour.
+    // `maxUnitReads` > 0 restricts the merge to pairs whose two units are both that small, and the
+    // component size is re-checked as merges land, so nothing leaves this phase holding
+    // 2 * maxUnitReads reads or more. Purity is lost per read: one wrong join between large units
+    // costs more than many wrong joins between small ones. 0 leaves the merge unbounded.
     void mergeBySupport(int coreThr,
                         int weakThr,
                         float supportRatio,
+                        size_t maxUnitReads,
                         size_t processedReadCnt,
                         std::unordered_map<uint32_t, std::unordered_set<uint32_t>> &groupInfo,
                         std::vector<uint32_t> &queryGroupInfo);

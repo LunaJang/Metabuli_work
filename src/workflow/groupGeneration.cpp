@@ -34,6 +34,13 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // within noise, but it is not scale-free -- chance links between units A and B grow with
     // |A| * |B|, so a fixed count is met automatically once coverage is high.
     par.mergeSupportRatio = 0.0f;
+    // Largest unit Phase 1.5 may merge, in reads. 0 keeps the pre-gate behaviour, which is what
+    // every measurement so far used. Off by default because the bound that fits real metagenomes
+    // (where an unbounded Phase 1.5 chains units into one component holding most of the reads)
+    // is not the one that fits the simulated benchmark (where Phase 1.5 doubled recall at no
+    // measurable purity cost). This function overrides LocalParameters' own initialisation, so
+    // both places have to agree.
+    par.mergeMaxUnitReads = 0;
     // Peak disk the subGraph_* intermediates may hold at once. 0 derives it from the free space
     // at the output directory (80%). A safety ceiling, not a performance target -- a run that
     // fits under it never folds early, so machines with room pay nothing for it. This function

@@ -289,6 +289,22 @@ LocalParameters::LocalParameters() :
                     typeid(float),
                     (void *) &mergeSupportRatio,
                     "^[0-9]*\\.?[0-9]+$"),
+        MERGE_MAX_UNIT_READS(MERGE_MAX_UNIT_READS_ID,
+                    "--merge-max-unit-reads",
+                    "Phase 1.5 merges a pair only if both units hold at most this many reads (0=off)",
+                    "Upper bound on the size of the units Phase 1.5 may merge, in reads. Purity is "
+                    "lost per read, not per merge: joining two large units wrongly costs more than "
+                    "many wrong joins between small ones, and an unbounded Phase 1.5 chains units "
+                    "into one giant component. Because both sides must clear the bound and the "
+                    "component size is re-checked as merges land, no group leaves this phase with "
+                    "2x this many reads or more. An absolute read count is the right axis here: "
+                    "unit size tracks genome coverage, not dataset size, so a fraction of the read "
+                    "count would mean something different in every run -- the reason "
+                    "--max-kmer-freq-ratio was dropped in favour of --max-kmer-reads. "
+                    "0 disables the bound, which is the pre-gate behaviour.",
+                    typeid(int),
+                    (void *) &mergeMaxUnitReads,
+                    "^[0-9]+$"),
         MAX_TMP_DISK(MAX_TMP_DISK_ID,
                      "--max-tmp-disk",
                      "Peak disk (MiB) the intermediate files may occupy (0: 80% of free space)",
@@ -635,6 +651,7 @@ LocalParameters::LocalParameters() :
     minOverlapRatio = 0.3f;
     weakBandRatio = 0.3333f;
     mergeSupportRatio = 0.0f;
+    mergeMaxUnitReads = 0;
     maxTmpDiskMiB = 0;
 
     buildUnirefDb.push_back(&UNIREF_XML);
@@ -747,6 +764,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);
     groupGeneration.push_back(&WEAK_BAND_RATIO);
     groupGeneration.push_back(&MERGE_SUPPORT_RATIO);
+    groupGeneration.push_back(&MERGE_MAX_UNIT_READS);
     groupGeneration.push_back(&MAX_TMP_DISK);
     groupGeneration.push_back(&PRINT_LOG);
 

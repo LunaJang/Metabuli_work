@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <queue>
 #include <iomanip>
+#include <functional>
 
 // One stream head in mergeGraph's k-way merge: the relation plus the subGraph_* index it
 // came from, so the merge knows which stream to refill after popping.
@@ -200,6 +201,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
         // Phase 1.5: merge units joined by several independent weak links
         mergeBySupport(coreThr, weakThr, par.mergeSupportRatio,
+                       static_cast<size_t>(par.mergeMaxUnitReads),
                        processedReadCnt, groupInfo, queryGroupInfo);
 
         // Phase 2: link Phase-1 singletons among themselves with weak edges
@@ -1575,6 +1577,7 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 void GroupGenerator::mergeBySupport(int coreThr,
                                    int weakThr,
                                    float supportRatio,
+                                   size_t maxUnitReads,
                                    size_t processedReadCnt,
                                    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
                                    vector<uint32_t> &queryGroupInfo) {
@@ -1597,12 +1600,27 @@ void GroupGenerator::mergeBySupport(int coreThr,
         unit[i] = queryGroupInfo[i] ? queryGroupInfo[i] : i;
     }
 
-    // Static Phase-1 unit sizes, indexed by unit id (which is a read id, hence in range).
-    std::vector<uint32_t> unitSize;
-    if (useRatio) {
-        unitSize.assign(processedReadCnt + 1, 0u);
-        for (uint32_t i = 1; i <= processedReadCnt; ++i) { unitSize[unit[i]]++; }
+    // The disjoint set starts from the Phase-1 components and the supported pairs are added to it
+    // further down. It is built here, before the counting passes, because `compSize` is indexed by
+    // its roots.
+    DisjointSet ds(processedReadCnt);
+    for (uint32_t i = 1; i <= processedReadCnt; ++i) {
+        if (queryGroupInfo[i] != 0 && queryGroupInfo[i] != i) {
+            ds.unionSets(i, queryGroupInfo[i]);
+        }
     }
+
+    // Reads per component, indexed by disjoint-set root. One array serves both roles: until the
+    // merge loop runs, every root is still a Phase-1 root, so a lookup returns the static unit size
+    // the ratio rule needs; from then on the loop keeps it current so the size gate can see what a
+    // component has already grown to. Keeping two arrays instead would cost another 4 B per read,
+    // which is ~666 MB on a 166 M-read run.
+    // The order matters and is load-bearing: `requiredSupport` and `smallSideOf` must see static
+    // sizes, or the support rule would depend on the merge order. Both are only called while
+    // building `candidates`, which finishes before the merge loop starts.
+    std::vector<uint32_t> compSize(processedReadCnt + 1, 0u);
+    for (uint32_t i = 1; i <= processedReadCnt; ++i) { compSize[ds.find(i)]++; }
+    const auto sizeOf = [&](uint32_t node) -> uint32_t { return compSize[ds.find(node)]; };
 
     // Counting map memory guard. Entries are ~24 B in unordered_map, so the cap below is a few GB.
     // On overflow, existing keys keep accumulating and new ones are dropped -- support can then only
@@ -1668,7 +1686,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
     // benchmark operating point was measured with.
     auto requiredSupport = [&](uint32_t u, uint32_t v) -> uint32_t {
         if (!useRatio) { return MERGE_SUPPORT_FLOOR; }
-        const uint32_t smaller = std::min(unitSize[u], unitSize[v]);
+        const uint32_t smaller = std::min(sizeOf(u), sizeOf(v));
         const double need = std::ceil(static_cast<double>(supportRatio) * static_cast<double>(smaller));
         const uint32_t needed = (need >= static_cast<double>(UINT32_MAX))
             ? UINT32_MAX : static_cast<uint32_t>(need);
@@ -1678,18 +1696,34 @@ void GroupGenerator::mergeBySupport(int coreThr,
     // Which side of a pair the distinct reads are counted on. Sizes decide it; equal sizes fall back
     // to the smaller unit id so the choice does not depend on map order.
     auto smallSideOf = [&](uint32_t u, uint32_t v) -> uint32_t {
-        if (unitSize[u] != unitSize[v]) { return (unitSize[u] < unitSize[v]) ? u : v; }
+        const uint32_t su = sizeOf(u), sv = sizeOf(v);
+        if (su != sv) { return (su < sv) ? u : v; }
         return std::min(u, v);
     };
 
     // Pairs that cleared pass 1. With the ratio on, this is only a prefilter -- pass 2 recounts them
     // by distinct reads, which can only be smaller.
+    // The size gate is applied here as well as in the merge loop. Here it is the cheap half: a pair
+    // whose Phase-1 units are already too big can never qualify, whatever happens later, so dropping
+    // it now also keeps it out of pass 2's distinct-read counting.
     std::unordered_map<uint64_t, uint32_t> candidates; // pair -> required support
+    size_t gatedStatic = 0, gatedStaticReads = 0;
     for (const auto& kv : support) {
         const uint32_t u = static_cast<uint32_t>(kv.first >> 32);
         const uint32_t v = static_cast<uint32_t>(kv.first & 0xFFFFFFFFull);
         const uint32_t need = requiredSupport(u, v);
-        if (kv.second >= need) { candidates.emplace(kv.first, need); }
+        if (kv.second < need) { continue; }
+        if (maxUnitReads > 0
+            && (sizeOf(u) > maxUnitReads || sizeOf(v) > maxUnitReads)) {
+            gatedStatic++;
+            gatedStaticReads += static_cast<size_t>(sizeOf(u)) + sizeOf(v);
+            continue;
+        }
+        candidates.emplace(kv.first, need);
+    }
+    if (maxUnitReads > 0) {
+        cout << "Phase 1.5: size gate " << maxUnitReads << " reads/unit dropped " << gatedStatic
+             << " supported pairs spanning " << gatedStaticReads << " unit-reads" << endl;
     }
 
     // Pass 2: distinct reads on the smaller side, for candidate pairs only.
@@ -1780,19 +1814,62 @@ void GroupGenerator::mergeBySupport(int coreThr,
         cout << endl;
     }
 
-    // Merge: start from the Phase-1 components, then add the supported pairs.
-    DisjointSet ds(processedReadCnt);
-    for (uint32_t i = 1; i <= processedReadCnt; ++i) {
-        if (queryGroupInfo[i] != 0 && queryGroupInfo[i] != i) {
-            ds.unionSets(i, queryGroupInfo[i]);
-        }
-    }
-    size_t mergedPairs = 0;
+    // Merge the supported pairs into the Phase-1 components built above.
+    //
+    // The order is fixed on purpose. The gate below asks how big a component already is, so with
+    // the plain `unordered_map` walk the outcome would depend on the map's bucket layout. Sorting
+    // by support puts the best-evidenced pairs first, which is also where the size budget should go.
+    const size_t LOG_BUCKETS = 8;
+    std::vector<std::pair<uint64_t, uint32_t>> ordered; // (pair key, support observed in pass 1)
+    ordered.reserve(candidates.size());
     for (const auto& kv : candidates) {
         if (useRatio && satisfied.count(kv.first) == 0) continue;
-        const uint32_t u = static_cast<uint32_t>(kv.first >> 32);
-        const uint32_t v = static_cast<uint32_t>(kv.first & 0xFFFFFFFFull);
+        const auto found = support.find(kv.first);
+        ordered.emplace_back(kv.first, (found == support.end()) ? 0u : found->second);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const std::pair<uint64_t, uint32_t>& a, const std::pair<uint64_t, uint32_t>& b) {
+                  if (a.second != b.second) { return a.second > b.second; }
+                  return a.first < b.first;
+              });
+
+    // Units touched by an accepted merge. A bitmap, not a set of ids: the id space is the read
+    // space, so this is one bit per read where a hash set would be tens of bytes per merged pair.
+    std::vector<bool> unitMerged(processedReadCnt + 1, false);
+    std::vector<size_t> mergeSizeHist(LOG_BUCKETS, 0); // sizes the gate actually saw, both sides
+    size_t mergedPairs = 0, gatedDynamic = 0;
+
+    const auto bucketOf = [LOG_BUCKETS](uint32_t sz) -> size_t {
+        // bucket 0 is the singleton component; from 2 on it is 1 + floor(log10(sz)), capped.
+        if (sz < 2) { return 0; }
+        size_t bucket = 1;
+        for (uint32_t bound = 10; bucket + 1 < LOG_BUCKETS && sz >= bound; ++bucket) {
+            bound *= 10;
+        }
+        return bucket;
+    };
+
+    for (const auto& entry : ordered) {
+        const uint32_t u = static_cast<uint32_t>(entry.first >> 32);
+        const uint32_t v = static_cast<uint32_t>(entry.first & 0xFFFFFFFFull);
+        const uint32_t ru = ds.find(u), rv = ds.find(v);
+        if (ru == rv) { continue; } // an earlier merge already joined them
+        // Re-checked here, not just on the Phase-1 sizes: a component that grew past the bound has
+        // to stop growing, and that is what makes the bound hold. Both sides are at most
+        // maxUnitReads, so no component can end up with 2 * maxUnitReads reads or more, and one
+        // that reaches the bound is out of the running for every remaining pair.
+        if (maxUnitReads > 0
+            && (compSize[ru] > maxUnitReads || compSize[rv] > maxUnitReads)) {
+            gatedDynamic++;
+            continue;
+        }
+        mergeSizeHist[bucketOf(compSize[ru])]++;
+        mergeSizeHist[bucketOf(compSize[rv])]++;
+        const uint64_t merged = static_cast<uint64_t>(compSize[ru]) + compSize[rv];
         ds.unionSets(u, v);
+        compSize[ds.find(u)] = static_cast<uint32_t>(merged); // read ids are uint32, so is any sum
+        unitMerged[u] = true;
+        unitMerged[v] = true;
         mergedPairs++;
     }
 
@@ -1826,6 +1903,75 @@ void GroupGenerator::mergeBySupport(int coreThr,
         cout << " [pair cap hit, " << droppedPairs << " observations dropped -- support undercounted]";
     }
     cout << endl;
+
+    // Read mass this phase moved, and the sizes it moved it from. Pair counts alone hide the damage:
+    // a few merges between large units cost more purity than many merges between small ones, because
+    // every read of a wrongly merged unit becomes impure. The share below is the worst case that
+    // purity can lose here, so it is readable before any grading run.
+    {
+        // Reads sitting in a component that this phase enlarged. Counted per component, from the
+        // final sizes, so a component merged several times is counted once.
+        std::unordered_set<uint32_t> mergedRoots;
+        size_t mergedUnits = 0;
+        for (uint32_t i = 1; i <= processedReadCnt; ++i) {
+            if (!unitMerged[i]) continue;
+            mergedUnits++;
+            mergedRoots.insert(ds.find(i));
+        }
+        size_t mergedReads = 0, maxMergedComp = 0;
+        for (const uint32_t root : mergedRoots) {
+            mergedReads += compSize[root];
+            if (compSize[root] > maxMergedComp) { maxMergedComp = compSize[root]; }
+        }
+
+        size_t groupedReads = 0, maxGroupSize = 0;
+        std::vector<size_t> groupSizes;
+        groupSizes.reserve(groupInfo.size());
+        for (const auto& g : groupInfo) {
+            groupSizes.push_back(g.second.size());
+            groupedReads += g.second.size();
+            if (g.second.size() > maxGroupSize) { maxGroupSize = g.second.size(); }
+        }
+        const size_t topN = std::min<size_t>(5, groupSizes.size());
+        std::partial_sort(groupSizes.begin(), groupSizes.begin() + topN, groupSizes.end(),
+                          std::greater<size_t>());
+
+        const double massShare = groupedReads
+            ? (100.0 * static_cast<double>(mergedReads) / static_cast<double>(groupedReads)) : 0.0;
+        cout << "Phase 1.5: " << mergedUnits << " units merged, holding " << mergedReads
+             << " reads (" << massShare << "% of grouped reads -- upper bound on the purity this"
+             << " phase can cost)" << endl;
+
+        // Sizes as the gate saw them: one entry per side of every accepted merge, taken from the
+        // component size at that moment. This is the distribution --merge-max-unit-reads cuts, so
+        // it is the table to read when picking a value for it.
+        cout << "Phase 1.5: merged component sizes";
+        static const char* BUCKET_NAME[] = {
+            "1", "2-9", "10-99", "100-999", "1e3-1e4", "1e4-1e5", "1e5-1e6", "1e6+"
+        };
+        for (size_t b = 0; b < LOG_BUCKETS; ++b) {
+            cout << " | " << BUCKET_NAME[b] << ": " << mergeSizeHist[b];
+        }
+        cout << endl;
+        if (maxUnitReads > 0) {
+            cout << "Phase 1.5: size gate also blocked " << gatedDynamic
+                 << " pairs at merge time (component had grown past the bound)" << endl;
+        }
+
+        // Two different numbers on purpose. The first covers every group, including Phase-1 groups
+        // this phase never touched -- those can be larger than the bound and are left alone. The
+        // second is the one the bound governs: no component this phase enlarged reaches
+        // 2 * maxUnitReads reads.
+        cout << "Phase 1.5: max group size " << maxGroupSize << ", top " << topN << ":";
+        for (size_t i = 0; i < topN; ++i) { cout << " " << groupSizes[i]; }
+        cout << endl;
+        cout << "Phase 1.5: largest component this phase enlarged: " << maxMergedComp;
+        if (maxUnitReads > 0) {
+            cout << " (bound 2 x " << maxUnitReads << " = " << (2 * maxUnitReads) << ")";
+        }
+        cout << endl;
+    }
+
     cout << "Phase 1.5 done: " << double(time(nullptr) - t0) << " s" << endl;
 }
 

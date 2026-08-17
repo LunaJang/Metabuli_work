@@ -99,6 +99,7 @@ public:
     PARAMETER(MAX_KMER_QUANTILE)
     PARAMETER(MIN_OVERLAP_RATIO)
     PARAMETER(MERGE_SUPPORT_RATIO)
+    PARAMETER(MERGE_MAX_UNIT_READS)
     PARAMETER(MAX_TMP_DISK)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
@@ -200,6 +201,7 @@ public:
     float maxKmerQuantile;    // share of k-mers (m >= 2) the cap keeps; picks maxKmerReads
     float minOverlapRatio;    // core threshold as a fraction of k-mers per read
     float mergeSupportRatio;  // Phase 1.5 support as a fraction of the smaller unit's read count
+    int mergeMaxUnitReads;    // Phase 1.5 merges a pair only if both units are at most this big
     int maxTmpDiskMiB;
 
     // Group application
