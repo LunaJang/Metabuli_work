@@ -6,6 +6,7 @@ set(util_source_files
         util/gradeByCladeSize.cpp
         util/gradeByCoverage.cpp
         util/gradeGroupByCoverage.cpp
+        util/gradeStrain.cpp
         util/expand_diffidx.cpp
         util/makeAAoffset.cpp
         util/printinfo.cpp

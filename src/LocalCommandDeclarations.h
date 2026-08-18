@@ -13,6 +13,7 @@ extern int gradeGroup(int argc, const char **argv, const Command& command);
 extern int gradeByCladeSize(int argc, const char **argv, const Command& command);
 extern int gradeByCoverage(int argc, const char **argv, const Command& command);
 extern int gradeGroupByCoverage(int argc, const char **argv, const Command& command);
+extern int gradeStrain(int argc, const char **argv, const Command& command);
 extern int seqHeader2TaxId(int argc, const char **argv, const Command& command);
 extern int addToLibrary(int argc, const char **argv, const Command& command);
 extern int filterByGenus(int argc, const char **argv, const Command& command);
