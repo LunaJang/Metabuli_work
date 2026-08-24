@@ -41,6 +41,14 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // measurable purity cost). This function overrides LocalParameters' own initialisation, so
     // both places have to agree.
     par.mergeMaxUnitReads = 0;
+    // K-mers discarded either side of a common-k-mer hit. 0 discards the hit alone; 1 discards
+    // three per hit and was the value every result before 2026-08-24 used, on the measurement that
+    // it removes 17% of query k-mers but only 0.7% of edges. That measurement counts edges, and
+    // edge count is not connectivity. On CAMI2 strain-madness, 1 -> 0 took k-mers per read from
+    // 73.6 to 81.4, groups from 2,702,839 to 2,561,814 and species Recall*c from 0.164 to 0.245,
+    // for 0.010 of purity. This function overrides LocalParameters' own initialisation, so both
+    // places have to agree.
+    par.commonKmerSpan = 0;
     // Peak disk the subGraph_* intermediates may hold at once. 0 derives it from the free space
     // at the output directory (80%). A safety ceiling, not a performance target -- a run that
     // fits under it never folds early, so machines with room pay nothing for it. This function

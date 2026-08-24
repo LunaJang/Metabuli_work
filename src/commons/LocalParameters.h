@@ -100,6 +100,7 @@ public:
     PARAMETER(MIN_OVERLAP_RATIO)
     PARAMETER(MERGE_SUPPORT_RATIO)
     PARAMETER(MERGE_MAX_UNIT_READS)
+    PARAMETER(COMMON_KMER_SPAN)
     PARAMETER(MAX_TMP_DISK)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
@@ -202,6 +203,9 @@ public:
     float minOverlapRatio;    // core threshold as a fraction of k-mers per read
     float mergeSupportRatio;  // Phase 1.5 support as a fraction of the smaller unit's read count
     int mergeMaxUnitReads;    // Phase 1.5 merges a pair only if both units are at most this big
+    // Not a ratio, and the exception is deliberate: this counts k-mer positions on a read, so it
+    // is already in the units the read geometry gives it. 0 discards a common-k-mer hit alone.
+    int commonKmerSpan;       // k-mers discarded either side of a common-k-mer hit
     int maxTmpDiskMiB;
 
     // Group application

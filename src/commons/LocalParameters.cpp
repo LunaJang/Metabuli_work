@@ -305,6 +305,24 @@ LocalParameters::LocalParameters() :
                     typeid(int),
                     (void *) &mergeMaxUnitReads,
                     "^[0-9]+$"),
+        COMMON_KMER_SPAN(COMMON_KMER_SPAN_ID,
+                    "--common-kmer-span",
+                    "K-mers discarded either side of a common-k-mer hit (0=the hit alone)",
+                    "A syncmer shared by two species cannot tell them apart, so every hit against "
+                    "the common k-mer index is removed from the query before the graph is built. "
+                    "This decides how far the removal reaches: 0 drops the hit alone, 1 drops three "
+                    "k-mers per hit, on the argument that a conserved region is not one k-mer wide. "
+                    "The wider setting was long treated as free because it removes 17% of query "
+                    "k-mers but only 0.7% of edges -- it lowers weights rather than deleting pairs, "
+                    "and --min-overlap-ratio scales with the surviving count. That argument counts "
+                    "edges, and edge count is not connectivity: the edges holding two stretches of "
+                    "one genome together are rare, so a small edge loss can still cut them and "
+                    "leave the genome in more pieces. On CAMI2 strain-madness, going from 1 to 0 "
+                    "took k-mers per read from 73.6 to 81.4 and species Recall*c from 0.164 to "
+                    "0.245, at a purity cost of 0.010.",
+                    typeid(int),
+                    (void *) &commonKmerSpan,
+                    "^[0-9]+$"),
         MAX_TMP_DISK(MAX_TMP_DISK_ID,
                      "--max-tmp-disk",
                      "Peak disk (MiB) the intermediate files may occupy (0: 80% of free space)",
@@ -652,6 +670,7 @@ LocalParameters::LocalParameters() :
     weakBandRatio = 0.3333f;
     mergeSupportRatio = 0.0f;
     mergeMaxUnitReads = 0;
+    commonKmerSpan = 0;
     maxTmpDiskMiB = 0;
 
     buildUnirefDb.push_back(&UNIREF_XML);
@@ -765,6 +784,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&WEAK_BAND_RATIO);
     groupGeneration.push_back(&MERGE_SUPPORT_RATIO);
     groupGeneration.push_back(&MERGE_MAX_UNIT_READS);
+    groupGeneration.push_back(&COMMON_KMER_SPAN);
     groupGeneration.push_back(&MAX_TMP_DISK);
     groupGeneration.push_back(&PRINT_LOG);
 

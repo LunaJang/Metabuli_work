@@ -62,6 +62,7 @@ GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     matchPerKmer = par.matchPerKmer;
     kmerFormat = par.kmerFormat;
     printLog = par.printLog;
+    commonKmerSpan = par.commonKmerSpan;
     
     geneticCode = new GeneticCode(par.reducedAA == 1);
     queryIndexer = new QueryIndexer(par);
@@ -377,11 +378,11 @@ void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
             // same seq
             else{
                 // copy
-                if (int64_t(qKmers.buffer[lookingPos].qInfo.pos) < int(matchBuffer.buffer[matchIdx].second) - COMMON_KMER_NEIGHBOR_SPAN){
+                if (int64_t(qKmers.buffer[lookingPos].qInfo.pos) < int(matchBuffer.buffer[matchIdx].second) - commonKmerSpan){
                     qKmers.buffer[storePos++] = qKmers.buffer[lookingPos++];
                 }
                 // next target check
-                else if(int(matchBuffer.buffer[matchIdx].second) + COMMON_KMER_NEIGHBOR_SPAN < int64_t(qKmers.buffer[lookingPos].qInfo.pos)){
+                else if(int(matchBuffer.buffer[matchIdx].second) + commonKmerSpan < int64_t(qKmers.buffer[lookingPos].qInfo.pos)){
                     matchIdx++;
                 }
                 // pass
