@@ -88,11 +88,18 @@ inline Relation makeRelation(uint32_t id1, uint32_t id2, uint16_t weight) {
 static const int RELATION_ZSTD_LEVEL = 1;             // ~500 MB/s/core; emit runs near 100 MB/s
 static const size_t RELATION_WRITE_ELEMS = 65'536;    // 768 KB of records per compressor feed
 
-// How far either side of a common-k-mer hit is discarded along with the hit. Constant rather than
-// a parameter: on the fixture it removes 17% of k-mers but only 0.7% of edges, so it lowers
-// weights instead of deleting pairs and there is nothing to tune. --min-overlap-ratio scales with
-// the surviving k-mer count and absorbs the shift.
-static const int COMMON_KMER_NEIGHBOR_SPAN = 1;
+// How far either side of a common-k-mer hit is discarded along with the hit. 0 discards the hit
+// alone; 1 discards three k-mers per hit. Constant rather than a parameter.
+//
+// This was 1, justified by the measurement that a span of 1 removes 17% of query k-mers but only
+// 0.7% of edges: it lowers weights rather than deleting pairs, and --min-overlap-ratio scales with
+// the surviving count and absorbs the shift. That measurement counts edges, not connectivity, and
+// the two come apart near a percolation threshold -- the edges holding two stretches of one genome
+// together are rare by construction, so losing 0.7% of edges can still cut them. Grouping recall is
+// bounded by exactly that: a species is recovered as hundreds of pure pieces and the piece count
+// converges as sequencing depth grows, so the boundaries are missing k-mers rather than missing
+// reads. A span of 1 manufactures two of those missing k-mers per hit.
+static const int COMMON_KMER_NEIGHBOR_SPAN = 0;
 
 // Two units are never merged on a single weak link, whatever --merge-support-ratio resolves to.
 // One link is what chance sharing across a repeat looks like.
