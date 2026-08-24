@@ -94,12 +94,10 @@ public:
     PARAMETER(PARAM_OUTDIR)
     
     // Group generation
-    PARAMETER(WEAK_BAND_RATIO)
+    PARAMETER(MIN_EDGE)
     PARAMETER(MAX_KMER_READS)
     PARAMETER(MAX_KMER_QUANTILE)
     PARAMETER(MIN_OVERLAP_RATIO)
-    PARAMETER(MERGE_SUPPORT_RATIO)
-    PARAMETER(MERGE_MAX_UNIT_READS)
     PARAMETER(COMMON_KMER_SPAN)
     PARAMETER(MAX_TMP_DISK)
     PARAMETER(MIN_VOTE_SCORE)
@@ -195,17 +193,15 @@ public:
     int extractMode;
     std::string outputDir;
     
-    // Group generation. Every algorithm threshold here is dimensionless: it is a ratio, so one
-    // value carries the same meaning across datasets with different read lengths and coverage.
-    float weakBandRatio;      // weak-band lower bound as a fraction of the core threshold
+    // Group generation. --min-overlap-ratio is a ratio so that one value means the same overlap
+    // across datasets with different read lengths and syncmer density. The other two are counts,
+    // deliberately: minEdge in shared k-mers (the ratio form measured worse -- see its help text)
+    // and commonKmerSpan in k-mer positions on a read.
+    int minEdge;              // weak-band lower bound, in shared k-mers
     int maxKmerReads;         // explicit reads-per-k-mer cap; 0 defers to maxKmerQuantile
     float maxKmerQuantile;    // share of k-mers (m >= 2) the cap keeps; picks maxKmerReads
     float minOverlapRatio;    // core threshold as a fraction of k-mers per read
-    float mergeSupportRatio;  // Phase 1.5 support as a fraction of the smaller unit's read count
-    int mergeMaxUnitReads;    // Phase 1.5 merges a pair only if both units are at most this big
-    // Not a ratio, and the exception is deliberate: this counts k-mer positions on a read, so it
-    // is already in the units the read geometry gives it. 0 discards a common-k-mer hit alone.
-    int commonKmerSpan;       // k-mers discarded either side of a common-k-mer hit
+    int commonKmerSpan;       // k-mers discarded either side of a common-k-mer hit; 0 = hit alone
     int maxTmpDiskMiB;
 
     // Group application

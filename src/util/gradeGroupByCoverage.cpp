@@ -229,7 +229,7 @@ int gradeGroupByCoverage(int argc, const char **argv, const Command &command) {
                 }
             }
 
-            // Phase 2: for each rank, iterate over coverage bins, build group/tax maps on the fly.
+            // Phase 3: for each rank, iterate over coverage bins, build group/tax maps on the fly.
             // Memory at any point: O(reads_at_one_bin) instead of O(ranks × covs × reads).
             for (const string &rank : ranks_local) {
                 for (auto &kv : covReads) {

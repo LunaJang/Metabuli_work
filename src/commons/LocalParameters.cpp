@@ -263,48 +263,22 @@ LocalParameters::LocalParameters() :
                     typeid(std::string),
                     (void *) &outputDir,
                     "^.*$"),
-        WEAK_BAND_RATIO(WEAK_BAND_RATIO_ID,
-                        "--weak-band-ratio",
-                        "Weak-band lower bound as a fraction of the core threshold",
-                        "Lower bound of the weak band, given as a fraction of the Phase 1 core "
-                        "threshold: weak edges are those with weight in (ratio x core, core]. The "
-                        "same value is Phase 2's floor for linking singletons. Expressing it as a "
-                        "ratio keeps the band's width proportional to the core threshold, so one "
-                        "value means the same thing on datasets with different read lengths -- an "
-                        "absolute weight does not. Must be in (0, 1).",
-                        typeid(float),
-                        (void *) &weakBandRatio,
-                        "^[0-9]*\\.?[0-9]+$"),
-        MERGE_SUPPORT_RATIO(MERGE_SUPPORT_RATIO_ID,
-                    "--merge-support-ratio",
-                    "Phase 1.5 support as a fraction of the smaller unit's reads (0=count edges)",
-                    "How much weak-link support two Phase-1 units need before they are merged "
-                    "(Phase 1.5), as a fraction of the smaller unit's read count. The support "
-                    "counted is the number of distinct reads on the smaller side that carry a weak "
-                    "link to the other unit, so the requirement scales with unit size: chance links "
-                    "from repeats grow with the product of the two unit sizes and would otherwise "
-                    "clear any fixed count on high-coverage data. A floor of 2 always applies. "
-                    "0 disables the ratio and falls back to counting weak edges with that floor, "
-                    "which is the pre-ratio behaviour.",
-                    typeid(float),
-                    (void *) &mergeSupportRatio,
-                    "^[0-9]*\\.?[0-9]+$"),
-        MERGE_MAX_UNIT_READS(MERGE_MAX_UNIT_READS_ID,
-                    "--merge-max-unit-reads",
-                    "Phase 1.5 merges a pair only if both units hold at most this many reads (0=off)",
-                    "Upper bound on the size of the units Phase 1.5 may merge, in reads. Purity is "
-                    "lost per read, not per merge: joining two large units wrongly costs more than "
-                    "many wrong joins between small ones, and an unbounded Phase 1.5 chains units "
-                    "into one giant component. Because both sides must clear the bound and the "
-                    "component size is re-checked as merges land, no group leaves this phase with "
-                    "2x this many reads or more. An absolute read count is the right axis here: "
-                    "unit size tracks genome coverage, not dataset size, so a fraction of the read "
-                    "count would mean something different in every run -- the reason "
-                    "--max-kmer-freq-ratio was dropped in favour of --max-kmer-reads. "
-                    "0 disables the bound, which is the pre-gate behaviour.",
-                    typeid(int),
-                    (void *) &mergeMaxUnitReads,
-                    "^[0-9]+$"),
+        MIN_EDGE(MIN_EDGE_ID,
+                        "--min-edge",
+                        "Weak-band lower bound, in shared k-mers",
+                        "Lower bound of the weak band: an edge lighter than this is not used at all, "
+                        "by either the merging pass or the singleton pass. Absolute, in shared "
+                        "k-mers, not a fraction of the core threshold. The fraction form was tried "
+                        "on the argument that one absolute number describes different overlaps on "
+                        "different data (5 is 5/15 = 0.333 of the core on species-inclusion but "
+                        "5/34 = 0.147 on CAMI2 marine). Measurement disagreed: --weak-band-ratio "
+                        "0.3333 reproduces an absolute 5 only when the core is 15, and on "
+                        "species-exclusion, where the core is 18, it raised the bound to 6 and took "
+                        "recall from 0.2716 to 0.2611. Clamped into [1, core threshold - 1], since "
+                        "an empty band leaves the later passes nothing to work with.",
+                        typeid(int),
+                        (void *) &minEdge,
+                        "^[0-9]+$"),
         COMMON_KMER_SPAN(COMMON_KMER_SPAN_ID,
                     "--common-kmer-span",
                     "K-mers discarded either side of a common-k-mer hit (0=the hit alone)",
@@ -667,9 +641,7 @@ LocalParameters::LocalParameters() :
     maxKmerReads = 0;
     maxKmerQuantile = 0.0f;
     minOverlapRatio = 0.3f;
-    weakBandRatio = 0.3333f;
-    mergeSupportRatio = 0.0f;
-    mergeMaxUnitReads = 0;
+    minEdge = 5;
     commonKmerSpan = 0;
     maxTmpDiskMiB = 0;
 
@@ -781,9 +753,7 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MAX_KMER_READS);
     groupGeneration.push_back(&MAX_KMER_QUANTILE);
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);
-    groupGeneration.push_back(&WEAK_BAND_RATIO);
-    groupGeneration.push_back(&MERGE_SUPPORT_RATIO);
-    groupGeneration.push_back(&MERGE_MAX_UNIT_READS);
+    groupGeneration.push_back(&MIN_EDGE);
     groupGeneration.push_back(&COMMON_KMER_SPAN);
     groupGeneration.push_back(&MAX_TMP_DISK);
     groupGeneration.push_back(&PRINT_LOG);

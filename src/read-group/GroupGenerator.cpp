@@ -183,35 +183,41 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             exit(EXIT_FAILURE);
         }
 
-        // Weak band lower bound, as a fraction of the core threshold. Keeping it proportional is
-        // the point: an absolute 5 was 5/15 = 0.333 of the core on the species-inclusion benchmark
-        // but 5/34 = 0.147 on CAMI2 marine, so marine's band was three times wider in absolute
-        // terms and Phase 1.5 there took in far more chance links. The clamps only guard rounding:
-        // the band has to contain at least one weight and stay below the core threshold.
-        int weakThr = static_cast<int>(par.weakBandRatio * coreThr + 0.5f);
+        // Weak band lower bound, in shared k-mers. Absolute rather than a fraction of the core
+        // threshold: the ratio form was adopted on the argument that an absolute 5 means 5/15 =
+        // 0.333 of the core on species-inclusion but 5/34 = 0.147 on CAMI2 marine, so one number
+        // describes different overlaps. But measurement went the other way. --weak-band-ratio
+        // 0.3333 reproduces an absolute 5 only when the core is 15: on species-exclusion, where the
+        // core is 18, it raised the bound to 6 and took recall from 0.2716 to 0.2611. The ratio was
+        // never a like-for-like rewrite of the absolute value, and the absolute value scored better,
+        // so this is the axis that gets swept.
+        int weakThr = par.minEdge;
         if (weakThr < 1) { weakThr = 1; }
         if (weakThr >= coreThr) { weakThr = coreThr - 1; }
 
         cout << "Core threshold: " << coreThr << " (overlap ratio " << par.minOverlapRatio
              << " x " << kmersPerRead << " k-mers/read)" << endl;
-        cout << "Weak band: (" << weakThr << ", " << coreThr << "] (ratio " << par.weakBandRatio
-             << " x core " << coreThr << "); Phase 2 floor " << weakThr << endl;
+        cout << "Weak band: (" << weakThr << ", " << coreThr << "] (--min-edge " << par.minEdge
+             << "); Phase 3 floor " << weakThr << endl;
+        if (par.minEdge >= coreThr) {
+            cout << "[WARN] --min-edge " << par.minEdge << " is at or above the core threshold "
+                 << coreThr << "; clamped to " << weakThr << ". The weak band would otherwise be"
+                 << " empty, leaving nothing for Phase 3 or Phase 3 to work with." << endl;
+        }
 
         // Phase 1: form core groups with strong edges
         makeGroups(coreThr, processedReadCnt, groupInfo, queryGroupInfo);
 
-        // Phase 1.5: merge units joined by several independent weak links
-        mergeBySupport(coreThr, weakThr, par.mergeSupportRatio,
-                       static_cast<size_t>(par.mergeMaxUnitReads),
-                       processedReadCnt, groupInfo, queryGroupInfo);
+        // Phase 2: merge units joined by several independent weak links
+        mergeBySupport(coreThr, weakThr, processedReadCnt, groupInfo, queryGroupInfo);
 
-        // Phase 2: link Phase-1 singletons among themselves with weak edges
+        // Phase 3: link Phase-1 singletons among themselves with weak edges
         {
             std::vector<bool> isSingleton(processedReadCnt + 1, false);
             for (uint32_t i = 1; i <= processedReadCnt; i++) {
                 if (queryGroupInfo[i] == 0) isSingleton[i] = true;
             }
-            makeGroupsPhase2(weakThr, processedReadCnt, isSingleton, groupInfo, queryGroupInfo);
+            makeGroupsPhase3(weakThr, processedReadCnt, isSingleton, groupInfo, queryGroupInfo);
         }
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
@@ -1167,7 +1173,7 @@ void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & o
         readers[i].reset(new RelationReader(files[i], bufElems));
     }
 
-    // Output is relations_*, which makeGroups/mergeBySupport/makeGroupsPhase2 read with
+    // Output is relations_*, which makeGroups/mergeBySupport/makeGroupsPhase3 read with
     // ReadBuffer<Relation>. That format stays raw -- only the subGraph_* inputs above change.
     WriteBuffer<Relation> out(outPath, 1024 * 1024);
 
@@ -1552,11 +1558,11 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
-// Phase 1.5 -- see the declaration in GroupGenerator.h for the rationale.
+// Phase 2 -- see the declaration in GroupGenerator.h for the rationale.
 //
 // A "unit" is a Phase-1 core group (labelled by its minimum read id) or, for a read that Phase 1
 // left alone, the read itself. Group ids are read ids of grouped reads, so a singleton's own id can
-// never collide with a group id. Weak edges are those in (weakThr, coreThr] -- above Phase 2's
+// never collide with a group id. Weak edges are those in (weakThr, coreThr] -- above Phase 3's
 // floor, below the core threshold. Pairs where both sides are singletons are skipped: distinct edges
 // are merged upstream, so two reads share exactly one edge and can never reach a support of 2. That
 // also keeps the counting map bounded to pairs involving at least one multi-read group.
@@ -1577,18 +1583,24 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 // size test against a changing component would make the output depend on that order.
 void GroupGenerator::mergeBySupport(int coreThr,
                                    int weakThr,
-                                   float supportRatio,
-                                   size_t maxUnitReads,
                                    size_t processedReadCnt,
                                    unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
                                    vector<uint32_t> &queryGroupInfo) {
+    // Both of these were parameters (--merge-support-ratio, --merge-max-unit-reads) and are now
+    // fixed at the values every measured result used. The ratio form of the support requirement was
+    // never measured against the plain count outside noise, and the size gate was off in every run
+    // that produced a published number; keeping them as knobs invited sweeps over axes that had
+    // already been decided. The branches they select are left in place so the reasoning stays
+    // readable -- the compiler removes them.
+    const float supportRatio = 0.0f;
+    const size_t maxUnitReads = 0;
     const bool useRatio = (supportRatio > 0.0f);
     if (useRatio) {
-        cout << "Phase 1.5: merging units whose smaller side has >= max(" << MERGE_SUPPORT_FLOOR
+        cout << "Phase 2: merging units whose smaller side has >= max(" << MERGE_SUPPORT_FLOOR
              << ", " << supportRatio << " x its read count) distinct reads carrying a weak link"
              << " (weight in (" << weakThr << ", " << coreThr << "])..." << endl;
     } else {
-        cout << "Phase 1.5: merging units with >= " << MERGE_SUPPORT_FLOOR
+        cout << "Phase 2: merging units with >= " << MERGE_SUPPORT_FLOOR
              << " weak links (weight in (" << weakThr << ", " << coreThr << "])..." << endl;
     }
     time_t t0 = time(nullptr);
@@ -1723,7 +1735,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
         candidates.emplace(kv.first, need);
     }
     if (maxUnitReads > 0) {
-        cout << "Phase 1.5: size gate " << maxUnitReads << " reads/unit dropped " << gatedStatic
+        cout << "Phase 2: size gate " << maxUnitReads << " reads/unit dropped " << gatedStatic
              << " supported pairs spanning " << gatedStaticReads << " unit-reads" << endl;
     }
 
@@ -1805,7 +1817,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
         distinctFile(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin",
                      partial, satisfied, PASS2_READ_CAP, heldReads, droppedReads);
 
-        cout << "Phase 1.5: " << candidates.size() << " candidate pairs, " << satisfied.size()
+        cout << "Phase 2: " << candidates.size() << " candidate pairs, " << satisfied.size()
              << " reached the distinct-read requirement (" << heldReads
              << " reads still held for the rest)";
         if (droppedReads) {
@@ -1875,7 +1887,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
     }
 
     // A Phase-1 group of exactly one read (its own label) never entered the disjoint set above, so
-    // re-mark those reads as grouped to keep them out of Phase 2's singleton pass.
+    // re-mark those reads as grouped to keep them out of Phase 3's singleton pass.
     for (uint32_t i = 1; i <= processedReadCnt; ++i) {
         if (queryGroupInfo[i] != 0) ds.grouped[i] = true;
     }
@@ -1897,7 +1909,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
         queryGroupInfo[i] = groupId;
     }
 
-    cout << "Phase 1.5: " << weakEdgeCnt << " weak edges over " << support.size()
+    cout << "Phase 2: " << weakEdgeCnt << " weak edges over " << support.size()
          << " unit pairs, " << mergedPairs << " pairs merged"
          << "; groups " << groupsBefore << " -> " << groupInfo.size();
     if (droppedPairs) {
@@ -1939,14 +1951,14 @@ void GroupGenerator::mergeBySupport(int coreThr,
 
         const double massShare = groupedReads
             ? (100.0 * static_cast<double>(mergedReads) / static_cast<double>(groupedReads)) : 0.0;
-        cout << "Phase 1.5: " << mergedUnits << " units merged, holding " << mergedReads
+        cout << "Phase 2: " << mergedUnits << " units merged, holding " << mergedReads
              << " reads (" << massShare << "% of grouped reads -- upper bound on the purity this"
              << " phase can cost)" << endl;
 
         // Sizes as the gate saw them: one entry per side of every accepted merge, taken from the
         // component size at that moment. This is the distribution --merge-max-unit-reads cuts, so
         // it is the table to read when picking a value for it.
-        cout << "Phase 1.5: merged component sizes";
+        cout << "Phase 2: merged component sizes";
         static const char* BUCKET_NAME[] = {
             "1", "2-9", "10-99", "100-999", "1e3-1e4", "1e4-1e5", "1e5-1e6", "1e6+"
         };
@@ -1955,7 +1967,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
         }
         cout << endl;
         if (maxUnitReads > 0) {
-            cout << "Phase 1.5: size gate also blocked " << gatedDynamic
+            cout << "Phase 2: size gate also blocked " << gatedDynamic
                  << " pairs at merge time (component had grown past the bound)" << endl;
         }
 
@@ -1963,27 +1975,27 @@ void GroupGenerator::mergeBySupport(int coreThr,
         // this phase never touched -- those can be larger than the bound and are left alone. The
         // second is the one the bound governs: no component this phase enlarged reaches
         // 2 * maxUnitReads reads.
-        cout << "Phase 1.5: max group size " << maxGroupSize << ", top " << topN << ":";
+        cout << "Phase 2: max group size " << maxGroupSize << ", top " << topN << ":";
         for (size_t i = 0; i < topN; ++i) { cout << " " << groupSizes[i]; }
         cout << endl;
-        cout << "Phase 1.5: largest component this phase enlarged: " << maxMergedComp;
+        cout << "Phase 2: largest component this phase enlarged: " << maxMergedComp;
         if (maxUnitReads > 0) {
             cout << " (bound 2 x " << maxUnitReads << " = " << (2 * maxUnitReads) << ")";
         }
         cout << endl;
     }
 
-    cout << "Phase 1.5 done: " << double(time(nullptr) - t0) << " s" << endl;
+    cout << "Phase 2 done: " << double(time(nullptr) - t0) << " s" << endl;
 }
 
-void GroupGenerator::makeGroupsPhase2(
+void GroupGenerator::makeGroupsPhase3(
     int groupKmerThr,
     size_t processedReadCnt,
     const std::vector<bool>& isSingleton,
     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
     vector<uint32_t>& queryGroupInfo)
 {
-    cout << "Phase 2: linking singletons..." << endl;
+    cout << "Phase 3: linking singletons..." << endl;
     time_t t0 = time(nullptr);
 
     DisjointSet ds(processedReadCnt);
@@ -2050,7 +2062,7 @@ void GroupGenerator::makeGroupsPhase2(
         }
     }
 
-    cout << "Phase 2 done: " << double(time(nullptr) - t0) << " s" << endl;
+    cout << "Phase 3 done: " << double(time(nullptr) - t0) << " s" << endl;
 }
 
 void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,

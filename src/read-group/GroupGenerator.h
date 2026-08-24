@@ -98,8 +98,8 @@ static const size_t RELATION_WRITE_ELEMS = 65'536;    // 768 KB of records per c
 // Recall*c from 0.164 to 0.245 for 0.010 of purity, so the value is worth sweeping and is now a
 // parameter.
 
-// Two units are never merged on a single weak link, whatever --merge-support-ratio resolves to.
-// One link is what chance sharing across a repeat looks like.
+// Phase 2 never merges two units on a single weak link. One link is what chance sharing across a
+// repeat looks like, so the smallest requirement carrying any information is two.
 static const uint32_t MERGE_SUPPORT_FLOOR = 2;
 
 static inline void relationStreamFatal(const std::string & path, const char * action) {
@@ -910,7 +910,7 @@ public:
                     size_t processedReadCnt,
                     unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,
                     vector<uint32_t> &queryGroupInfo);
-    // Phase 1.5: merge Phase-1 units that are joined by several independent weak edges.
+    // Phase 2: merge Phase-1 units that are joined by several independent weak edges.
     // A single weak edge (few shared k-mers) is indistinguishable from chance sharing across
     // repeats or conserved regions; several between the same pair of units are not. Counting
     // support at the unit level -- rather than testing node-level triangles -- is what makes
@@ -929,14 +929,12 @@ public:
     // costs more than many wrong joins between small ones. 0 leaves the merge unbounded.
     void mergeBySupport(int coreThr,
                         int weakThr,
-                        float supportRatio,
-                        size_t maxUnitReads,
                         size_t processedReadCnt,
                         std::unordered_map<uint32_t, std::unordered_set<uint32_t>> &groupInfo,
                         std::vector<uint32_t> &queryGroupInfo);
 
 
-    void makeGroupsPhase2(int groupKmerThr,
+    void makeGroupsPhase3(int groupKmerThr,
                           size_t processedReadCnt,
                           const std::vector<bool>& isSingleton,
                           unordered_map<uint32_t, unordered_set<uint32_t>>& groupInfo,

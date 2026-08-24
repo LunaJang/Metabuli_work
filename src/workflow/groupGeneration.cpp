@@ -22,25 +22,23 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // benchmark (61.7 M reads, 49.6 k-mers/read -> core threshold 15): 0.3 is the peak, with 0.2,
     // 0.4 and 0.5 all below it.
     par.minOverlapRatio = 0.3f;
-    // Weak-band lower bound as a fraction of the core threshold, also Phase 2's floor.
+    // Weak-band lower bound as a fraction of the core threshold, also Phase 3's floor.
     // 5/15 = 0.3333 reproduces the species-inclusion operating point, where the band was (5, 15].
     // The absolute 5 it replaces meant different things per dataset: 5/15 = 0.333 of the core on
     // that benchmark but 5/34 = 0.147 on CAMI2 marine, so marine's band was three times as wide
-    // in absolute terms and Phase 1.5 there absorbed far more chance links.
-    par.weakBandRatio = 0.3333f;
-    // Phase 1.5 support as a fraction of the smaller unit's read count. 0 keeps the pre-ratio
+    // in absolute terms and Phase 2 there absorbed far more chance links.
+    par.minEdge = 5;
+    // Phase 2 support as a fraction of the smaller unit's read count. 0 keeps the pre-ratio
     // behaviour (count weak edges, floor 2), which is the measured operating point; the ratio is
     // opt-in until a value is measured on marine. Sweeping the old absolute support over 2/3 was
     // within noise, but it is not scale-free -- chance links between units A and B grow with
     // |A| * |B|, so a fixed count is met automatically once coverage is high.
-    par.mergeSupportRatio = 0.0f;
-    // Largest unit Phase 1.5 may merge, in reads. 0 keeps the pre-gate behaviour, which is what
+    // Largest unit Phase 2 may merge, in reads. 0 keeps the pre-gate behaviour, which is what
     // every measurement so far used. Off by default because the bound that fits real metagenomes
-    // (where an unbounded Phase 1.5 chains units into one component holding most of the reads)
-    // is not the one that fits the simulated benchmark (where Phase 1.5 doubled recall at no
+    // (where an unbounded Phase 2 chains units into one component holding most of the reads)
+    // is not the one that fits the simulated benchmark (where Phase 2 doubled recall at no
     // measurable purity cost). This function overrides LocalParameters' own initialisation, so
     // both places have to agree.
-    par.mergeMaxUnitReads = 0;
     // K-mers discarded either side of a common-k-mer hit. 0 discards the hit alone; 1 discards
     // three per hit and was the value every result before 2026-08-24 used, on the measurement that
     // it removes 17% of query k-mers but only 0.7% of edges. That measurement counts edges, and
@@ -84,22 +82,16 @@ int groupGeneration(int argc, const char **argv, const Command& command)
         cerr << "       there is no absolute threshold to fall back to." << endl;
         return 1;
     }
-    if (par.weakBandRatio <= 0.0f || par.weakBandRatio >= 1.0f) {
-        cerr << "Error: --weak-band-ratio must be in (0, 1) (given " << par.weakBandRatio << ")." << endl;
-        cerr << "       It is the weak band's lower bound as a fraction of the core threshold:" << endl;
-        cerr << "       at 0 the band would swallow every edge, at 1 it would be empty." << endl;
+    if (par.minEdge < 1) {
+        cerr << "Error: --min-edge must be >= 1 (given " << par.minEdge << ")." << endl;
+        cerr << "       It is the weak band's lower bound in shared k-mers; at 0 the band would" << endl;
+        cerr << "       swallow every edge, including pairs sharing nothing." << endl;
         return 1;
     }
     if (par.maxKmerQuantile < 0.0f || par.maxKmerQuantile > 1.0f) {
         cerr << "Error: --max-kmer-quantile must be in [0, 1] (given " << par.maxKmerQuantile << ")." << endl;
         cerr << "       It is the share of k-mers (counted over those in at least two reads)" << endl;
         cerr << "       that the reads-per-k-mer cap keeps. 0 disables the automatic cap." << endl;
-        return 1;
-    }
-    if (par.mergeSupportRatio < 0.0f || par.mergeSupportRatio > 1.0f) {
-        cerr << "Error: --merge-support-ratio must be in [0, 1] (given " << par.mergeSupportRatio << ")." << endl;
-        cerr << "       It is a fraction of the smaller unit's read count; above 1 no pair can" << endl;
-        cerr << "       ever qualify. 0 disables the ratio and keeps the plain floor of 2." << endl;
         return 1;
     }
 
