@@ -1710,97 +1710,191 @@ void GroupGenerator::mergeBySupport(int coreThr,
     for (uint32_t i = 1; i <= processedReadCnt; ++i) { compSize[ds.find(i)]++; }
     const auto sizeOf = [&](uint32_t node) -> uint32_t { return compSize[ds.find(node)]; };
 
-    // Counting map memory guard. Entries are ~24 B in unordered_map, so the cap below is a few GB.
-    // On overflow, existing keys keep accumulating and new ones are dropped -- support can then only
-    // be under-counted, never over-counted, so a merge is never invented. The count is reported.
-    const size_t SUPPORT_PAIR_CAP = 200000000;
-
+    // Support counting, exact, and independent of every knob that exists for memory or speed.
+    //
+    // This used to be a capped map. The cap made the answer depend on how the edges happened to be
+    // divided up: relations_* is partitioned by (id1, id2) -- READ ids -- while support is keyed on
+    // the UNIT pair, so one unit pair's weak edges are scattered across many partitions. Each
+    // partition counted its own share against its own cap, so overflow dropped different pairs
+    // depending on how many partitions there were and how many readers shared them. First that was
+    // --threads (16 threads scored species purity 0.932 on strain-madness, 64 scored 0.714 on a
+    // byte-identical k-mer set); sizing the caps per route only moved the dependency to
+    // --partitions. A device that exists to bound memory must not change the result, so the cap is
+    // gone.
+    //
+    // What replaces it: shard by the support key itself. hash(key) sends every occurrence of a
+    // pair to exactly one shard, so a shard can be counted to completion in memory with no cap at
+    // all, and the shard count changes only how much memory and disk the counting uses -- never
+    // which pairs are counted or how far. Shards are 8 bytes per weak edge on disk, against the
+    // 117 GB of relations_* already there.
     std::unordered_map<uint64_t, uint32_t> support;
-    size_t weakEdgeCnt = 0, droppedPairs = 0;
+    size_t weakEdgeCnt = 0;
 
     auto packPair = [](uint32_t a, uint32_t b) -> uint64_t {
         return (a < b) ? ((uint64_t)a << 32 | b) : ((uint64_t)b << 32 | a);
     };
 
-    // One route, one reader, one map, one cap -- and the cap is sized from what the route holds
-    // rather than from the thread count. relations_* records are a fixed 12 bytes, so the file
-    // size divided by sizeof(Relation) is the exact record count and allocateRouteCaps can split
-    // the budget without reading anything first.
     const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
     const auto routePath = [&](size_t route) {
         return outDir + "/relations_" + std::to_string(route) + ".bin";
     };
-    std::vector<size_t> routeRecords(routeCnt, 0);
+
+    // How many shards. relations_* records are a fixed 12 bytes, so the file sizes give an exact
+    // upper bound on the weak-edge count without reading anything, and distinct keys can never
+    // outnumber edges. One shard whenever the whole thing fits -- the common case, and it skips
+    // the shard files entirely.
+    size_t upperBoundEdges = 0;
     for (size_t r = 0; r < routeCnt; ++r) {
-        routeRecords[r] = static_cast<size_t>(FileUtil::getFileSize(routePath(r)))
-                          / sizeof(Relation);
+        upperBoundEdges += static_cast<size_t>(FileUtil::getFileSize(routePath(r)))
+                           / sizeof(Relation);
     }
-    const std::vector<size_t> routeCaps = allocateRouteCaps(routeRecords, SUPPORT_PAIR_CAP);
+    const size_t entryBudget = getRelationBudget(par.ramUsage);
+    size_t shardCnt = (upperBoundEdges + entryBudget - 1) / std::max<size_t>(1, entryBudget);
+    if (shardCnt < 1) { shardCnt = 1; }
+    // The bound above counts every record in relations_*, but only the ones inside the weak band
+    // are keyed here -- on strain-madness that was 450 M of 10.49 G, so the estimate is roughly
+    // 20x conservative and the shard count can be trimmed hard without a shard ever coming close
+    // to the budget. Trimmed by what phase A can hold open: every writer keeps one file per shard.
+    const size_t fdBudget = getOpenFileLimit() / 2;
+    const size_t writers = static_cast<size_t>(std::max(1, par.threads));
+    const size_t shardFdCap = std::max<size_t>(1, fdBudget / writers);
+    if (shardCnt > shardFdCap) {
+        cout << "Phase 2: " << shardCnt << " key shards would need " << (shardCnt * writers)
+             << " open files; trimming to " << shardFdCap << " (limit "
+             << getOpenFileLimit() << "). The estimate counts every relations_* record, not just"
+             << " the weak band, so it is far above what the shards actually hold." << endl;
+        shardCnt = shardFdCap;
+    }
+    // Write buffers are charged against a fixed total per writer rather than a fixed size each,
+    // so raising the shard count cannot multiply the memory it uses.
+    const size_t SHARD_WRITE_BYTES_PER_WRITER = 16u << 20;
+    const size_t shardBufElems = std::max<size_t>(
+        4096, SHARD_WRITE_BYTES_PER_WRITER / (shardCnt * sizeof(uint64_t)));
 
-    // Per-route instrumentation. The totals alone cannot show where the cap bites, and the
-    // routing rule sends ~88% of every edge into the cross bucket.
+    // Per-route weak-edge counts, for the load-skew report. Instrumentation only.
     std::vector<size_t> routeWeak(routeCnt, 0);
-    std::vector<size_t> routeDropped(routeCnt, 0);
-    // Map size the moment this route's cap was first reached, or 0 if it never was.
-    std::vector<size_t> routeSizeAtCap(routeCnt, 0);
 
-    // One route per call, and the cap comes from routeCaps[route]. Threads touch disjoint
-    // elements of the three instrumentation vectors -- a route is read by exactly one reader --
-    // so those writes need no synchronisation.
-    auto countRoute = [&](size_t route,
-                          std::unordered_map<uint64_t, uint32_t>& local,
-                          size_t& weakCnt, size_t& dropped) {
-        const size_t cap = routeCaps[route];
-        size_t localRouteWeak = 0, localRouteDropped = 0;
-        ReadBuffer<Relation> rb(routePath(route), 1024 * 1024);
-        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
-            const uint32_t id1 = r.id1, id2 = r.id2;
-            if (id1 == 0 || id2 == 0) continue;
-            if (id1 > processedReadCnt || id2 > processedReadCnt) continue;
-            const int w = static_cast<int>(r.weight);
-            if (w <= weakThr || w > coreThr) continue;
-            if (queryGroupInfo[id1] == 0 && queryGroupInfo[id2] == 0) continue;
-            const uint32_t u = unit[id1], v = unit[id2];
-            if (u == v) continue;
-            weakCnt++;
-            localRouteWeak++;
-            const uint64_t key = packPair(u, v);
-            auto it = local.find(key);
-            if (it != local.end()) {
-                it->second++;
-            } else if (local.size() < cap) {
-                local.emplace(key, 1u);
-            } else {
-                dropped++;
-                localRouteDropped++;
-                // First drop is the first time this route's map was full.
-                if (routeSizeAtCap[route] == 0) {
-                    routeSizeAtCap[route] = local.size();
+    // The filter every pass applies to a Relation, in one place so the two passes cannot drift.
+    // Returns false when the edge carries no support for any pair.
+    const auto weakPairOf = [&](const Relation & r, uint64_t & keyOut) -> bool {
+        const uint32_t id1 = r.id1, id2 = r.id2;
+        if (id1 == 0 || id2 == 0) { return false; }
+        if (id1 > processedReadCnt || id2 > processedReadCnt) { return false; }
+        const int w = static_cast<int>(r.weight);
+        if (w <= weakThr || w > coreThr) { return false; }
+        if (queryGroupInfo[id1] == 0 && queryGroupInfo[id2] == 0) { return false; }
+        const uint32_t u = unit[id1], v = unit[id2];
+        if (u == v) { return false; }
+        keyOut = packPair(u, v);
+        return true;
+    };
+
+    // Splitmix64. Any mixer would do; what matters is that it depends on the key alone, so a
+    // pair's shard is the same on every run and in every configuration.
+    const auto shardOfKey = [shardCnt](uint64_t key) -> size_t {
+        if (shardCnt == 1) { return 0; }
+        uint64_t x = key + 0x9E3779B97F4A7C15ull;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        x ^= x >> 31;
+        return static_cast<size_t>(x % shardCnt);
+    };
+
+    if (shardCnt == 1) {
+        // Everything fits. Threads count into private maps and the merge sums them, which is
+        // exact because nothing is discarded: `support[key] += n` recovers the total however the
+        // occurrences were spread across readers. A key can appear under several routes, so the
+        // floor cannot be applied per thread -- it is applied to the merged counts below.
+        #pragma omp parallel for schedule(dynamic) num_threads(par.threads)
+        for (size_t route = 0; route < routeCnt; ++route) {
+            std::unordered_map<uint64_t, uint32_t> local;
+            size_t localWeak = 0;
+            uint64_t key = 0;
+            ReadBuffer<Relation> rb(routePath(route), 1024 * 1024);
+            for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+                if (!weakPairOf(r, key)) { continue; }
+                localWeak++;
+                local[key]++;
+            }
+            routeWeak[route] = localWeak;
+            #pragma omp critical
+            {
+                for (const auto& kv : local) { support[kv.first] += kv.second; }
+                weakEdgeCnt += localWeak;
+            }
+        }
+        // Same filter the sharded path applies, so `support` means the same thing either way:
+        // pairs that could still be merged. requiredSupport never returns less than the floor,
+        // so nothing droppable here could have qualified.
+        for (auto it = support.begin(); it != support.end(); ) {
+            if (it->second < MERGE_SUPPORT_FLOOR) { it = support.erase(it); } else { ++it; }
+        }
+    } else {
+        // Two passes. Scatter keys to shard files, then count one shard at a time. Each writer
+        // owns its own file so no lock is needed on the hot path; the reader takes every writer's
+        // file for its shard.
+        const auto shardPath = [&](size_t shard, size_t writer) {
+            return outDir + "/support_" + std::to_string(shard) + "_" + std::to_string(writer);
+        };
+        std::vector<std::string> shardFiles;
+
+        #pragma omp parallel num_threads(par.threads)
+        {
+            const int writer = omp_get_thread_num();
+            std::vector<std::unique_ptr<WriteBuffer<uint64_t>>> out(shardCnt);
+            for (size_t sh = 0; sh < shardCnt; ++sh) {
+                out[sh].reset(new WriteBuffer<uint64_t>(shardPath(sh, writer), shardBufElems));
+            }
+            size_t localWeak = 0;
+
+            #pragma omp for schedule(dynamic)
+            for (size_t route = 0; route < routeCnt; ++route) {
+                size_t routeLocalWeak = 0;
+                uint64_t key = 0;
+                ReadBuffer<Relation> rb(routePath(route), 1024 * 1024);
+                for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+                    if (!weakPairOf(r, key)) { continue; }
+                    routeLocalWeak++;
+                    out[shardOfKey(key)]->write(&key, 1);
+                }
+                routeWeak[route] = routeLocalWeak;
+                localWeak += routeLocalWeak;
+            }
+
+            for (size_t sh = 0; sh < shardCnt; ++sh) {
+                out[sh]->flush();
+                out[sh].reset();
+            }
+            #pragma omp critical
+            {
+                weakEdgeCnt += localWeak;
+                for (size_t sh = 0; sh < shardCnt; ++sh) {
+                    shardFiles.push_back(shardPath(sh, writer));
                 }
             }
         }
-        routeWeak[route] = localRouteWeak;
-        routeDropped[route] = localRouteDropped;
-    };
 
-    // Every route, including what used to be the separately-handled cross bucket, goes through
-    // the same loop with its own map and its own share of the budget. A route's map is merged
-    // into `support` and released before the next route on that worker starts, so peak memory is
-    // bounded by the shares of the routes running concurrently, and those shares sum to at most
-    // SUPPORT_PAIR_CAP by construction.
-    #pragma omp parallel for schedule(dynamic) num_threads(par.threads)
-    for (size_t route = 0; route < routeCnt; ++route) {
-        std::unordered_map<uint64_t, uint32_t> local;
-        size_t localWeak = 0, localDropped = 0;
+        cout << "Phase 2: " << weakEdgeCnt << " weak edges scattered over " << shardCnt
+             << " key shards x " << writers << " writers ("
+             << humanBytes(weakEdgeCnt * sizeof(uint64_t)) << " on disk, "
+             << shardBufElems << " elems per write buffer)" << endl;
 
-        countRoute(route, local, localWeak, localDropped);
-
-        #pragma omp critical
-        {
-            for (const auto& kv : local) support[kv.first] += kv.second;
-            weakEdgeCnt += localWeak;
-            droppedPairs += localDropped;
+        // One shard at a time so peak memory is one shard's distinct keys, whatever shardCnt is.
+        // Only pairs that could still matter are carried out of the shard: a pair below the floor
+        // can never be merged, so keeping it would only grow `support` for nothing.
+        for (size_t sh = 0; sh < shardCnt; ++sh) {
+            std::unordered_map<uint64_t, uint32_t> shardCount;
+            for (int writer = 0; writer < par.threads; ++writer) {
+                ReadBuffer<uint64_t> rb(shardPath(sh, writer), 1024 * 1024);
+                for (uint64_t key = rb.getNext(); key != 0; key = rb.getNext()) {
+                    shardCount[key]++;
+                }
+            }
+            for (const auto& kv : shardCount) {
+                if (kv.second >= MERGE_SUPPORT_FLOOR) { support.emplace(kv.first, kv.second); }
+            }
         }
+        reportAndRemoveFiles(shardFiles, "support shards");
     }
 
     // Where the weak edges are, what each route was allowed to hold, and whether that was
@@ -1824,23 +1918,10 @@ void GroupGenerator::mergeBySupport(int coreThr,
                              / static_cast<double>(weakEdgeCnt))
                      << "%)";
             }
-            cout << " cap " << routeCaps[r];
-            if (routeDropped[r] > 0) {
-                cout << " dropped " << routeDropped[r]
-                     << ", map full at " << routeSizeAtCap[r];
-            }
         }
         cout << endl;
-        // The judgement line. Caps are now a function of what each route holds, not of the
-        // thread count, so this count must not move when --threads does.
-        size_t cappedRoutes = 0, allocated = 0;
-        for (size_t r = 0; r < routeCnt; ++r) {
-            if (routeDropped[r] > 0) { cappedRoutes++; }
-            allocated += routeCaps[r];
-        }
-        cout << "Phase 2: " << cappedRoutes << " of " << routeCnt
-             << " routes hit their cap; " << allocated << " of " << SUPPORT_PAIR_CAP
-             << " pairs budgeted across routes (sized from record counts, not --threads)" << endl;
+        // Load skew only. There is nothing to drop any more, so this is about where the work is,
+        // not about what was lost -- the cross bucket carrying ~88% is why the merge shards it.
     }
 
     // Support required of a pair. Without the ratio this is the bare floor, which is the rule the
@@ -1889,23 +1970,20 @@ void GroupGenerator::mergeBySupport(int coreThr,
 
     // Pass 2: distinct reads on the smaller side, for candidate pairs only.
     std::unordered_set<uint64_t> satisfied;
-    size_t droppedReads = 0;
     if (useRatio && !candidates.empty()) {
-        // Read-set memory guard, same contract as SUPPORT_PAIR_CAP: on overflow new reads are
-        // dropped, so a count can only fall short and a merge is never invented.
-        const size_t PASS2_READ_CAP = 200000000;
-        // Same treatment as the support cap: shares sized from what each route holds, so the
-        // thread count cannot decide which reads get dropped.
-        const std::vector<size_t> routeReadCaps = allocateRouteCaps(routeRecords, PASS2_READ_CAP);
-
+        // No cap. This pass counts distinct reads per candidate pair, and a cap here would put
+        // the same dependency back that the support pass just lost: which reads get dropped would
+        // be decided by how the edges were partitioned. `candidates` is already the pairs that
+        // cleared the support floor, so the read sets are bounded by that -- far smaller than the
+        // edge stream. If this ever does not fit, shard it by key as the support pass does; do not
+        // reintroduce a cap.
         // A pair is satisfied as soon as `required` distinct reads are seen, so a reader that
         // stops inserting at that point cannot make any pair's union fall short: no reader stops
         // earlier.
         auto distinctRoute = [&](size_t route,
                                  std::unordered_map<uint64_t, std::unordered_set<uint32_t>>& local,
                                  std::unordered_set<uint64_t>& localSatisfied,
-                                 size_t& held, size_t& dropped) {
-            const size_t cap = routeReadCaps[route];
+                                 size_t& held) {
             ReadBuffer<Relation> rb(routePath(route), 1024 * 1024);
             for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
                 const uint32_t id1 = r.id1, id2 = r.id2;
@@ -1922,7 +2000,6 @@ void GroupGenerator::mergeBySupport(int coreThr,
                 if (localSatisfied.count(key)) continue;
                 const uint32_t small = smallSideOf(u, v);
                 const uint32_t readId = (unit[id1] == small) ? id1 : id2;
-                if (held >= cap) { dropped++; continue; }
                 auto& reads = local[key];
                 if (reads.insert(readId).second) { held++; }
                 if (reads.size() >= cand->second) {
@@ -1942,9 +2019,9 @@ void GroupGenerator::mergeBySupport(int coreThr,
         for (size_t route = 0; route < routeCnt; ++route) {
             std::unordered_map<uint64_t, std::unordered_set<uint32_t>> local;
             std::unordered_set<uint64_t> localSatisfied;
-            size_t localHeld = 0, localDropped = 0;
+            size_t localHeld = 0;
 
-            distinctRoute(route, local, localSatisfied, localHeld, localDropped);
+            distinctRoute(route, local, localSatisfied, localHeld);
 
             #pragma omp critical
             {
@@ -1953,7 +2030,6 @@ void GroupGenerator::mergeBySupport(int coreThr,
                     partial[kv.first].insert(kv.second.begin(), kv.second.end());
                 }
                 heldReads += localHeld;
-                droppedReads += localDropped;
             }
         }
         // Unions can have crossed the requirement even when no single route's share did.
@@ -1968,12 +2044,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
 
         cout << "Phase 2: " << candidates.size() << " candidate pairs, " << satisfied.size()
              << " reached the distinct-read requirement (" << heldReads
-             << " reads still held for the rest)";
-        if (droppedReads) {
-            cout << " [read cap hit, " << droppedReads
-                 << " observations dropped -- support undercounted]";
-        }
-        cout << endl;
+             << " reads still held for the rest)" << endl;
     }
 
     // Merge the supported pairs into the Phase-1 components built above.
@@ -2059,12 +2130,9 @@ void GroupGenerator::mergeBySupport(int coreThr,
     }
 
     cout << "Phase 2: " << weakEdgeCnt << " weak edges over " << support.size()
-         << " unit pairs, " << mergedPairs << " pairs merged"
-         << "; groups " << groupsBefore << " -> " << groupInfo.size();
-    if (droppedPairs) {
-        cout << " [pair cap hit, " << droppedPairs << " observations dropped -- support undercounted]";
-    }
-    cout << endl;
+         << " unit pairs at or above the support floor, " << mergedPairs << " pairs merged"
+         << "; groups " << groupsBefore << " -> " << groupInfo.size()
+         << " [counted exactly, no cap; independent of --threads and --partitions]" << endl;
 
     // Read mass this phase moved, and the sizes it moved it from. Pair counts alone hide the damage:
     // a few merges between large units cost more purity than many merges between small ones, because

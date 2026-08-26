@@ -556,67 +556,6 @@ inline size_t shardsForRoute(size_t route, int partitionCnt) {
     return (route == static_cast<size_t>(partitionCnt)) ? static_cast<size_t>(partitionCnt) : 1;
 }
 
-// Splits a counting budget across routes in proportion to how much each one holds.
-//
-// The support pass used to give every reader SUPPORT_PAIR_CAP/threads, which made the result
-// depend on --threads. The routing rule funnels ~88% of all edges into the cross bucket, and that
-// bucket is one route read by one reader, so raising the thread count shrank the cap the biggest
-// route was measured against while the work it had to hold stayed put. Overflow drops pairs, and
-// which ones survive is then decided by read order rather than by support. Measured on CAMI2
-// strain-madness at otherwise identical settings: 53,784,754 observations dropped at 16 threads
-// against 243,045,103 at 64, species purity 0.932 against 0.714.
-//
-// Every route is given its share up front, before any reading starts, so the allocation is a pure
-// function of (routeRecords, totalCap): no thread count, no scheduling order, no dependence on
-// which route happens to finish first. Routes are visited largest first so the rounding remainder
-// lands on the small ones, and the running divisor guarantees the shares sum to at most totalCap
-// no matter how many run at once. A route with nothing in it gets nothing.
-inline std::vector<size_t> allocateRouteCaps(const std::vector<size_t> & routeRecords,
-                                             size_t totalCap) {
-    const size_t routeCnt = routeRecords.size();
-    std::vector<size_t> caps(routeCnt, 0);
-    if (routeCnt == 0) {
-        return caps;
-    }
-
-    std::vector<size_t> order(routeCnt);
-    for (size_t r = 0; r < routeCnt; ++r) { order[r] = r; }
-    std::sort(order.begin(), order.end(), [&routeRecords](size_t a, size_t b) {
-        if (routeRecords[a] != routeRecords[b]) { return routeRecords[a] > routeRecords[b]; }
-        return a < b; // ties broken by index so the result does not depend on sort stability
-    });
-
-    size_t remainingRecords = 0;
-    for (const size_t n : routeRecords) { remainingRecords += n; }
-    if (remainingRecords == 0) {
-        return caps;
-    }
-
-    size_t remainingCap = totalCap;
-    for (const size_t route : order) {
-        const size_t records = routeRecords[route];
-        if (records == 0 || remainingRecords == 0) {
-            continue;
-        }
-        // A route never needs a cap above what it could possibly hold: distinct pairs cannot
-        // outnumber records. Handing it less than that only invents drops.
-        size_t share = static_cast<size_t>(
-            (static_cast<double>(remainingCap) * static_cast<double>(records))
-            / static_cast<double>(remainingRecords));
-        if (share > records) { share = records; }
-        if (share > remainingCap) { share = remainingCap; }
-        // Rounding can zero out a route that does hold records, and a map capped at 0 drops
-        // every pair it sees. Give it one -- but only out of what is left, so the shares still
-        // sum to at most totalCap. A route reached with nothing left gets nothing, which
-        // undercounts its support and can therefore only prevent a merge, never invent one.
-        if (share == 0 && remainingCap > 0) { share = 1; }
-        caps[route] = share;
-        remainingCap = (remainingCap > share) ? (remainingCap - share) : 0;
-        remainingRecords -= records;
-    }
-    return caps;
-}
-
 // Which shard of its route an edge belongs to. Keyed on id1 ALONE -- keying on anything
 // derived from both ids would let one pair land in two shards and split its weight.
 inline size_t shardOf(uint32_t id1, size_t shardCnt) {
