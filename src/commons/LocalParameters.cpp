@@ -263,21 +263,41 @@ LocalParameters::LocalParameters() :
                     typeid(std::string),
                     (void *) &outputDir,
                     "^.*$"),
-        MIN_EDGE(MIN_EDGE_ID,
-                        "--min-edge",
-                        "Weak-band lower bound, in shared k-mers",
-                        "Lower bound of the weak band: an edge lighter than this is not used at all, "
-                        "by either the merging pass or the singleton pass. Absolute, in shared "
-                        "k-mers, not a fraction of the core threshold. The fraction form was tried "
-                        "on the argument that one absolute number describes different overlaps on "
-                        "different data (5 is 5/15 = 0.333 of the core on species-inclusion but "
-                        "5/34 = 0.147 on CAMI2 marine). Measurement disagreed: --weak-band-ratio "
-                        "0.3333 reproduces an absolute 5 only when the core is 15, and on "
-                        "species-exclusion, where the core is 18, it raised the bound to 6 and took "
-                        "recall from 0.2716 to 0.2611. Clamped into [1, core threshold - 1], since "
-                        "an empty band leaves the later passes nothing to work with.",
+        WEAK_BAND_RATIO(WEAK_BAND_RATIO_ID,
+                        "--weak-band-ratio",
+                        "Weak-band lower bound as a fraction of the core threshold",
+                        "Lower bound of the weak band, as a fraction of the Phase 1 core threshold: "
+                        "weak edges are those with weight in (ratio x core, core], and an edge "
+                        "lighter than the bound is not used at all, by either the merging pass or "
+                        "the singleton pass. The same value is the singleton pass's floor. This was "
+                        "briefly an absolute count of shared k-mers (--min-edge), on the argument "
+                        "that 0.3333 reproduces an absolute 5 only where the core is 15. "
+                        "Measurement reversed that: an absolute 10 is 10/33 = 0.30 of the core on "
+                        "CAMI2 strain-madness but 10/26 = 0.38 on species-exclusion, so it is the "
+                        "absolute form that means different things on different data. And the axis "
+                        "is sharp -- on strain-madness at 16 threads, a bound of 11 gives species "
+                        "purity 0.932 while 10 gives 0.763, so one k-mer of band width is worth "
+                        "0.169 of purity. Clamped into [1, core threshold - 1], since an empty band "
+                        "leaves the later passes nothing to work with.",
+                        typeid(float),
+                        (void *) &weakBandRatio,
+                        "^[0-9]*\\.?[0-9]+$"),
+        PARTITIONS(PARTITIONS_ID,
+                        "--partitions",
+                        "Intermediate partitions for the edge graph (0=follow --threads)",
+                        "How many partitions the edge graph is split into on disk. The routing rule "
+                        "sends an edge to one of 2*partitions+1 buckets by (id1, id2), and the "
+                        "cross bucket -- which carries about 88% of all edges -- is sharded that "
+                        "many ways again, so a flush writes 3*partitions files. This used to be the "
+                        "thread count, which made both the file count and the flush count scale "
+                        "with it: CAMI2 strain-madness went from 389 flushes x 48 units at 16 "
+                        "threads to 2,354 x 192 at 64, so the same 117.29 GB became 451,968 files "
+                        "instead of 18,672 and the run took 8h 08m instead of 3h 40m. Separating "
+                        "the two lets --threads decide only how many workers run at once. Partition "
+                        "count does change the result, because it changes how edges are grouped for "
+                        "the support pass; thread count no longer does.",
                         typeid(int),
-                        (void *) &minEdge,
+                        (void *) &partitions,
                         "^[0-9]+$"),
         COMMON_KMER_SPAN(COMMON_KMER_SPAN_ID,
                     "--common-kmer-span",
@@ -641,7 +661,8 @@ LocalParameters::LocalParameters() :
     maxKmerReads = 0;
     maxKmerQuantile = 0.0f;
     minOverlapRatio = 0.3f;
-    minEdge = 5;
+    weakBandRatio = 0.3333f;
+    partitions = 0;
     commonKmerSpan = 0;
     maxTmpDiskMiB = 0;
 
@@ -753,7 +774,8 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&MAX_KMER_READS);
     groupGeneration.push_back(&MAX_KMER_QUANTILE);
     groupGeneration.push_back(&MIN_OVERLAP_RATIO);
-    groupGeneration.push_back(&MIN_EDGE);
+    groupGeneration.push_back(&WEAK_BAND_RATIO);
+    groupGeneration.push_back(&PARTITIONS);
     groupGeneration.push_back(&COMMON_KMER_SPAN);
     groupGeneration.push_back(&MAX_TMP_DISK);
     groupGeneration.push_back(&PRINT_LOG);

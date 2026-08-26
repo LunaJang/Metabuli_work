@@ -494,51 +494,127 @@ inline size_t getTmpDiskBudgetBytes(const std::string & outDir, int maxTmpDiskMi
     return freeBytes / 100 * 80;
 }
 
-inline size_t getRelationThreshold(int numThreads, int maxRamGiB) {
+// Pairs the emit stage may hold in memory across ALL threads before flushing.
+//
+// This used to divide the budget by the thread count and hand each thread its own quota. Total
+// capacity was the same either way, but each thread flushed independently the moment its own map
+// filled, so a quarter-sized map meant four times as many flush events -- and each event writes
+// one file per merge unit. CAMI2 strain-madness went from 389 flushes at 16 threads to 2,354 at
+// 64, and with 3*partitions units per flush the same 117.29 GB landed in 451,968 files instead of
+// 18,672. The merge then folded 23 times instead of once and the run took 8h 08m instead of
+// 3h 40m. Shared here so both numbers stop tracking --threads.
+//
+// MAX_THRESHOLD is now what a single thread can be asked to hold when --threads is 1:
+// 200 M entries x 48 B is 9.6 GB, which fits the budgets these runs use (128 GiB) but is worth
+// remembering if the cap is ever raised.
+inline size_t getRelationBudget(int maxRamGiB) {
     const size_t availableBytes = getMemoryBudgetBytes(maxRamGiB);
 
     const double safetyFactor = 0.6;
     const size_t bytesPerEntry = 48; // unordered_map node overhead
 
-    size_t threshold = (size_t)(availableBytes * safetyFactor)
-                       / (numThreads * bytesPerEntry);
+    size_t budget = (size_t)(availableBytes * safetyFactor) / bytesPerEntry;
 
     const size_t MIN_THRESHOLD = 1'000'000;
     const size_t MAX_THRESHOLD = 200'000'000;
-    return std::max(MIN_THRESHOLD, std::min(threshold, MAX_THRESHOLD));
+    return std::max(MIN_THRESHOLD, std::min(budget, MAX_THRESHOLD));
 }
 
-// Width of one id range in the relations_* routing scheme.
-inline size_t getRouteRangeSize(size_t processedReadCnt, int numThreads) {
-    const size_t threads = static_cast<size_t>(numThreads);
-    return (processedReadCnt > threads) ? (processedReadCnt / threads) : processedReadCnt;
+// Width of one id range in the relations_* routing scheme. The count is --partitions, not
+// --threads: the two were the same number until 2026-08-26, which is what made the result depend
+// on the thread count.
+inline size_t getRouteRangeSize(size_t processedReadCnt, int partitionCnt) {
+    const size_t parts = static_cast<size_t>(partitionCnt < 1 ? 1 : partitionCnt);
+    return (processedReadCnt > parts) ? (processedReadCnt / parts) : processedReadCnt;
 }
 
 // Which relations_{r}.bin an edge belongs to. Depends only on (id1, id2), which is what lets
-// the merge be split by route: a pair can never appear under two different routes.
-// Routes 0..numThreads-1 and numThreads+1..2*numThreads are each read by a single union-find
-// thread; numThreads is the cross bucket that spans partitions.
-inline size_t routeOf(uint32_t id1, uint32_t id2, int numThreads, size_t rangeSize) {
-    const uint32_t threads = static_cast<uint32_t>(numThreads);
-    if (id1 % threads == id2 % threads) {
-        return static_cast<size_t>(id1 % threads);
+// the merge be split by route: a pair can never appear under two different routes. Each route is
+// then read by exactly one reader, so a per-route counting map sees every observation of a pair.
+// Routes 0..partitionCnt-1 hold the same-residue edges and partitionCnt+1..2*partitionCnt the
+// same-range ones; partitionCnt is the cross bucket that spans partitions.
+inline size_t routeOf(uint32_t id1, uint32_t id2, int partitionCnt, size_t rangeSize) {
+    const uint32_t parts = static_cast<uint32_t>(partitionCnt < 1 ? 1 : partitionCnt);
+    if (id1 % parts == id2 % parts) {
+        return static_cast<size_t>(id1 % parts);
     }
     // rangeSize is 0 only when there are no reads at all, in which case there are no edges
     // either; guard anyway so the helper can never divide by zero.
     if (rangeSize != 0 && id1 / rangeSize == id2 / rangeSize) {
-        return static_cast<size_t>(id1 / rangeSize) + static_cast<size_t>(numThreads);
+        return static_cast<size_t>(id1 / rangeSize) + static_cast<size_t>(parts);
     }
-    return static_cast<size_t>(numThreads);
+    return static_cast<size_t>(parts);
 }
 
 // How many shards a route is split into for merging. Only the cross bucket needs it: the
 // routing rule sends ~88% of all edges there (measured), so merging it as one unit caps the
 // whole parallel merge at ~1.13x no matter how many threads are available.
-inline size_t shardsForRoute(size_t route, int numThreads) {
-    if (numThreads < 1) {
+inline size_t shardsForRoute(size_t route, int partitionCnt) {
+    if (partitionCnt < 1) {
         return 1;
     }
-    return (route == static_cast<size_t>(numThreads)) ? static_cast<size_t>(numThreads) : 1;
+    return (route == static_cast<size_t>(partitionCnt)) ? static_cast<size_t>(partitionCnt) : 1;
+}
+
+// Splits a counting budget across routes in proportion to how much each one holds.
+//
+// The support pass used to give every reader SUPPORT_PAIR_CAP/threads, which made the result
+// depend on --threads. The routing rule funnels ~88% of all edges into the cross bucket, and that
+// bucket is one route read by one reader, so raising the thread count shrank the cap the biggest
+// route was measured against while the work it had to hold stayed put. Overflow drops pairs, and
+// which ones survive is then decided by read order rather than by support. Measured on CAMI2
+// strain-madness at otherwise identical settings: 53,784,754 observations dropped at 16 threads
+// against 243,045,103 at 64, species purity 0.932 against 0.714.
+//
+// Every route is given its share up front, before any reading starts, so the allocation is a pure
+// function of (routeRecords, totalCap): no thread count, no scheduling order, no dependence on
+// which route happens to finish first. Routes are visited largest first so the rounding remainder
+// lands on the small ones, and the running divisor guarantees the shares sum to at most totalCap
+// no matter how many run at once. A route with nothing in it gets nothing.
+inline std::vector<size_t> allocateRouteCaps(const std::vector<size_t> & routeRecords,
+                                             size_t totalCap) {
+    const size_t routeCnt = routeRecords.size();
+    std::vector<size_t> caps(routeCnt, 0);
+    if (routeCnt == 0) {
+        return caps;
+    }
+
+    std::vector<size_t> order(routeCnt);
+    for (size_t r = 0; r < routeCnt; ++r) { order[r] = r; }
+    std::sort(order.begin(), order.end(), [&routeRecords](size_t a, size_t b) {
+        if (routeRecords[a] != routeRecords[b]) { return routeRecords[a] > routeRecords[b]; }
+        return a < b; // ties broken by index so the result does not depend on sort stability
+    });
+
+    size_t remainingRecords = 0;
+    for (const size_t n : routeRecords) { remainingRecords += n; }
+    if (remainingRecords == 0) {
+        return caps;
+    }
+
+    size_t remainingCap = totalCap;
+    for (const size_t route : order) {
+        const size_t records = routeRecords[route];
+        if (records == 0 || remainingRecords == 0) {
+            continue;
+        }
+        // A route never needs a cap above what it could possibly hold: distinct pairs cannot
+        // outnumber records. Handing it less than that only invents drops.
+        size_t share = static_cast<size_t>(
+            (static_cast<double>(remainingCap) * static_cast<double>(records))
+            / static_cast<double>(remainingRecords));
+        if (share > records) { share = records; }
+        if (share > remainingCap) { share = remainingCap; }
+        // Rounding can zero out a route that does hold records, and a map capped at 0 drops
+        // every pair it sees. Give it one -- but only out of what is left, so the shares still
+        // sum to at most totalCap. A route reached with nothing left gets nothing, which
+        // undercounts its support and can therefore only prevent a merge, never invent one.
+        if (share == 0 && remainingCap > 0) { share = 1; }
+        caps[route] = share;
+        remainingCap = (remainingCap > share) ? (remainingCap - share) : 0;
+        remainingRecords -= records;
+    }
+    return caps;
 }
 
 // Which shard of its route an edge belongs to. Keyed on id1 ALONE -- keying on anything
@@ -678,7 +754,12 @@ protected:
     int kmerFormat;
     int printLog;
     int commonKmerSpan;   // --common-kmer-span; see the note above the class
-    
+    // The one number the routing scheme is built on. Resolved once, in the constructor, from
+    // --partitions falling back to --threads, and read everywhere the old code read par.threads
+    // for a routing decision. Keeping the two apart is the point: --threads may then change
+    // without changing the result, which it used to do through the support pass's cap.
+    int partitionCnt;
+
     // Agents    
     GeneticCode * geneticCode = nullptr;
     QueryIndexer *queryIndexer = nullptr;

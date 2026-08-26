@@ -63,7 +63,11 @@ GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     kmerFormat = par.kmerFormat;
     printLog = par.printLog;
     commonKmerSpan = par.commonKmerSpan;
-    
+    // 0 means "follow --threads", which is what every run before --partitions existed did.
+    // Clamped to at least 1: routeOf takes id1 % partitionCnt, and --threads is itself >= 1.
+    partitionCnt = (par.partitions > 0) ? par.partitions : par.threads;
+    if (partitionCnt < 1) { partitionCnt = 1; }
+
     geneticCode = new GeneticCode(par.reducedAA == 1);
     queryIndexer = new QueryIndexer(par);
     queryIndexer->setKmerLen(12);
@@ -183,26 +187,30 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
             exit(EXIT_FAILURE);
         }
 
-        // Weak band lower bound, in shared k-mers. Absolute rather than a fraction of the core
-        // threshold: the ratio form was adopted on the argument that an absolute 5 means 5/15 =
-        // 0.333 of the core on species-inclusion but 5/34 = 0.147 on CAMI2 marine, so one number
-        // describes different overlaps. But measurement went the other way. --weak-band-ratio
-        // 0.3333 reproduces an absolute 5 only when the core is 15: on species-exclusion, where the
-        // core is 18, it raised the bound to 6 and took recall from 0.2716 to 0.2611. The ratio was
-        // never a like-for-like rewrite of the absolute value, and the absolute value scored better,
-        // so this is the axis that gets swept.
-        int weakThr = par.minEdge;
+        // Weak band lower bound, as a fraction of the core threshold. This was briefly an
+        // absolute count of shared k-mers (--min-edge), adopted because 0.3333 reproduces an
+        // absolute 5 only where the core is 15. Measurement reversed the argument: an absolute 10
+        // is 10/33 = 0.30 of the core on CAMI2 strain-madness but 10/26 = 0.38 on
+        // species-exclusion, so it is the absolute form that means different things on different
+        // data. And the axis is sharp -- on strain-madness at 16 threads a bound of 11 gives
+        // species purity 0.932 while 10 gives 0.763, one k-mer of band width for 0.169 of purity.
+        // The clamp and the warning are kept from the absolute version; they were the good part.
+        const int requestedWeakThr =
+            static_cast<int>(par.weakBandRatio * static_cast<float>(coreThr) + 0.5f);
+        int weakThr = requestedWeakThr;
         if (weakThr < 1) { weakThr = 1; }
         if (weakThr >= coreThr) { weakThr = coreThr - 1; }
 
         cout << "Core threshold: " << coreThr << " (overlap ratio " << par.minOverlapRatio
              << " x " << kmersPerRead << " k-mers/read)" << endl;
-        cout << "Weak band: (" << weakThr << ", " << coreThr << "] (--min-edge " << par.minEdge
-             << "); Phase 3 floor " << weakThr << endl;
-        if (par.minEdge >= coreThr) {
-            cout << "[WARN] --min-edge " << par.minEdge << " is at or above the core threshold "
-                 << coreThr << "; clamped to " << weakThr << ". The weak band would otherwise be"
-                 << " empty, leaving nothing for Phase 3 or Phase 3 to work with." << endl;
+        cout << "Weak band: (" << weakThr << ", " << coreThr << "] (ratio "
+             << par.weakBandRatio << " x core " << coreThr << "); Phase 3 floor "
+             << weakThr << endl;
+        if (requestedWeakThr >= coreThr) {
+            cout << "[WARN] --weak-band-ratio " << par.weakBandRatio << " puts the bound at "
+                 << requestedWeakThr << ", at or above the core threshold " << coreThr
+                 << "; clamped to " << weakThr << ". The weak band would otherwise be empty,"
+                 << " leaving nothing for Phase 2 or Phase 3 to work with." << endl;
         }
 
         // Phase 1: form core groups with strong edges
@@ -225,7 +233,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         // relations_*.bin are reparsed every refinement iteration but are no longer
         // needed once grouping is saved. Indices: relations_0 .. relations_{2*threads}.
         std::vector<std::string> relationFiles;
-        for (int i = 0; i <= par.threads * 2; i++) {
+        for (int i = 0; i <= partitionCnt * 2; i++) {
             relationFiles.push_back(outDir + "/relations_" + std::to_string(i) + ".bin");
         }
         reportAndRemoveFiles(relationFiles, "relations");
@@ -535,8 +543,13 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
 
-    const size_t RELATION_THRESHOLD = getRelationThreshold(par.threads, par.ramUsage);
-    cout << "Flush threshold: " << RELATION_THRESHOLD << " pairs/thread (memory budget "
+    // Shared across threads, not per thread: see getRelationBudget. Each thread still keeps its
+    // own map -- concurrent writes to one map would need a lock on the hot path -- but the
+    // decision to flush is made against the running total, so the number of flushes depends on
+    // how much data there is and not on how many workers are chewing through it.
+    const size_t RELATION_BUDGET = getRelationBudget(par.ramUsage);
+    std::atomic<size_t> bufferedPairs(0);
+    cout << "Flush budget: " << RELATION_BUDGET << " pairs across all threads (memory budget "
          << humanBytes(getMemoryBudgetBytes(par.ramUsage)) << ", --max-ram "
          << par.ramUsage << " GiB)" << endl;
 
@@ -634,7 +647,14 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     {
         int threadIdx = omp_get_thread_num();
         std::unordered_map<uint64_t, uint16_t> pair2weight;
-        pair2weight.reserve(RELATION_THRESHOLD);
+        // Reserve the thread's fair share, not the whole shared budget: reserving the total on
+        // every thread would allocate par.threads times the memory the budget allows.
+        pair2weight.reserve(std::max<size_t>(1, RELATION_BUDGET
+                                               / static_cast<size_t>(std::max(1, par.threads))));
+        // Pairs this thread has added to `bufferedPairs` and not yet flushed. Tracked separately
+        // because unordered_map::size() counts distinct keys while the shared total has to be
+        // decremented by exactly what this thread contributed.
+        size_t publishedPairs = 0;
 
         const string skippedPartName = outDir + "/skipped_kmers_" + to_string(threadIdx);
         ofstream skippedPart(skippedPartName);
@@ -690,10 +710,22 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                     addSat16(pair2weight[pairKey], 1);
                 }
             }
-            if (pair2weight.size() >= RELATION_THRESHOLD) {
+            // Publish this thread's growth before testing the shared total, so the decision is
+            // made against what is actually in memory. Only the growth is published, hence the
+            // delta: size() is distinct keys, and a k-mer whose pairs all already exist adds
+            // nothing to the footprint.
+            if (pair2weight.size() > publishedPairs) {
+                bufferedPairs.fetch_add(pair2weight.size() - publishedPairs,
+                                        std::memory_order_relaxed);
+                publishedPairs = pair2weight.size();
+            }
+            if (bufferedPairs.load(std::memory_order_relaxed) >= RELATION_BUDGET
+                && !pair2weight.empty()) {
                 size_t counter_now = counter.fetch_add(1, memory_order_relaxed);
                 localEmittedEdges += pair2weight.size();
                 saveSubGraphToFile(pair2weight, counter_now, processedReadCnt);
+                bufferedPairs.fetch_sub(publishedPairs, std::memory_order_relaxed);
+                publishedPairs = 0;
                 pair2weight.clear();
                 // Publish progress before the guards read it, so the projection matches the
                 // bytes that have just been written.
@@ -711,6 +743,11 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
             localEmittedEdges += pair2weight.size();
             saveSubGraphToFile(pair2weight, counter_now, processedReadCnt);
+            // Leave the shared counter at zero. Nothing reads it after this point, but a thread
+            // that exits still holding a claim would make the number meaningless if the emit
+            // stage is ever run twice in one process.
+            bufferedPairs.fetch_sub(publishedPairs, std::memory_order_relaxed);
+            publishedPairs = 0;
         } else {
             cout << "Thread " << threadIdx << " has no relations to write." << endl;
         }
@@ -851,6 +888,26 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << (static_cast<double>(rawEdgeBytes) / static_cast<double>(diskEdgeBytes)) << "x";
     }
     cout << ")" << endl;
+    // Files, not flushes. Every flush writes one file per merge unit, and the unit count is
+    // 3 x threads today (2*threads+1 routes, with the cross bucket sharded `threads` ways), so
+    // the file count carries a factor of the thread count that the flush count alone hides.
+    // Raising --threads shrinks each thread's share of the memory budget, which raises the flush
+    // count too, and the product is what the merge then has to fold: CAMI2 strain-madness went
+    // from 389 flushes x 48 units at 16 threads to 2,354 x 192 at 64, so 18,672 files became
+    // 451,968 for the same 117.29 GB, and the run took 8h 08m instead of 3h 40m. Printed here
+    // rather than only at merge time so the cost is visible before the fold starts.
+    {
+        const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
+        size_t unitCnt = 0;
+        for (size_t r = 0; r < routeCnt; ++r) {
+            unitCnt += shardsForRoute(r, partitionCnt);
+        }
+        cout << "[edges] " << this->numOfGraph << " flushes x " << unitCnt << " units ("
+             << routeCnt << " routes, cross bucket sharded x"
+             << shardsForRoute(static_cast<size_t>(partitionCnt), partitionCnt) << ") = "
+             << (this->numOfGraph * unitCnt) << " subGraph files, at --threads "
+             << par.threads << endl;
+    }
     // What the run actually held at once, which is the number a shared filesystem cares about.
     // "0 folds" means the data fit under the budget and nothing was folded early -- the path
     // this build takes when there is room, identical to the one before incremental folding.
@@ -874,19 +931,19 @@ void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>&
     // Split by relations_* route at write time. Because the route is a function of
     // (id1, id2) alone, a pair can never land under two routes -- which is what makes the
     // per-route merges independent and lets them run in parallel.
-    const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
-    const size_t rangeSize = getRouteRangeSize(processedReadCnt, par.threads);
+    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
+    const size_t rangeSize = getRouteRangeSize(processedReadCnt, partitionCnt);
 
     // byUnit[route][shard]. Every route carries a shard index so the merge's filename rule is
     // uniform; only the cross bucket actually has more than one.
     std::vector<std::vector<std::vector<Relation>>> byUnit(routeCnt);
     for (size_t route = 0; route < routeCnt; ++route) {
-        byUnit[route].resize(shardsForRoute(route, par.threads));
+        byUnit[route].resize(shardsForRoute(route, partitionCnt));
     }
     for (const auto& [pairKey, weight] : pair2weight) {
         const uint32_t id1 = static_cast<uint32_t>(pairKey >> 32);
         const uint32_t id2 = static_cast<uint32_t>(pairKey & 0xFFFFFFFF);
-        const size_t route = routeOf(id1, id2, par.threads, rangeSize);
+        const size_t route = routeOf(id1, id2, partitionCnt, rangeSize);
         byUnit[route][shardOf(id1, byUnit[route].size())].push_back(makeRelation(id1, id2, weight));
     }
 
@@ -1023,12 +1080,12 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
         foldedOutputs.resize(unitCount());
     }
 
-    const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
+    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
     // One extra stream per unit for the previous fold's output, which is re-folded below.
     const size_t bufElems = getMergeBufferElems(to - from + 1, par.ramUsage, 1);
     size_t foldedFiles = 0;
     for (size_t route = 0; route < routeCnt; ++route) {
-        const size_t shardCnt = shardsForRoute(route, par.threads);
+        const size_t shardCnt = shardsForRoute(route, partitionCnt);
         for (size_t shard = 0; shard < shardCnt; ++shard) {
             // Earlier folds' outputs go back in. Folding only the new flushes would let those
             // outputs pile up untouched, and the live footprint would climb past the budget one
@@ -1231,10 +1288,10 @@ void GroupGenerator::mergeGraph() {
     // (relations_* route, shard), and both are functions of the ids alone, so no pair spans
     // two units. Sharding exists because the routing rule funnels ~88% of all edges into the
     // cross bucket, which would otherwise cap the whole parallel merge at ~1.13x.
-    const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
+    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
     std::vector<std::pair<size_t, size_t>> units; // (route, shard)
     for (size_t r = 0; r < routeCnt; ++r) {
-        const size_t shardCnt = shardsForRoute(r, par.threads);
+        const size_t shardCnt = shardsForRoute(r, partitionCnt);
         for (size_t s = 0; s < shardCnt; ++s) {
             units.emplace_back(r, s);
         }
@@ -1250,14 +1307,14 @@ void GroupGenerator::mergeGraph() {
     // Concatenation is legal because the relations_* consumers scan the file end to end and
     // never depend on ordering.
     auto unitOutPath = [&](size_t route, size_t shard) {
-        return (shardsForRoute(route, par.threads) == 1)
+        return (shardsForRoute(route, partitionCnt) == 1)
              ? (outDir + "/relations_" + to_string(route) + ".bin")
              : (outDir + "/relations_" + to_string(route) + "_s" + to_string(shard) + ".tmp");
     };
 
     const size_t peakFds = concurrentMergers * mergeFdsPerUnit(std::min(this->unitStreamCount(), maxFanIn));
     cout << "Merge: " << unitCnt << " units (" << routeCnt << " routes, cross bucket sharded x"
-         << shardsForRoute(static_cast<size_t>(par.threads), par.threads) << ") x "
+         << shardsForRoute(static_cast<size_t>(partitionCnt), partitionCnt) << ") x "
          << this->numOfGraph << " subgraphs, " << concurrentMergers
          << " concurrent (fan-in " << maxFanIn << ", peak fds " << peakFds
          << " of soft limit " << getOpenFileLimit() << ")" << endl;
@@ -1309,8 +1366,8 @@ void GroupGenerator::mergeGraph() {
 
     // Fold the cross bucket's shard temps into its relations_*.bin.
     {
-        const size_t crossRoute = static_cast<size_t>(par.threads);
-        const size_t crossShards = shardsForRoute(crossRoute, par.threads);
+        const size_t crossRoute = static_cast<size_t>(partitionCnt);
+        const size_t crossShards = shardsForRoute(crossRoute, partitionCnt);
         if (crossShards > 1) {
             const string finalPath = outDir + "/relations_" + to_string(crossRoute) + ".bin";
             ofstream dst(finalPath, std::ios::binary);
@@ -1385,10 +1442,10 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
     // each one's merge to relations.bin. Records are sorted within a route but the file as a
     // whole is segmented by route -- this dump exists for weight-histogram analysis, which
     // does not depend on global ordering. The merge itself stays a linear scan.
-    const size_t routeCnt = static_cast<size_t>(par.threads) * 2 + 1;
+    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
     std::vector<std::pair<size_t, size_t>> units; // (route, shard)
     for (size_t r = 0; r < routeCnt; ++r) {
-        const size_t shardCnt = shardsForRoute(r, par.threads);
+        const size_t shardCnt = shardsForRoute(r, partitionCnt);
         for (size_t s = 0; s < shardCnt; ++s) {
             units.emplace_back(r, s);
         }
@@ -1496,12 +1553,26 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     };
 
 
+    // Routes, not threads. There are 2*partitionCnt+1 of them and the count no longer follows
+    // --threads, so a thread can no longer be identified with a route by index: the loops below
+    // hand routes out with `omp for` instead. Union-find is order-independent and the relabelling
+    // below keys on the minimum read id, so which worker took which route cannot reach the output.
+    //
+    // The two loops are kept separate, and the barrier between them is load-bearing. The second
+    // one starts from a copy of the global `ds`, so it needs every route of the first group to
+    // have been merged in already. Routes 0..partitionCnt-1 hold the same-residue edges and
+    // partitionCnt..2*partitionCnt-1 the same-range ones; route 2*partitionCnt is read last,
+    // single-threaded, as before.
+    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
+
     #pragma omp parallel num_threads(par.threads)
     {
-        int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
 
-        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin", subDs);
+        #pragma omp for schedule(dynamic)
+        for (size_t route = 0; route < static_cast<size_t>(partitionCnt); ++route) {
+            processFile(outDir + "/relations_" + std::to_string(route) + ".bin", subDs);
+        }
 
         subDs.flatten();
 
@@ -1513,12 +1584,15 @@ void GroupGenerator::makeGroups(int groupKmerThr,
 
     #pragma omp parallel num_threads(par.threads)
     {
-        int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
         #pragma omp critical
         { subDs = ds;}
 
-        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin", subDs);
+        #pragma omp for schedule(dynamic)
+        for (size_t route = static_cast<size_t>(partitionCnt);
+             route < routeCnt - 1; ++route) {
+            processFile(outDir + "/relations_" + std::to_string(route) + ".bin", subDs);
+        }
 
         subDs.flatten();
 
@@ -1527,7 +1601,8 @@ void GroupGenerator::makeGroups(int groupKmerThr,
     }
 
     {
-        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin", 1024 * 1024);
+        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(routeCnt - 1) + ".bin",
+                                1024 * 1024);
         for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
             if (static_cast<int>(r.weight) > groupKmerThr) {
                 ds.unionSets(r.id1, r.id2);
@@ -1639,7 +1714,6 @@ void GroupGenerator::mergeBySupport(int coreThr,
     // On overflow, existing keys keep accumulating and new ones are dropped -- support can then only
     // be under-counted, never over-counted, so a merge is never invented. The count is reported.
     const size_t SUPPORT_PAIR_CAP = 200000000;
-    const size_t perThreadCap = std::max<size_t>(1, SUPPORT_PAIR_CAP / std::max(1, par.threads));
 
     std::unordered_map<uint64_t, uint32_t> support;
     size_t weakEdgeCnt = 0, droppedPairs = 0;
@@ -1648,10 +1722,37 @@ void GroupGenerator::mergeBySupport(int coreThr,
         return (a < b) ? ((uint64_t)a << 32 | b) : ((uint64_t)b << 32 | a);
     };
 
-    auto countFile = [&](const std::string& fname,
-                         std::unordered_map<uint64_t, uint32_t>& local,
-                         size_t cap, size_t& weakCnt, size_t& dropped) {
-        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+    // One route, one reader, one map, one cap -- and the cap is sized from what the route holds
+    // rather than from the thread count. relations_* records are a fixed 12 bytes, so the file
+    // size divided by sizeof(Relation) is the exact record count and allocateRouteCaps can split
+    // the budget without reading anything first.
+    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
+    const auto routePath = [&](size_t route) {
+        return outDir + "/relations_" + std::to_string(route) + ".bin";
+    };
+    std::vector<size_t> routeRecords(routeCnt, 0);
+    for (size_t r = 0; r < routeCnt; ++r) {
+        routeRecords[r] = static_cast<size_t>(FileUtil::getFileSize(routePath(r)))
+                          / sizeof(Relation);
+    }
+    const std::vector<size_t> routeCaps = allocateRouteCaps(routeRecords, SUPPORT_PAIR_CAP);
+
+    // Per-route instrumentation. The totals alone cannot show where the cap bites, and the
+    // routing rule sends ~88% of every edge into the cross bucket.
+    std::vector<size_t> routeWeak(routeCnt, 0);
+    std::vector<size_t> routeDropped(routeCnt, 0);
+    // Map size the moment this route's cap was first reached, or 0 if it never was.
+    std::vector<size_t> routeSizeAtCap(routeCnt, 0);
+
+    // One route per call, and the cap comes from routeCaps[route]. Threads touch disjoint
+    // elements of the three instrumentation vectors -- a route is read by exactly one reader --
+    // so those writes need no synchronisation.
+    auto countRoute = [&](size_t route,
+                          std::unordered_map<uint64_t, uint32_t>& local,
+                          size_t& weakCnt, size_t& dropped) {
+        const size_t cap = routeCaps[route];
+        size_t localRouteWeak = 0, localRouteDropped = 0;
+        ReadBuffer<Relation> rb(routePath(route), 1024 * 1024);
         for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
             const uint32_t id1 = r.id1, id2 = r.id2;
             if (id1 == 0 || id2 == 0) continue;
@@ -1662,6 +1763,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
             const uint32_t u = unit[id1], v = unit[id2];
             if (u == v) continue;
             weakCnt++;
+            localRouteWeak++;
             const uint64_t key = packPair(u, v);
             auto it = local.find(key);
             if (it != local.end()) {
@@ -1670,20 +1772,28 @@ void GroupGenerator::mergeBySupport(int coreThr,
                 local.emplace(key, 1u);
             } else {
                 dropped++;
+                localRouteDropped++;
+                // First drop is the first time this route's map was full.
+                if (routeSizeAtCap[route] == 0) {
+                    routeSizeAtCap[route] = local.size();
+                }
             }
         }
+        routeWeak[route] = localRouteWeak;
+        routeDropped[route] = localRouteDropped;
     };
 
-    #pragma omp parallel num_threads(par.threads)
-    {
-        const int threadIdx = omp_get_thread_num();
+    // Every route, including what used to be the separately-handled cross bucket, goes through
+    // the same loop with its own map and its own share of the budget. A route's map is merged
+    // into `support` and released before the next route on that worker starts, so peak memory is
+    // bounded by the shares of the routes running concurrently, and those shares sum to at most
+    // SUPPORT_PAIR_CAP by construction.
+    #pragma omp parallel for schedule(dynamic) num_threads(par.threads)
+    for (size_t route = 0; route < routeCnt; ++route) {
         std::unordered_map<uint64_t, uint32_t> local;
         size_t localWeak = 0, localDropped = 0;
 
-        countFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin",
-                  local, perThreadCap, localWeak, localDropped);
-        countFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin",
-                  local, perThreadCap, localWeak, localDropped);
+        countRoute(route, local, localWeak, localDropped);
 
         #pragma omp critical
         {
@@ -1692,8 +1802,46 @@ void GroupGenerator::mergeBySupport(int coreThr,
             droppedPairs += localDropped;
         }
     }
-    countFile(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin",
-              support, SUPPORT_PAIR_CAP, weakEdgeCnt, droppedPairs);
+
+    // Where the weak edges are, what each route was allowed to hold, and whether that was
+    // enough. The totals below say how much was dropped but not that one route holds most of
+    // it, which is the fact that used to make the cap thread-dependent.
+    {
+        std::vector<size_t> order(routeCnt);
+        for (size_t r = 0; r < routeCnt; ++r) { order[r] = r; }
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            if (routeWeak[a] != routeWeak[b]) { return routeWeak[a] > routeWeak[b]; }
+            return a < b;
+        });
+        const size_t shown = std::min<size_t>(3, routeCnt);
+        cout << "Phase 2: weak edges by route, top " << shown << " of " << routeCnt;
+        for (size_t i = 0; i < shown; ++i) {
+            const size_t r = order[i];
+            cout << " | route " << r << ": " << routeWeak[r];
+            if (weakEdgeCnt > 0) {
+                cout << " (" << fixed << setprecision(1)
+                     << (100.0 * static_cast<double>(routeWeak[r])
+                             / static_cast<double>(weakEdgeCnt))
+                     << "%)";
+            }
+            cout << " cap " << routeCaps[r];
+            if (routeDropped[r] > 0) {
+                cout << " dropped " << routeDropped[r]
+                     << ", map full at " << routeSizeAtCap[r];
+            }
+        }
+        cout << endl;
+        // The judgement line. Caps are now a function of what each route holds, not of the
+        // thread count, so this count must not move when --threads does.
+        size_t cappedRoutes = 0, allocated = 0;
+        for (size_t r = 0; r < routeCnt; ++r) {
+            if (routeDropped[r] > 0) { cappedRoutes++; }
+            allocated += routeCaps[r];
+        }
+        cout << "Phase 2: " << cappedRoutes << " of " << routeCnt
+             << " routes hit their cap; " << allocated << " of " << SUPPORT_PAIR_CAP
+             << " pairs budgeted across routes (sized from record counts, not --threads)" << endl;
+    }
 
     // Support required of a pair. Without the ratio this is the bare floor, which is the rule the
     // benchmark operating point was measured with.
@@ -1746,15 +1894,19 @@ void GroupGenerator::mergeBySupport(int coreThr,
         // Read-set memory guard, same contract as SUPPORT_PAIR_CAP: on overflow new reads are
         // dropped, so a count can only fall short and a merge is never invented.
         const size_t PASS2_READ_CAP = 200000000;
-        const size_t perThreadReadCap = std::max<size_t>(1, PASS2_READ_CAP / std::max(1, par.threads));
+        // Same treatment as the support cap: shares sized from what each route holds, so the
+        // thread count cannot decide which reads get dropped.
+        const std::vector<size_t> routeReadCaps = allocateRouteCaps(routeRecords, PASS2_READ_CAP);
 
-        // A pair is satisfied as soon as `required` distinct reads are seen, so a thread that stops
-        // inserting at that point cannot make any pair's union fall short: no thread stops earlier.
-        auto distinctFile = [&](const std::string& fname,
-                                std::unordered_map<uint64_t, std::unordered_set<uint32_t>>& local,
-                                std::unordered_set<uint64_t>& localSatisfied,
-                                size_t cap, size_t& held, size_t& dropped) {
-            ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        // A pair is satisfied as soon as `required` distinct reads are seen, so a reader that
+        // stops inserting at that point cannot make any pair's union fall short: no reader stops
+        // earlier.
+        auto distinctRoute = [&](size_t route,
+                                 std::unordered_map<uint64_t, std::unordered_set<uint32_t>>& local,
+                                 std::unordered_set<uint64_t>& localSatisfied,
+                                 size_t& held, size_t& dropped) {
+            const size_t cap = routeReadCaps[route];
+            ReadBuffer<Relation> rb(routePath(route), 1024 * 1024);
             for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
                 const uint32_t id1 = r.id1, id2 = r.id2;
                 if (id1 == 0 || id2 == 0) continue;
@@ -1783,17 +1935,16 @@ void GroupGenerator::mergeBySupport(int coreThr,
 
         size_t heldReads = 0;
         std::unordered_map<uint64_t, std::unordered_set<uint32_t>> partial;
-        #pragma omp parallel num_threads(par.threads)
-        {
-            const int threadIdx = omp_get_thread_num();
+        // Every route in one loop, the cross bucket included. It used to be read separately and
+        // last, against the whole PASS2_READ_CAP, while the others shared it by thread; both of
+        // those made the outcome depend on --threads.
+        #pragma omp parallel for schedule(dynamic) num_threads(par.threads)
+        for (size_t route = 0; route < routeCnt; ++route) {
             std::unordered_map<uint64_t, std::unordered_set<uint32_t>> local;
             std::unordered_set<uint64_t> localSatisfied;
             size_t localHeld = 0, localDropped = 0;
 
-            distinctFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin",
-                         local, localSatisfied, perThreadReadCap, localHeld, localDropped);
-            distinctFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin",
-                         local, localSatisfied, perThreadReadCap, localHeld, localDropped);
+            distinctRoute(route, local, localSatisfied, localHeld, localDropped);
 
             #pragma omp critical
             {
@@ -1805,7 +1956,7 @@ void GroupGenerator::mergeBySupport(int coreThr,
                 droppedReads += localDropped;
             }
         }
-        // Unions can have crossed the requirement even when no single thread's share did.
+        // Unions can have crossed the requirement even when no single route's share did.
         for (auto it = partial.begin(); it != partial.end(); ) {
             if (it->second.size() >= candidates[it->first]) {
                 satisfied.insert(it->first);
@@ -1814,8 +1965,6 @@ void GroupGenerator::mergeBySupport(int coreThr,
                 ++it;
             }
         }
-        distinctFile(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin",
-                     partial, satisfied, PASS2_READ_CAP, heldReads, droppedReads);
 
         cout << "Phase 2: " << candidates.size() << " candidate pairs, " << satisfied.size()
              << " reached the distinct-read requirement (" << heldReads
@@ -2013,11 +2162,18 @@ void GroupGenerator::makeGroupsPhase3(
         }
     };
 
+    // Routes, handed out by `omp for`, for the same reason as in makeGroups: the route count is
+    // 2*partitionCnt+1 and no longer equals the thread count, so a thread index is not a route
+    // index. The barrier between the two loops stays -- the second starts from a copy of `ds`.
+    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
+
     #pragma omp parallel num_threads(par.threads)
     {
-        int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
-        processFile(outDir + "/relations_" + std::to_string(threadIdx) + ".bin", subDs);
+        #pragma omp for schedule(dynamic)
+        for (size_t route = 0; route < static_cast<size_t>(partitionCnt); ++route) {
+            processFile(outDir + "/relations_" + std::to_string(route) + ".bin", subDs);
+        }
         subDs.flatten();
         #pragma omp critical
         { ds += subDs; }
@@ -2025,18 +2181,22 @@ void GroupGenerator::makeGroupsPhase3(
 
     #pragma omp parallel num_threads(par.threads)
     {
-        int threadIdx = omp_get_thread_num();
         DisjointSet subDs(processedReadCnt);
         #pragma omp critical
         { subDs = ds; }
-        processFile(outDir + "/relations_" + std::to_string(par.threads + threadIdx) + ".bin", subDs);
+        #pragma omp for schedule(dynamic)
+        for (size_t route = static_cast<size_t>(partitionCnt);
+             route < routeCnt - 1; ++route) {
+            processFile(outDir + "/relations_" + std::to_string(route) + ".bin", subDs);
+        }
         subDs.flatten();
         #pragma omp critical
         { ds += subDs; }
     }
 
     {
-        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(par.threads * 2) + ".bin", 1024 * 1024);
+        ReadBuffer<Relation> rb(outDir + "/relations_" + std::to_string(routeCnt - 1) + ".bin",
+                                1024 * 1024);
         for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
             if (r.id1 == 0 || r.id2 == 0) continue;
             if (r.id1 > processedReadCnt || r.id2 > processedReadCnt) continue;

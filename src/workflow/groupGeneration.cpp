@@ -27,7 +27,16 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // The absolute 5 it replaces meant different things per dataset: 5/15 = 0.333 of the core on
     // that benchmark but 5/34 = 0.147 on CAMI2 marine, so marine's band was three times as wide
     // in absolute terms and Phase 2 there absorbed far more chance links.
-    par.minEdge = 5;
+    // 0.3333 is what every result up to 2026-08-24 was measured with. It was briefly replaced by
+    // an absolute --min-edge on the argument that the ratio reproduces an absolute 5 only where
+    // the core is 15; measurement reversed that, because an absolute 10 is 0.30 of the core on
+    // strain-madness (core 33) but 0.38 on species-exclusion (core 26), and on strain-madness the
+    // difference between a bound of 11 and 10 is species purity 0.932 against 0.763.
+    par.weakBandRatio = 0.3333f;
+    // Intermediate partitions. 0 follows --threads, which is what every run before this parameter
+    // existed did; 16 is the value the published numbers were produced at. Kept at 0 until the
+    // route-loop and cap work below it is verified, so this build reproduces those runs exactly.
+    par.partitions = 0;
     // Phase 2 support as a fraction of the smaller unit's read count. 0 keeps the pre-ratio
     // behaviour (count weak edges, floor 2), which is the measured operating point; the ratio is
     // opt-in until a value is measured on marine. Sweeping the old absolute support over 2/3 was
@@ -82,10 +91,16 @@ int groupGeneration(int argc, const char **argv, const Command& command)
         cerr << "       there is no absolute threshold to fall back to." << endl;
         return 1;
     }
-    if (par.minEdge < 1) {
-        cerr << "Error: --min-edge must be >= 1 (given " << par.minEdge << ")." << endl;
-        cerr << "       It is the weak band's lower bound in shared k-mers; at 0 the band would" << endl;
-        cerr << "       swallow every edge, including pairs sharing nothing." << endl;
+    if (par.weakBandRatio <= 0.0f || par.weakBandRatio >= 1.0f) {
+        cerr << "Error: --weak-band-ratio must be in (0, 1) (given " << par.weakBandRatio << ")." << endl;
+        cerr << "       It is the weak band's lower bound as a fraction of the core threshold." << endl;
+        cerr << "       At 0 the band would swallow every edge, including pairs sharing nothing;" << endl;
+        cerr << "       at 1 it would be empty and the later passes would have nothing to use." << endl;
+        return 1;
+    }
+    if (par.partitions < 0) {
+        cerr << "Error: --partitions must be >= 0 (given " << par.partitions << ")." << endl;
+        cerr << "       0 means follow --threads." << endl;
         return 1;
     }
     if (par.maxKmerQuantile < 0.0f || par.maxKmerQuantile > 1.0f) {

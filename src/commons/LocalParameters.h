@@ -94,7 +94,8 @@ public:
     PARAMETER(PARAM_OUTDIR)
     
     // Group generation
-    PARAMETER(MIN_EDGE)
+    PARAMETER(WEAK_BAND_RATIO)
+    PARAMETER(PARTITIONS)
     PARAMETER(MAX_KMER_READS)
     PARAMETER(MAX_KMER_QUANTILE)
     PARAMETER(MIN_OVERLAP_RATIO)
@@ -193,11 +194,12 @@ public:
     int extractMode;
     std::string outputDir;
     
-    // Group generation. --min-overlap-ratio is a ratio so that one value means the same overlap
-    // across datasets with different read lengths and syncmer density. The other two are counts,
-    // deliberately: minEdge in shared k-mers (the ratio form measured worse -- see its help text)
-    // and commonKmerSpan in k-mer positions on a read.
-    int minEdge;              // weak-band lower bound, in shared k-mers
+    // Group generation. Both thresholds are ratios so that one value means the same overlap
+    // across datasets with different read lengths and syncmer density. commonKmerSpan is the
+    // exception and the exception is deliberate: it counts k-mer positions on a read, which is
+    // already the unit the read geometry gives it.
+    float weakBandRatio;      // weak-band lower bound as a fraction of the core threshold
+    int partitions;           // intermediate partitions; 0 = follow --threads
     int maxKmerReads;         // explicit reads-per-k-mer cap; 0 defers to maxKmerQuantile
     float maxKmerQuantile;    // share of k-mers (m >= 2) the cap keeps; picks maxKmerReads
     float minOverlapRatio;    // core threshold as a fraction of k-mers per read
