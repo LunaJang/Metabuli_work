@@ -135,13 +135,10 @@ int groupGeneration(int argc, const char **argv, const Command& command)
                 cerr << "       Rebuild the DB with these settings, or pass the DB's settings." << endl;
                 return 1;
             }
-        } else {
-            cerr << "[WARN] " << paramFile << " is missing, so the DB's k-mer settings cannot be"
-                 << " checked against --syncmer " << par.syncmer << " --smer-len " << par.smerLen
-                 << "." << endl;
-            cerr << "[WARN] The DB predates the check. A mismatch would make the common k-mer"
-                 << " filter remove nothing, silently." << endl;
         }
+        // No kmer_params: the DB predates the record and there is nothing to compare against.
+        // Silent on purpose. It warned on every run against every DB built before the check, so
+        // the line said only "this DB is old" -- never that anything was wrong with this run.
     }
 
     if (par.seqMode == 2) {
