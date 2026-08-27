@@ -15,6 +15,7 @@
 #include <sys/sysinfo.h>
 #include <sys/resource.h>
 #include <sys/statvfs.h>
+#include <dirent.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
@@ -565,6 +566,46 @@ inline size_t shardOf(uint32_t id1, size_t shardCnt) {
     return static_cast<size_t>(id1 % static_cast<uint32_t>(shardCnt));
 }
 
+// Flat, gapless index over the (route, shard) units, keyed on --partitions. Distinct from the
+// class's unitIndexOf/unitCount, which derive the same layout from --threads: the two agreed
+// until --partitions was split off from --threads, and only this pair is correct once they
+// differ. Gapless because every unit here owns a mutex and a map, and the strided form would
+// allocate partitionCnt of each per single-shard route.
+//
+// Layout: routes below the cross bucket hold one shard each and index directly; the cross
+// bucket's shards follow; routes above it are offset past them.
+inline size_t emitUnitCount(int partitionCnt) {
+    const size_t cross = static_cast<size_t>(partitionCnt < 1 ? 1 : partitionCnt);
+    const size_t routeCnt = cross * 2 + 1;
+    return (routeCnt - 1) + shardsForRoute(cross, partitionCnt);
+}
+
+inline size_t emitUnitIndex(size_t route, size_t shard, int partitionCnt) {
+    const size_t cross = static_cast<size_t>(partitionCnt < 1 ? 1 : partitionCnt);
+    if (route < cross) {
+        return route;
+    }
+    if (route == cross) {
+        return cross + shard;
+    }
+    return cross + shardsForRoute(cross, partitionCnt) + (route - cross - 1);
+}
+
+// One emit buffer per unit, shared by every thread. Holding the map per unit rather than per
+// thread is what takes the flush unit off --threads: a flush empties all of these at once, so
+// what lands in a file is the whole budget divided by the unit count, whatever the thread count.
+// Non-copyable and non-movable because of the mutex, hence held by unique_ptr in a vector.
+struct EmitUnitBuffer {
+    std::mutex lock;
+    std::unordered_map<uint64_t, uint16_t> pairs;
+};
+
+// How many pair occurrences a thread stages for one unit before taking that unit's lock. The
+// insertion site is the C(m,2) loop, the hottest in the program -- locking per occurrence would
+// cost about as much as the hash insert it guards. Batching amortises it away at the price of
+// `emitUnitCount * STAGE * 8` bytes per thread (1.5 MB at 48 units).
+static const size_t EMIT_STAGE_BATCH = 4096;
+
 // Soft cap on how many files this process may hold open.
 inline size_t getOpenFileLimit() {
     struct rlimit lim;
@@ -580,6 +621,27 @@ inline size_t getOpenFileLimit() {
 // by merging in rounds rather than by opening more files.
 // Descriptors one merge unit holds at its peak: `fanIn` readers plus the single file it is
 // writing (its output, or a fold intermediate).
+// Descriptors this process currently holds, or 0 where it cannot be counted. Predictions of
+// fd use are only as good as the model behind them; this is the measurement to check them
+// against, and the number that decides whether a run survives on a host with a tighter limit.
+inline size_t openFdCount() {
+#if defined(__linux__)
+    DIR * const dir = opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        return 0;
+    }
+    size_t count = 0;
+    while (readdir(dir) != nullptr) {
+        ++count;
+    }
+    closedir(dir);
+    // ".", ".." and the descriptor opendir itself is holding.
+    return (count > 3) ? (count - 3) : 0;
+#else
+    return 0;   // no portable equivalent; the prediction stands alone there
+#endif
+}
+
 inline size_t mergeFdsPerUnit(size_t fanIn) {
     return fanIn + 1;
 }
@@ -591,8 +653,14 @@ inline size_t mergeFdsPerUnit(size_t fanIn) {
 // descriptor over an 8192 limit at 16 threads and killed the merge with a bare
 // "Error opening file". Only a fraction of the limit is spent so that descriptors held
 // elsewhere -- and the writer this arithmetic now counts -- cannot tip it over.
-inline size_t getMergeFanIn(int numThreads, size_t concurrentMergers) {
-    (void) numThreads;
+// `concurrentMergers` is how many merges will hold streams open AT THE SAME TIME -- not how
+// many threads the run has. The two were passed the same value at the fold site, which made the
+// fold's fan-in shrink as --threads grew even though the fold merges one unit at a time. On a
+// host with the common `ulimit -n 1024` that took the fan-in from 512 at one thread to 11 at
+// sixty-four, and a smaller fan-in means more fold rounds over the same data.
+// The old first parameter was already dead (`(void) numThreads`); it is gone so the mistake
+// cannot be repeated.
+inline size_t getMergeFanIn(size_t concurrentMergers) {
     const size_t FAN_IN_CAP = 512;
     const double utilisation = 0.75;
     const size_t mergers = std::max<size_t>(1, concurrentMergers);
@@ -710,6 +778,16 @@ protected:
     // thread, hence the atomic. Compared against emittedEdgeCnt * sizeof(Relation) it gives
     // the compression ratio the run achieved.
     std::atomic<uint64_t> subGraphBytesOnDisk{0};
+
+    // Compressed size of every subGraph_* file written, for the size distribution the [edges]
+    // summary reports. The total alone cannot distinguish "the same data in half as many files"
+    // from "half the data" -- and that distinction is the whole question about --threads, since
+    // raising it splits one flush budget across more maps and so writes more, smaller files.
+    // Appended once per flush, not once per file: saveSubGraphToFile collects a flush's unit
+    // sizes locally and takes the lock once. One entry per file at 8 B is a few MB at the
+    // largest file counts seen (472,320 files -> 3.8 MB).
+    std::mutex subGraphSizeMutex;
+    std::vector<uint64_t> subGraphFileBytes;
 
     // --- Incremental fold state -------------------------------------------------------------
     // The merge used to start only after every flush had been written, so peak disk was the
@@ -840,11 +918,15 @@ public:
                         std::vector<uint64_t> & mHistPairs);
 
 
-    // Writes one file per relations_* route (subGraph_{counter}_{route}) instead of one file
-    // per flush, so the merge can process each route independently and in parallel.
-    void saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
-                            const size_t counter_now,
-                            size_t processedReadCnt);
+    // Writes one file per unit for one flush index: subGraph_{counter}_{route}_{shard}.
+    // Takes the units already partitioned, because the emit buffers are now kept per unit --
+    // the routing that used to happen here now happens at insertion time. `unitKey[u]` is the
+    // (route, shard) of unit u, so the caller's flat index survives into the file name.
+    // Every unit gets a file even when empty: the merge lists its inputs by name without
+    // checking existence, and a missing file would be read as a short stream.
+    void saveSubGraphToFile(const std::vector<std::unordered_map<uint64_t, uint16_t>> & units,
+                            const std::vector<std::pair<size_t, size_t>> & unitKey,
+                            const size_t counter_now);
 
     // No processedReadCnt: routing now happens in saveSubGraphToFile, which is where the
     // read count is needed. This function only folds and merges what is already partitioned.
@@ -875,17 +957,13 @@ public:
                    size_t& mergedOut, size_t& ceilingOut);
 
     // --- Incremental fold ---------------------------------------------------------------
-    // Units are numbered route-major with a fixed stride so the index is a pure function of
-    // (route, shard); routes that carry one shard simply leave their extra slots unused.
-    size_t shardStride() const {
-        return shardsForRoute(static_cast<size_t>(par.threads), par.threads);
-    }
-    size_t unitCount() const {
-        return (static_cast<size_t>(par.threads) * 2 + 1) * shardStride();
-    }
-    size_t unitIndexOf(size_t route, size_t shard) const {
-        return route * shardStride() + shard;
-    }
+    // Unit numbering lives in emitUnitCount/emitUnitIndex, above. There used to be a second
+    // copy here that derived the same layout from --threads; the two agreed only while
+    // --partitions followed --threads, and once they could differ the fold indexed
+    // foldedOutputs with one and sized it with the other. With --partitions above --threads
+    // that wrote past the end of the vector, and unitInputFiles -- which is bounds-checked --
+    // silently read another unit's folded output instead. Removed rather than fixed in place,
+    // so there is one definition to be wrong about.
     std::string subGraphName(size_t flushIdx, size_t route, size_t shard) const {
         return outDir + "/subGraph_" + std::to_string(flushIdx) + "_" + std::to_string(route)
              + "_" + std::to_string(shard);

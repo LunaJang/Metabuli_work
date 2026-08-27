@@ -39,6 +39,21 @@ static std::string humanBytes(uint64_t bytes) {
     return std::string(buf);
 }
 
+// Min, median and max of `values`, by partial_sort so the whole vector is not ordered: the
+// caller's vectors run to hundreds of thousands of entries and only three order statistics are
+// wanted. Takes a copy because it reorders. Returns {0,0,0} on an empty input.
+struct OrderStats { uint64_t min; uint64_t median; uint64_t max; };
+static OrderStats orderStats(std::vector<uint64_t> values) {
+    if (values.empty()) {
+        return {0, 0, 0};
+    }
+    const size_t mid = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + mid, values.end());
+    const uint64_t median = values[mid];
+    const auto minmax = std::minmax_element(values.begin(), values.end());
+    return {*minmax.first, median, *minmax.second};
+}
+
 // Sum sizes of existing files in `paths`, log "<label>: N files, X freed", then remove them.
 // Non-existent paths are skipped (not counted).
 static void reportAndRemoveFiles(const std::vector<std::string>& paths, const std::string& label) {
@@ -549,6 +564,41 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // how much data there is and not on how many workers are chewing through it.
     const size_t RELATION_BUDGET = getRelationBudget(par.ramUsage);
     std::atomic<size_t> bufferedPairs(0);
+
+    // Emit buffers, one per output unit and shared by every thread. This is the whole point of
+    // the 2026-08-27 change: with a map per thread, a flush emptied one thread's share and the
+    // shared budget was reached again after another 1/N of it, so flushes -- and the files each
+    // one writes -- scaled with --threads. Held per unit, a flush empties all of them at once,
+    // so a file carries budget/units whatever the thread count is.
+    const size_t emitUnitCnt = emitUnitCount(partitionCnt);
+    const size_t emitRouteCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
+    const size_t emitRangeSize = getRouteRangeSize(processedReadCnt, partitionCnt);
+    std::vector<std::unique_ptr<EmitUnitBuffer>> emitUnits;
+    emitUnits.reserve(emitUnitCnt);
+    for (size_t u = 0; u < emitUnitCnt; ++u) {
+        emitUnits.push_back(std::unique_ptr<EmitUnitBuffer>(new EmitUnitBuffer()));
+        // The budget is shared across units, so a unit's fair share is its slice of it. The
+        // per-thread reserve this replaces divided by --threads instead, which is the same
+        // arithmetic applied to the wrong denominator.
+        emitUnits.back()->pairs.reserve(std::max<size_t>(1, RELATION_BUDGET / emitUnitCnt));
+    }
+    // (route, shard) of each flat unit index, so the file name survives the flattening.
+    std::vector<std::pair<size_t, size_t>> emitUnitKey(emitUnitCnt, {0, 0});
+    for (size_t route = 0; route < emitRouteCnt; ++route) {
+        const size_t shardCnt = shardsForRoute(route, partitionCnt);
+        for (size_t shard = 0; shard < shardCnt; ++shard) {
+            emitUnitKey[emitUnitIndex(route, shard, partitionCnt)] = {route, shard};
+        }
+    }
+    // Serialises flush rounds. try_lock, not lock: a thread that finds a round already running
+    // carries on filling buffers instead of waiting, and its data goes out in the next round.
+    std::mutex emitFlushMutex;
+    // Contention on the per-unit locks, in the only terms that matter here -- how often a
+    // thread had to wait at all. Reported so a configuration with few units (--partitions 1
+    // gives three) shows the cost instead of hiding it.
+    std::atomic<uint64_t> unitLockWaits(0);
+    std::atomic<uint64_t> unitLockTakes(0);
+
     cout << "Flush budget: " << RELATION_BUDGET << " pairs across all threads (memory budget "
          << humanBytes(getMemoryBudgetBytes(par.ramUsage)) << ", --max-ram "
          << par.ramUsage << " GiB)" << endl;
@@ -571,7 +621,9 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // per unit, so a prefix longer than the fan-in has to be folded regardless of disk. Note
     // that getMergeFanIn looks at the fd limit and the thread count only -- it knows nothing
     // about how much data is on disk, which is why the budget above is the primary trigger.
-    const size_t foldFanIn = getMergeFanIn(par.threads, static_cast<size_t>(par.threads));
+    // One merger: maybeFoldEmitted walks the units serially, so only one unit's streams are
+    // open at any moment. Passing the thread count here shrank the fan-in for no reason.
+    const size_t foldFanIn = getMergeFanIn(1);
     std::atomic<int> counter(0);
 
     // High-frequency k-mers are dropped by --max-kmer-freq-ratio. Record which ones so the
@@ -585,6 +637,46 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // largest m that survived the skip -- that m sets the per-k-mer worst case.
     size_t emittedEdgeCnt = 0; // Relation records written to subGraph_*
     size_t maxKeptM = 0;       // largest reads-per-k-mer that was NOT skipped
+    // Pairs carried by each flush. The flush budget is shared across threads but the flush
+    // itself empties one thread's map, so what a flush actually writes is roughly the budget
+    // divided by the thread count -- and that, not the budget, is what sets the file size the
+    // merge then has to work through. Reported as a distribution because the mean hides the
+    // final partial flushes.
+    std::vector<size_t> flushPairCounts;
+
+    // Move every unit's map out under its own lock, then write the whole set under one flush
+    // index. Writing happens outside the unit locks, so threads resume inserting immediately.
+    auto flushEmitUnits = [&]() {
+        if (!emitFlushMutex.try_lock()) {
+            return; // another thread is already flushing; nothing here is lost
+        }
+        const std::lock_guard<std::mutex> flushGuard(emitFlushMutex, std::adopt_lock);
+
+        std::vector<std::unordered_map<uint64_t, uint16_t>> taken(emitUnitCnt);
+        size_t movedPairs = 0;
+        for (size_t u = 0; u < emitUnitCnt; ++u) {
+            const std::lock_guard<std::mutex> unitGuard(emitUnits[u]->lock);
+            taken[u].swap(emitUnits[u]->pairs);
+            movedPairs += taken[u].size();
+        }
+        if (movedPairs == 0) {
+            return; // do not spend a flush index on a round that would write only empty files
+        }
+        bufferedPairs.fetch_sub(movedPairs, std::memory_order_relaxed);
+
+        const size_t counter_now =
+            static_cast<size_t>(counter.fetch_add(1, std::memory_order_relaxed));
+        saveSubGraphToFile(taken, emitUnitKey, counter_now);
+
+        // Both are read only after the parallel region joins, and every write here is under
+        // emitFlushMutex, so no further synchronisation is needed.
+        emittedEdgeCnt += movedPairs;
+        flushPairCounts.push_back(movedPairs);
+
+        checkDiskHeadroom();
+        // Fold what is already complete instead of letting the whole emit pile up.
+        maybeFoldEmitted(tmpDiskBudget, foldFanIn);
+    };
     // Sum of C(m,2) over kept k-mers = pair OCCURRENCES the clique produced. Records written
     // are fewer, because pair2weight collapses a pair seen across several k-mers into one
     // entry. emittedEdgeCnt / keptPairSum is that collapse factor, measured on this run.
@@ -646,16 +738,6 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     #pragma omp parallel num_threads(par.threads)
     {
         int threadIdx = omp_get_thread_num();
-        std::unordered_map<uint64_t, uint16_t> pair2weight;
-        // Reserve the thread's fair share, not the whole shared budget: reserving the total on
-        // every thread would allocate par.threads times the memory the budget allows.
-        pair2weight.reserve(std::max<size_t>(1, RELATION_BUDGET
-                                               / static_cast<size_t>(std::max(1, par.threads))));
-        // Pairs this thread has added to `bufferedPairs` and not yet flushed. Tracked separately
-        // because unordered_map::size() counts distinct keys while the shared total has to be
-        // decremented by exactly what this thread contributed.
-        size_t publishedPairs = 0;
-
         const string skippedPartName = outDir + "/skipped_kmers_" + to_string(threadIdx);
         ofstream skippedPart(skippedPartName);
         if (!skippedPart.is_open()) {
@@ -665,8 +747,41 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         size_t localMaxM = 0;
         size_t localSumM = 0;
         double localPairEst = 0.0;
-        size_t localEmittedEdges = 0;
         size_t localMaxKeptM = 0;
+        // Pair occurrences staged for each unit, flushed into the shared unit map in batches.
+        // The batch is what makes the per-unit lock affordable: the alternative is taking it
+        // inside the C(m,2) loop below, once per occurrence.
+        std::vector<std::vector<uint64_t>> stage(emitUnitCnt);
+        for (size_t u = 0; u < emitUnitCnt; ++u) {
+            stage[u].reserve(EMIT_STAGE_BATCH);
+        }
+
+        // Merge one unit's staged occurrences into the shared map. Only newly created keys
+        // count towards the budget: a repeat of a pair already buffered adds no footprint.
+        auto drainStage = [&](size_t u) {
+            if (stage[u].empty()) {
+                return;
+            }
+            size_t newKeys = 0;
+            {
+                std::unique_lock<std::mutex> guard(emitUnits[u]->lock, std::try_to_lock);
+                if (!guard.owns_lock()) {
+                    unitLockWaits.fetch_add(1, std::memory_order_relaxed);
+                    guard.lock();
+                }
+                unitLockTakes.fetch_add(1, std::memory_order_relaxed);
+                std::unordered_map<uint64_t, uint16_t> & shared = emitUnits[u]->pairs;
+                for (const uint64_t pairKey : stage[u]) {
+                    const size_t before = shared.size();
+                    addSat16(shared[pairKey], 1);
+                    if (shared.size() != before) { newKeys++; }
+                }
+            }
+            stage[u].clear();
+            if (newKeys != 0) {
+                bufferedPairs.fetch_add(newKeys, std::memory_order_relaxed);
+            }
+        };
         std::vector<uint64_t> localHistKmers(M_HIST_BUCKETS, 0);
         std::vector<uint64_t> localHistPairs(M_HIST_BUCKETS, 0);
         uint64_t localKeptPairs = 0;
@@ -704,53 +819,49 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 localKeptPairs += static_cast<uint64_t>(m) * static_cast<uint64_t>(m - 1) / 2;
             }
             for (size_t i = 0; i + 1 < m; ++i) {
-                const uint64_t idHi = static_cast<uint64_t>(currentQueryIds[i]) << 32;
+                const uint32_t id1 = currentQueryIds[i];
+                const uint64_t idHi = static_cast<uint64_t>(id1) << 32;
                 for (size_t j = i + 1; j < m; ++j) {
-                    const uint64_t pairKey = idHi | static_cast<uint64_t>(currentQueryIds[j]);
-                    addSat16(pair2weight[pairKey], 1);
+                    const uint32_t id2 = currentQueryIds[j];
+                    // Route at insertion time, not at write time. The unit a pair belongs to
+                    // is a function of (id1, id2) alone, so deciding it here changes nothing
+                    // about where the pair ends up -- it only moves the decision earlier, which
+                    // is what lets the buffer be held per unit.
+                    const size_t route = routeOf(id1, id2, partitionCnt, emitRangeSize);
+                    const size_t u = emitUnitIndex(
+                        route, shardOf(id1, shardsForRoute(route, partitionCnt)), partitionCnt);
+                    stage[u].push_back(idHi | static_cast<uint64_t>(id2));
+                    if (stage[u].size() >= EMIT_STAGE_BATCH) {
+                        drainStage(u);
+                    }
                 }
             }
-            // Publish this thread's growth before testing the shared total, so the decision is
-            // made against what is actually in memory. Only the growth is published, hence the
-            // delta: size() is distinct keys, and a k-mer whose pairs all already exist adds
-            // nothing to the footprint.
-            if (pair2weight.size() > publishedPairs) {
-                bufferedPairs.fetch_add(pair2weight.size() - publishedPairs,
-                                        std::memory_order_relaxed);
-                publishedPairs = pair2weight.size();
-            }
-            if (bufferedPairs.load(std::memory_order_relaxed) >= RELATION_BUDGET
-                && !pair2weight.empty()) {
-                size_t counter_now = counter.fetch_add(1, memory_order_relaxed);
-                localEmittedEdges += pair2weight.size();
-                saveSubGraphToFile(pair2weight, counter_now, processedReadCnt);
-                bufferedPairs.fetch_sub(publishedPairs, std::memory_order_relaxed);
-                publishedPairs = 0;
-                pair2weight.clear();
+            // The budget is tested against the shared total, which is what every thread's
+            // drains have contributed. Staged occurrences not yet drained are not counted:
+            // they are bounded by EMIT_STAGE_BATCH per unit per thread and are not in a map.
+            if (bufferedPairs.load(std::memory_order_relaxed) >= RELATION_BUDGET) {
+                // Everything this thread is holding goes in before the round starts, so a
+                // flush carries as much as it can rather than leaving a batch behind.
+                for (size_t u = 0; u < emitUnitCnt; ++u) {
+                    drainStage(u);
+                }
                 // Publish progress before the guards read it, so the projection matches the
-                // bytes that have just been written.
+                // bytes that are about to be written.
                 kmerValuesDone.fetch_add(localValuesDone, std::memory_order_relaxed);
                 localValuesDone = 0;
-                checkDiskHeadroom();
-                // Fold what is already complete instead of letting the whole emit pile up.
-                // No barrier: this thread folds only the finished prefix while the others keep
-                // writing indices above it, so the two never touch the same file.
-                maybeFoldEmitted(tmpDiskBudget, foldFanIn);
+                // No barrier: one thread writes the round while the others keep filling the
+                // now-empty buffers, and their data goes out in the next one.
+                flushEmitUnits();
             }
         });
 
-        if (!pair2weight.empty()) {
-            size_t counter_now = counter.fetch_add(1, std::memory_order_relaxed);
-            localEmittedEdges += pair2weight.size();
-            saveSubGraphToFile(pair2weight, counter_now, processedReadCnt);
-            // Leave the shared counter at zero. Nothing reads it after this point, but a thread
-            // that exits still holding a claim would make the number meaningless if the emit
-            // stage is ever run twice in one process.
-            bufferedPairs.fetch_sub(publishedPairs, std::memory_order_relaxed);
-            publishedPairs = 0;
-        } else {
-            cout << "Thread " << threadIdx << " has no relations to write." << endl;
+        // Nothing may stay staged past the end of this thread's scan.
+        for (size_t u = 0; u < emitUnitCnt; ++u) {
+            drainStage(u);
         }
+
+        // No per-thread final write: what this thread built is in the shared unit buffers, and
+        // the last round after the parallel region joins carries it out.
         skippedPart.close();
 
         #pragma omp critical
@@ -758,7 +869,6 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             skippedKmerCnt  += localSkippedCnt;
             skippedSumM     += localSumM;
             skippedPairEst  += localPairEst;
-            emittedEdgeCnt  += localEmittedEdges;
             if (localMaxM > skippedMaxM) { skippedMaxM = localMaxM; }
             if (localMaxKeptM > maxKeptM) { maxKeptM = localMaxKeptM; }
             keptPairSum += localKeptPairs;
@@ -768,6 +878,11 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             }
         }
     }
+    // Final round. Every thread drained its staging before exiting, so whatever is left in the
+    // unit buffers is the tail below the budget -- one more round writes it out. try_lock inside
+    // flushEmitUnits cannot fail here: the parallel region has joined.
+    flushEmitUnits();
+
     this->numOfGraph = counter.load(std::memory_order_relaxed);
 
     // Concatenate the per-thread skip logs. Thread t owns k-mer value range t (writeKmers
@@ -906,7 +1021,46 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << routeCnt << " routes, cross bucket sharded x"
              << shardsForRoute(static_cast<size_t>(partitionCnt), partitionCnt) << ") = "
              << (this->numOfGraph * unitCnt) << " subGraph files, at --threads "
-             << par.threads << endl;
+             << par.threads << " --partitions " << partitionCnt << endl;
+
+        // The two distributions the totals above cannot show. Whether raising --threads split
+        // the same data into more, smaller pieces -- or actually moved more data -- is the
+        // difference between these lines and the byte total, and it is the question the merge
+        // time depends on. Both should be flat across --threads for a given input; anything
+        // else is the flush unit tracking the thread count.
+        std::vector<uint64_t> flushWidths;
+        flushWidths.reserve(flushPairCounts.size());
+        for (const size_t n : flushPairCounts) { flushWidths.push_back(n); }
+        const OrderStats flushStats = orderStats(flushWidths);
+        cout << "[edges] pairs per flush: min " << flushStats.min
+             << ", median " << flushStats.median
+             << ", max " << flushStats.max
+             << " (budget " << RELATION_BUDGET << " shared across " << par.threads
+             << " threads)" << endl;
+
+        OrderStats fileStats{0, 0, 0};
+        size_t fileCnt = 0;
+        {
+            const std::lock_guard<std::mutex> guard(subGraphSizeMutex);
+            fileCnt = subGraphFileBytes.size();
+            fileStats = orderStats(subGraphFileBytes);
+        }
+        cout << "[edges] subGraph file size: median " << humanBytes(fileStats.median)
+             << ", max " << humanBytes(fileStats.max)
+             << " over " << fileCnt << " files, "
+             << this->foldRounds << " folds" << endl;
+
+        // Cost of holding the buffers per unit rather than per thread. Units are the lock
+        // domain, so few of them and many threads is the configuration to watch:
+        // --partitions 1 leaves three. Staging keeps the take count down to roughly
+        // occurrences / EMIT_STAGE_BATCH, and a wait share near zero means the batch is doing
+        // its job.
+        const uint64_t takes = unitLockTakes.load(std::memory_order_relaxed);
+        const uint64_t waits = unitLockWaits.load(std::memory_order_relaxed);
+        cout << "[edges] unit lock: " << takes << " takes, " << waits << " contended ("
+             << fixed << setprecision(2)
+             << (takes > 0 ? 100.0 * static_cast<double>(waits) / static_cast<double>(takes) : 0.0)
+             << "%), " << emitUnitCnt << " units for " << par.threads << " threads" << endl;
     }
     // What the run actually held at once, which is the number a shared filesystem cares about.
     // "0 folds" means the data fit under the budget and nothing was folded early -- the path
@@ -925,45 +1079,49 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
 }
 
-void GroupGenerator::saveSubGraphToFile(const unordered_map<uint64_t, uint16_t>& pair2weight,
-                                        const size_t counter_now,
-                                        size_t processedReadCnt) {
-    // Split by relations_* route at write time. Because the route is a function of
-    // (id1, id2) alone, a pair can never land under two routes -- which is what makes the
-    // per-route merges independent and lets them run in parallel.
-    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
-    const size_t rangeSize = getRouteRangeSize(processedReadCnt, partitionCnt);
-
-    // byUnit[route][shard]. Every route carries a shard index so the merge's filename rule is
-    // uniform; only the cross bucket actually has more than one.
-    std::vector<std::vector<std::vector<Relation>>> byUnit(routeCnt);
-    for (size_t route = 0; route < routeCnt; ++route) {
-        byUnit[route].resize(shardsForRoute(route, partitionCnt));
-    }
-    for (const auto& [pairKey, weight] : pair2weight) {
-        const uint32_t id1 = static_cast<uint32_t>(pairKey >> 32);
-        const uint32_t id2 = static_cast<uint32_t>(pairKey & 0xFFFFFFFF);
-        const size_t route = routeOf(id1, id2, partitionCnt, rangeSize);
-        byUnit[route][shardOf(id1, byUnit[route].size())].push_back(makeRelation(id1, id2, weight));
-    }
-
-    // Empty units still get an empty file: the merge's input list is then simply
-    // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
+void GroupGenerator::saveSubGraphToFile(
+        const std::vector<std::unordered_map<uint64_t, uint16_t>> & units,
+        const std::vector<std::pair<size_t, size_t>> & unitKey,
+        const size_t counter_now) {
+    // The units arrive already partitioned: routeOf/shardOf ran at insertion time, so a pair
+    // reached exactly one unit and cannot appear under two. That is what still makes the
+    // per-route merges independent.
     uint64_t compressedBytes = 0;
-    for (size_t route = 0; route < routeCnt; ++route) {
-        for (size_t shard = 0; shard < byUnit[route].size(); ++shard) {
-            const string subGraphFileName = subGraphName(counter_now, route, shard);
-            std::vector<Relation> & relations = byUnit[route][shard];
-            sort(relations.begin(), relations.end(), Relation::compare);
-            // A failed write used to be reported and skipped. It is fatal now: the merge would
-            // otherwise read a file that is missing or short and produce a silently wrong graph.
-            RelationWriter out(subGraphFileName);
-            for (size_t i = 0; i < relations.size(); ++i) {
-                out.write(relations[i]);
-            }
-            out.finish();
-            compressedBytes += out.compressedBytes();
+    // One entry per file, appended to the shared vector once at the end of the flush rather
+    // than per file, so the lock is taken once per flush instead of once per unit.
+    std::vector<uint64_t> flushFileBytes;
+    flushFileBytes.reserve(units.size());
+
+    for (size_t u = 0; u < units.size(); ++u) {
+        std::vector<Relation> relations;
+        relations.reserve(units[u].size());
+        for (const auto & entry : units[u]) {
+            const uint64_t pairKey = entry.first;
+            relations.push_back(makeRelation(static_cast<uint32_t>(pairKey >> 32),
+                                             static_cast<uint32_t>(pairKey & 0xFFFFFFFF),
+                                             entry.second));
         }
+        sort(relations.begin(), relations.end(), Relation::compare);
+
+        // Empty units still get an empty file: the merge's input list is then simply
+        // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
+        const string subGraphFileName = subGraphName(counter_now, unitKey[u].first,
+                                                     unitKey[u].second);
+        // A failed write used to be reported and skipped. It is fatal now: the merge would
+        // otherwise read a file that is missing or short and produce a silently wrong graph.
+        RelationWriter out(subGraphFileName);
+        for (size_t i = 0; i < relations.size(); ++i) {
+            out.write(relations[i]);
+        }
+        out.finish();
+        compressedBytes += out.compressedBytes();
+        flushFileBytes.push_back(out.compressedBytes());
+    }
+
+    {
+        const std::lock_guard<std::mutex> guard(subGraphSizeMutex);
+        subGraphFileBytes.insert(subGraphFileBytes.end(),
+                                 flushFileBytes.begin(), flushFileBytes.end());
     }
     subGraphBytesOnDisk.fetch_add(compressedBytes, std::memory_order_relaxed);
     noteSubGraphBytes(static_cast<int64_t>(compressedBytes));
@@ -1077,7 +1235,7 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
     const size_t round = foldRounds++;
     foldedUpTo = to;
     if (foldedOutputs.empty()) {
-        foldedOutputs.resize(unitCount());
+        foldedOutputs.resize(emitUnitCount(partitionCnt));
     }
 
     const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
@@ -1091,7 +1249,8 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
             // outputs pile up untouched, and the live footprint would climb past the budget one
             // fold at a time. Re-folding keeps exactly one file per unit, so the footprint
             // tracks the merged-so-far size -- the floor no amount of folding can go below.
-            std::vector<std::string> & folded = foldedOutputs[unitIndexOf(route, shard)];
+            std::vector<std::string> & folded =
+                foldedOutputs[emitUnitIndex(route, shard, partitionCnt)];
             std::vector<std::string> inputs = folded;
             inputs.reserve(inputs.size() + (to - from));
             for (size_t i = from; i < to; ++i) {
@@ -1114,9 +1273,16 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
         }
     }
 
+    // fan-in and peak fds in the same terms the final merge reports, so the two stages can be
+    // compared. One unit at a time here, hence one merger: peak is that unit's streams plus its
+    // output. Predicted, then what the process is actually holding, because a wrong prediction
+    // is exactly how a run dies on a host with a smaller descriptor limit than the one it was
+    // tuned on.
     cout << "[disk] fold " << round << ": flushes [" << from << ", " << to << ") -> "
          << foldedFiles << " files, live "
          << humanBytes(static_cast<uint64_t>(std::max<int64_t>(0, subGraphLiveBytes.load())))
+         << " (fan-in " << maxFanIn << ", peak fds " << mergeFdsPerUnit(maxFanIn)
+         << " predicted / " << openFdCount() << " open, soft limit " << getOpenFileLimit() << ")"
          << endl;
 }
 
@@ -1124,7 +1290,7 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
 // foldedUpTo/foldedOutputs are stable.
 std::vector<std::string> GroupGenerator::unitInputFiles(size_t route, size_t shard) const {
     std::vector<std::string> files;
-    const size_t unit = unitIndexOf(route, shard);
+    const size_t unit = emitUnitIndex(route, shard, partitionCnt);
     if (unit < foldedOutputs.size()) {
         files = foldedOutputs[unit];
     }
@@ -1298,7 +1464,7 @@ void GroupGenerator::mergeGraph() {
     }
     const size_t unitCnt = units.size();
     const size_t concurrentMergers = std::min(static_cast<size_t>(par.threads), unitCnt);
-    const size_t maxFanIn = getMergeFanIn(par.threads, concurrentMergers);
+    const size_t maxFanIn = getMergeFanIn(concurrentMergers);
     const size_t mergeBufElems = getMergeBufferElems(std::min(this->unitStreamCount(), maxFanIn),
                                                      par.ramUsage, concurrentMergers);
     const size_t streamsPerUnit = std::min(this->unitStreamCount(), maxFanIn);
@@ -1450,7 +1616,7 @@ void GroupGenerator::mergeGraph_one(size_t processedReadCnt) {
             units.emplace_back(r, s);
         }
     }
-    const size_t maxFanIn = getMergeFanIn(par.threads, 1);
+    const size_t maxFanIn = getMergeFanIn(1);
     const size_t mergeBufElems = getMergeBufferElems(std::min(this->unitStreamCount(), maxFanIn),
                                                      par.ramUsage, 1);
     cout << "Merge: " << units.size() << " units x " << this->numOfGraph
