@@ -2,7 +2,7 @@
 
 Copy-paste. One parameter changes per run; combinations are not swept.
 
-Build `93b8e45a`. Argument order for every script here:
+Build `d8c9f221`. Argument order for every script here:
 
 ```
 hash  min-overlap-ratio  min-edge  max-kmer-quantile  common-kmer-span  [weight-mode  min-vote-score]
@@ -23,21 +23,28 @@ All jobs pinned to `super001` with `-w`.
 
 ```bash
 cd /home/lunajang/src/Metabuli_work && git pull origin master
-mkdir -p build_93b8e45a && cd build_93b8e45a
+mkdir -p build_d8c9f221 && cd build_d8c9f221
 cmake -DCMAKE_BUILD_TYPE=Release .. && make -j64
 cd /home/lunajang/src/read-grouping-analysis && git pull origin luna
 ```
 
-## 1. Baseline grouping — 6 datasets
+## 1. Baseline grouping — 6 datasets [x]
 
 ```bash
-sbatch -w super001 benchmark/benchmark_exclusion_group.sh 93b8e45a 0.40 10 0.995 0
-sbatch -w super001 benchmark/benchmark_inclusion_group.sh 93b8e45a 0.40 10 0.995 0
-sbatch -w super001 cami2/cami2_strain_madness_group.sh    93b8e45a 0.40 10 0.995 0
-sbatch -w super001 cami2/cami2_marine_group.sh            93b8e45a 0.40 10 0.995 0
-sbatch -w super001 cami2/cami2_plant_associated_group.sh  93b8e45a 0.40 10 0.995 0
-sbatch -w super001 cami2/cami2_clinical_pathogen_group.sh 93b8e45a 0.40 10 0.995 0
+sbatch -w super001 benchmark/benchmark_exclusion_group.sh d8c9f221 0.40 10 0.995 0
+sbatch -w super001 benchmark/benchmark_inclusion_group.sh d8c9f221 0.40 10 0.995 0
+sbatch -w super001 cami2/cami2_strain_madness_group.sh    d8c9f221 0.40 10 0.995 0
+sbatch -w super001 cami2/cami2_marine_group.sh            d8c9f221 0.40 10 0.995 0
+sbatch -w super001 cami2/cami2_plant_associated_group.sh  d8c9f221 0.40 10 0.995 0
+sbatch -w super001 cami2/cami2_clinical_pathogen_group.sh d8c9f221 0.40 10 0.995 0
 ```
+
+Submitted batch job 550749
+Submitted batch job 550750
+Submitted batch job 550751
+Submitted batch job 550752
+Submitted batch job 550753
+Submitted batch job 550754
 
 ## 2. Sweep grouping — species-exclusion + strain-madness
 
@@ -49,13 +56,13 @@ G1=benchmark/benchmark_exclusion_group.sh
 G2=cami2/cami2_strain_madness_group.sh
 
 # --min-overlap-ratio
-for r in 0.3 0.5;     do sbatch -w super001 $G1 93b8e45a $r  10 0.995 0; sbatch -w super001 $G2 93b8e45a $r  10 0.995 0; done
+for r in 0.3 0.5;     do sbatch -w super001 $G1 d8c9f221 $r  10 0.995 0; sbatch -w super001 $G2 d8c9f221 $r  10 0.995 0; done
 # --min-edge
-for e in 5 15;        do sbatch -w super001 $G1 93b8e45a 0.40 $e 0.995 0; sbatch -w super001 $G2 93b8e45a 0.40 $e 0.995 0; done
+for e in 5 15;        do sbatch -w super001 $G1 d8c9f221 0.40 $e 0.995 0; sbatch -w super001 $G2 d8c9f221 0.40 $e 0.995 0; done
 # --max-kmer-quantile
-for q in 0.990 0.999; do sbatch -w super001 $G1 93b8e45a 0.40 10 $q    0; sbatch -w super001 $G2 93b8e45a 0.40 10 $q    0; done
+for q in 0.990 0.999; do sbatch -w super001 $G1 d8c9f221 0.40 10 $q    0; sbatch -w super001 $G2 d8c9f221 0.40 10 $q    0; done
 # --common-kmer-span
-for s in 1 2;         do sbatch -w super001 $G1 93b8e45a 0.40 10 0.995 $s; sbatch -w super001 $G2 93b8e45a 0.40 10 0.995 $s; done
+for s in 1 2;         do sbatch -w super001 $G1 d8c9f221 0.40 10 0.995 $s; sbatch -w super001 $G2 d8c9f221 0.40 10 0.995 $s; done
 ```
 
 ## 3. Label propagation — after step 1
@@ -69,12 +76,12 @@ arguments — the weight sweep is Metabuli only.
 Output goes to `metabuli_group_<tag>` with no vote suffix.
 
 ```bash
-sbatch -w super001 benchmark/benchmark_exclusion_metabuli_group.sh 93b8e45a 0.40 10 0.995 0 2 0.15
-sbatch -w super001 benchmark/benchmark_inclusion_metabuli_group.sh 93b8e45a 0.40 10 0.995 0 2 0.15
-sbatch -w super001 cami2/cami2_metabuli_strain_madness_group.sh    93b8e45a 0.40 10 0.995 0 2 0.15
-sbatch -w super001 cami2/cami2_metabuli_marine_group.sh            93b8e45a 0.40 10 0.995 0 2 0.15
-sbatch -w super001 cami2/cami2_metabuli_plant_associated_group.sh  93b8e45a 0.40 10 0.995 0 2 0.15
-sbatch -w super001 cami2/cami2_metabuli_clinical_pathogen_group.sh 93b8e45a 0.40 10 0.995 0 2 0.15
+sbatch -w super001 benchmark/benchmark_exclusion_metabuli_group.sh d8c9f221 0.40 10 0.995 0 2 0.15
+sbatch -w super001 benchmark/benchmark_inclusion_metabuli_group.sh d8c9f221 0.40 10 0.995 0 2 0.15
+sbatch -w super001 cami2/cami2_metabuli_strain_madness_group.sh    d8c9f221 0.40 10 0.995 0 2 0.15
+sbatch -w super001 cami2/cami2_metabuli_marine_group.sh            d8c9f221 0.40 10 0.995 0 2 0.15
+sbatch -w super001 cami2/cami2_metabuli_plant_associated_group.sh  d8c9f221 0.40 10 0.995 0 2 0.15
+sbatch -w super001 cami2/cami2_metabuli_clinical_pathogen_group.sh d8c9f221 0.40 10 0.995 0 2 0.15
 ```
 
 ### 3b. weight-mode 0 and 1
@@ -83,12 +90,12 @@ Output goes to `metabuli_group_<tag>_w0` / `_w1`, so 3a is not overwritten.
 
 ```bash
 for w in 0 1; do
-  sbatch -w super001 benchmark/benchmark_exclusion_metabuli_group.sh 93b8e45a 0.40 10 0.995 0 $w 0.15
-  sbatch -w super001 benchmark/benchmark_inclusion_metabuli_group.sh 93b8e45a 0.40 10 0.995 0 $w 0.15
-  sbatch -w super001 cami2/cami2_metabuli_strain_madness_group.sh    93b8e45a 0.40 10 0.995 0 $w 0.15
-  sbatch -w super001 cami2/cami2_metabuli_marine_group.sh            93b8e45a 0.40 10 0.995 0 $w 0.15
-  sbatch -w super001 cami2/cami2_metabuli_plant_associated_group.sh  93b8e45a 0.40 10 0.995 0 $w 0.15
-  sbatch -w super001 cami2/cami2_metabuli_clinical_pathogen_group.sh 93b8e45a 0.40 10 0.995 0 $w 0.15
+  sbatch -w super001 benchmark/benchmark_exclusion_metabuli_group.sh d8c9f221 0.40 10 0.995 0 $w 0.15
+  sbatch -w super001 benchmark/benchmark_inclusion_metabuli_group.sh d8c9f221 0.40 10 0.995 0 $w 0.15
+  sbatch -w super001 cami2/cami2_metabuli_strain_madness_group.sh    d8c9f221 0.40 10 0.995 0 $w 0.15
+  sbatch -w super001 cami2/cami2_metabuli_marine_group.sh            d8c9f221 0.40 10 0.995 0 $w 0.15
+  sbatch -w super001 cami2/cami2_metabuli_plant_associated_group.sh  d8c9f221 0.40 10 0.995 0 $w 0.15
+  sbatch -w super001 cami2/cami2_metabuli_clinical_pathogen_group.sh d8c9f221 0.40 10 0.995 0 $w 0.15
 done
 ```
 
@@ -106,7 +113,7 @@ for s in benchmark/benchmark_exclusion_kraken2_group.sh \
          cami2/cami2_centrifuge_strain_madness_group.sh \
          cami2/cami2_centrifuge_marine_group.sh \
          cami2/cami2_centrifuge_plant_associated_group.sh ; do
-  sbatch -w super001 $s 93b8e45a 0.40 10 0.995 0
+  sbatch -w super001 $s d8c9f221 0.40 10 0.995 0
 done
 ```
 
@@ -116,7 +123,7 @@ Only worth running where a grouping point is a candidate operating point. Same a
 step 2 plus the vote arguments, e.g. span 1 on exclusion:
 
 ```bash
-sbatch -w super001 benchmark/benchmark_exclusion_metabuli_group.sh 93b8e45a 0.40 10 0.995 1 2 0.15
+sbatch -w super001 benchmark/benchmark_exclusion_metabuli_group.sh d8c9f221 0.40 10 0.995 1 2 0.15
 ```
 
 ## Notes
