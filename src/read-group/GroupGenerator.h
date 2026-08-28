@@ -25,6 +25,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <zstd.h>
 #include "IndexCreator.h"
 #include "SeqIterator.h"
@@ -734,6 +736,42 @@ static inline size_t mHistBucket(size_t m) {
     return bucket; // floor(log2(m)) for m >= 1; 0 for m == 0
 }
 
+// Edge-weight histogram: one bin per weight up to WEIGHT_HIST_LINEAR, log2 buckets above it.
+// mHistBucket cannot serve here even though both are "a distribution of counts". Two reasons:
+//
+//   - capFromQuantile below reads the m histogram's buckets as [2^b, 2^(b+1)) to derive the
+//     reads-per-k-mer cap, so that bucketing is load-bearing -- changing it changes which cap a
+//     run picks, and the cap changes the graph. It has to stay log2.
+//   - Edge weights sit far lower than the thresholds cutting them. On CAMI2 the mean merged
+//     weight is 1.3 (clinical-pathogen) to 11.0 (marine) against core thresholds of 25 to 45,
+//     so log2 bucketing puts almost every edge in buckets 0-4. Five bins describe the shape of
+//     the thing the threshold is cutting; 256 describe it well enough to fit a model to.
+//
+// 256 covers twice the largest core threshold seen (45 on marine), which is the range where the
+// two populations -- reads off one genome, and reads sharing only a conserved stretch -- overlap.
+// Above it a weight is unambiguously a real overlap and factor-2 spacing loses nothing.
+static const size_t WEIGHT_HIST_LINEAR = 256;
+static const size_t WEIGHT_HIST_BUCKETS = WEIGHT_HIST_LINEAR + M_HIST_BUCKETS;
+
+static inline size_t weightHistBucket(size_t w) {
+    if (w < WEIGHT_HIST_LINEAR) { return w; }
+    return WEIGHT_HIST_LINEAR + mHistBucket(w);
+}
+
+// Smallest weight landing in `bucket`. Exact in the linear range, and the power of two that
+// opens the bucket above it. The reporting code classifies a whole bucket by this value, so
+// keeping the inverse next to the forward mapping is what stops the two drifting apart.
+static inline size_t weightHistLowerBound(size_t bucket) {
+    if (bucket < WEIGHT_HIST_LINEAR) { return bucket; }
+    const size_t exponent = bucket - WEIGHT_HIST_LINEAR;
+    if (exponent >= 63) { return SIZE_MAX; }
+    const size_t lo = (static_cast<size_t>(1) << exponent);
+    // The first few log2 buckets describe weights the linear range already covers; nothing is
+    // ever counted into them. Report them as starting where the linear range ends so a stray
+    // count cannot be classified below its true weight.
+    return (lo < WEIGHT_HIST_LINEAR) ? WEIGHT_HIST_LINEAR : lo;
+}
+
 // Smallest log2-bucket upper bound (3, 7, 15, 31, ...) covering `quantile` of the k-mers with
 // m >= 2, i.e. the cap that keeps that share of distinct k-mers and drops the tail above it.
 //
@@ -773,6 +811,284 @@ static inline size_t capFromQuantile(const std::vector<uint64_t> & mHistKmers, f
     return 0;
 }
 
+// --- Edge-weight mixture, the score --score writes -------------------------------------------
+//
+// An edge weight is how many k-mers two reads share. Two populations produce them: reads off the
+// same genome, whose weight tracks how far they overlap, and reads off different organisms that
+// happen to share a conserved stretch. Grouping separates the two with a threshold. The score
+// separates them with the posterior instead, so a read that fell just short of a group still
+// carries a number saying how close it came.
+//
+// Chance collision is not the competing hypothesis and a test against it is worthless here. With
+// k-mers per read around 100 and a syncmer space around 1e9, two unrelated reads are expected to
+// share 1e-6 k-mers; a weight of 2 already rejects chance at 1e-12, so every edge in the file
+// "rejects chance". What has to be told apart is same-organism from conserved-region, and only
+// the shape of the observed distribution carries that.
+//
+// f0 -- conserved-region component. Geometric on {1, 2, ...}: a conserved stretch keeps matching
+//       until it ends, which is the memoryless story, and CAMI2 mean weights of 1.3 to 11.0
+//       against thresholds of 25 to 45 say the mass really is packed against 1.
+// f1 -- same-organism component. Negative binomial on {1, 2, ...}: overlap length varies and the
+//       variance runs well above the mean, which a Poisson cannot absorb.
+struct WeightMixtureFit {
+    double pi1 = 0.0;         // mixing weight of the same-organism component
+    double p0 = 0.5;          // geometric parameter of f0
+    double r1 = 1.0;          // negative binomial shape of f1
+    double p1 = 0.5;          // negative binomial probability of f1
+    double mean0 = 0.0;       // fitted component means, reported and used for the sanity check
+    double mean1 = 0.0;
+    double logLik = 0.0;
+    size_t iterations = 0;
+    uint64_t fittedEdges = 0; // edges the fit actually saw (the exact-resolution range)
+    double gainNats = 0.0;    // mean log-likelihood gained per edge over one component
+    bool identifiable = false;
+};
+
+// Log pmf of the geometric component at weight w >= 1.
+static inline double weightLogPmf0(const WeightMixtureFit & fit, size_t w) {
+    if (w < 1) { return -INFINITY; }
+    return std::log1p(-fit.p0) + static_cast<double>(w - 1) * std::log(fit.p0);
+}
+
+// Log pmf of the negative binomial component at weight w >= 1, shifted so its support starts at 1.
+static inline double weightLogPmf1(const WeightMixtureFit & fit, size_t w) {
+    if (w < 1) { return -INFINITY; }
+    const double y = static_cast<double>(w - 1);
+    return std::lgamma(y + fit.r1) - std::lgamma(fit.r1) - std::lgamma(y + 1.0)
+         + fit.r1 * std::log(fit.p1) + y * std::log1p(-fit.p1);
+}
+
+// Mean log-likelihood per edge of the best single negative binomial over the same range, by
+// moment matching. This is the null the mixture has to beat: a distribution packed against 1 with
+// a long tail is exactly what one over-dispersed component looks like, so "the EM converged and
+// the two means differ" is not evidence of two populations. A single geometric splits happily
+// into two components that each explain part of its own decay.
+static inline double singleComponentMeanLogLik(const std::vector<uint64_t> & hist, size_t maxW) {
+    uint64_t total = 0;
+    double sum = 0.0;
+    for (size_t w = 1; w < maxW; ++w) {
+        total += hist[w];
+        sum += static_cast<double>(hist[w]) * static_cast<double>(w);
+    }
+    if (total == 0) { return -INFINITY; }
+    const double mean = sum / static_cast<double>(total);
+    double var = 0.0;
+    for (size_t w = 1; w < maxW; ++w) {
+        const double d = static_cast<double>(w) - mean;
+        var += static_cast<double>(hist[w]) * d * d;
+    }
+    var /= static_cast<double>(total);
+
+    const double EPS = 1e-12;
+    const double R_MAX = 1e6;
+    const double meanY = std::max(EPS, mean - 1.0);
+    WeightMixtureFit single;
+    single.r1 = (var > meanY + EPS) ? std::min(R_MAX, meanY * meanY / (var - meanY)) : R_MAX;
+    single.r1 = std::max(EPS, single.r1);
+    single.p1 = std::min(1.0 - EPS, std::max(EPS, single.r1 / (single.r1 + meanY)));
+
+    double logLik = 0.0;
+    for (size_t w = 1; w < maxW; ++w) {
+        if (hist[w] == 0) { continue; }
+        const double lp = weightLogPmf1(single, w);
+        if (!std::isfinite(lp)) { return -INFINITY; }
+        logLik += static_cast<double>(hist[w]) * lp;
+    }
+    return logLik / static_cast<double>(total);
+}
+
+// How much better, in nats per edge, the mixture has to explain the data than one component
+// before its posterior is treated as a score. Not a significance level: at CAMI2 edge counts
+// (1e8 to 3e10) any information criterion passes on a difference far too small to mean anything,
+// because the penalty is fixed and the log-likelihood grows with the edge count. A per-edge floor
+// does not have that problem. 0.02 sits between the two synthetic cases measured while building
+// this: a single geometric of mean 2.5, which the EM still splits into components of mean 1.9 and
+// 3.4, gains -0.000002 nats, and a genuine two-population histogram gains 0.300.
+static const double MIXTURE_MIN_GAIN_NATS = 0.02;
+
+// Fit the two components to `hist` by EM. Only the exact-resolution part of the histogram is
+// used: above WEIGHT_HIST_LINEAR a bucket spans a range of weights and has no single w to score,
+// and those weights are unambiguously real overlap anyway -- the mixture is needed for the low
+// range where the two populations sit on top of each other.
+//
+// Deterministic. The initial split is the histogram's own mean rather than a random assignment,
+// and every step below is a closed form, so two runs over the same histogram return the same fit.
+// That matters because the histogram is itself thread- and partition-independent, and the score
+// derived from it has to inherit that.
+inline WeightMixtureFit fitWeightMixture(const std::vector<uint64_t> & hist) {
+    WeightMixtureFit fit;
+
+    const size_t maxW = std::min(WEIGHT_HIST_LINEAR, hist.size());
+    uint64_t total = 0;
+    double weightedSum = 0.0;
+    for (size_t w = 1; w < maxW; ++w) {
+        total += hist[w];
+        weightedSum += static_cast<double>(hist[w]) * static_cast<double>(w);
+    }
+    fit.fittedEdges = total;
+    if (total == 0) {
+        return fit; // identifiable stays false
+    }
+    const double overallMean = weightedSum / static_cast<double>(total);
+
+    // Responsibilities, one per weight. Initialised by the mean split: everything above the
+    // overall mean starts as same-organism, everything at or below it as conserved-region.
+    std::vector<double> gamma(maxW, 0.0);
+    for (size_t w = 1; w < maxW; ++w) {
+        gamma[w] = (static_cast<double>(w) > overallMean) ? 1.0 : 0.0;
+    }
+
+    const double EPS = 1e-12;
+    const double R_MAX = 1e6;
+    double prevLogLik = -INFINITY;
+
+    for (size_t iter = 1; iter <= 500; ++iter) {
+        // --- M-step ---------------------------------------------------------------------
+        double n1 = 0.0, n0 = 0.0, sum1 = 0.0, sum0 = 0.0;
+        for (size_t w = 1; w < maxW; ++w) {
+            const double c = static_cast<double>(hist[w]);
+            if (c == 0.0) { continue; }
+            const double g = gamma[w];
+            n1 += c * g;
+            n0 += c * (1.0 - g);
+            sum1 += c * g * static_cast<double>(w);
+            sum0 += c * (1.0 - g) * static_cast<double>(w);
+        }
+        if (n1 <= EPS || n0 <= EPS) {
+            fit.iterations = iter;
+            fit.identifiable = false;
+            return fit; // one component swallowed everything
+        }
+
+        fit.pi1 = n1 / (n1 + n0);
+        fit.mean0 = sum0 / n0;
+        fit.mean1 = sum1 / n1;
+
+        // Geometric on {1, ...} has mean 1 / (1 - p0). A mean at or below 1 cannot be
+        // represented; clamp rather than divide by zero.
+        const double mean0Clamped = std::max(1.0 + EPS, fit.mean0);
+        fit.p0 = std::min(1.0 - EPS, std::max(EPS, 1.0 - 1.0 / mean0Clamped));
+
+        // Negative binomial by moment matching on the shifted variable y = w - 1. Real-valued
+        // shape has no closed-form M-step, and matching the first two moments each round keeps
+        // the whole fit in closed form -- which is what makes it reproducible.
+        double var1 = 0.0;
+        for (size_t w = 1; w < maxW; ++w) {
+            const double c = static_cast<double>(hist[w]);
+            if (c == 0.0) { continue; }
+            const double d = static_cast<double>(w) - fit.mean1;
+            var1 += c * gamma[w] * d * d;
+        }
+        var1 /= n1;
+        const double meanY = std::max(EPS, fit.mean1 - 1.0);
+        if (var1 > meanY + EPS) {
+            fit.r1 = std::min(R_MAX, meanY * meanY / (var1 - meanY));
+        } else {
+            fit.r1 = R_MAX; // under-dispersed; the Poisson limit of the negative binomial
+        }
+        fit.r1 = std::max(EPS, fit.r1);
+        fit.p1 = std::min(1.0 - EPS, std::max(EPS, fit.r1 / (fit.r1 + meanY)));
+
+        // --- E-step ---------------------------------------------------------------------
+        double logLik = 0.0;
+        for (size_t w = 1; w < maxW; ++w) {
+            const double l1 = std::log(fit.pi1) + weightLogPmf1(fit, w);
+            const double l0 = std::log1p(-fit.pi1) + weightLogPmf0(fit, w);
+            const double hi = std::max(l1, l0);
+            if (!std::isfinite(hi)) {
+                gamma[w] = 0.0;
+                continue;
+            }
+            const double denom = std::exp(l1 - hi) + std::exp(l0 - hi);
+            gamma[w] = std::exp(l1 - hi) / denom;
+            const double c = static_cast<double>(hist[w]);
+            if (c != 0.0) { logLik += c * (hi + std::log(denom)); }
+        }
+
+        fit.iterations = iter;
+        fit.logLik = logLik;
+        const double denom = std::max(1.0, std::fabs(prevLogLik));
+        if (iter > 1 && std::fabs(logLik - prevLogLik) / denom < 1e-9) { break; }
+        prevLogLik = logLik;
+    }
+
+    // The same-organism component is the one with the larger mean. Moment matching does not
+    // enforce that, and a fit that came out the other way round would invert every score.
+    if (fit.mean1 < fit.mean0) {
+        fit.identifiable = false;
+        return fit;
+    }
+    // A mixture whose components sit on top of each other explains the data no better than one
+    // component and gives a posterior that is nearly constant in w -- useless as a score. Say so
+    // rather than emitting numbers that look like probabilities. The gain over one component is
+    // the load-bearing test; the other two only rule out degenerate fits cheaply.
+    fit.gainNats = fit.logLik / static_cast<double>(total)
+                 - singleComponentMeanLogLik(hist, maxW);
+    fit.identifiable = (fit.pi1 > 1e-4) && (fit.pi1 < 1.0 - 1e-4)
+                    && (fit.mean1 > fit.mean0 * 1.2)
+                    && std::isfinite(fit.gainNats)
+                    && (fit.gainNats >= MIXTURE_MIN_GAIN_NATS);
+    return fit;
+}
+
+// P(same organism | weight) for every representable weight, forced non-decreasing.
+//
+// The monotonicity is a correctness requirement, not a cosmetic one: the scoring pass keeps a
+// read's top-k candidate groups by edge weight and converts to a score only when writing, which
+// is only the same set as the top-k by score while the mapping is monotone. Moment matching can
+// produce a mild dip at the low end, so the fitted curve is run through pool-adjacent-violators
+// rather than trusted.
+inline std::vector<float> mixtureToLut(const WeightMixtureFit & fit, size_t lutSize) {
+    std::vector<float> lut(lutSize, 0.0f);
+    if (lutSize == 0) { return lut; }
+    if (!fit.identifiable) { return lut; } // all zeroes; the raw weight in the record is the fallback
+
+    std::vector<double> posterior(lutSize, 0.0);
+    for (size_t w = 1; w < lutSize; ++w) {
+        const double l1 = std::log(fit.pi1) + weightLogPmf1(fit, w);
+        const double l0 = std::log1p(-fit.pi1) + weightLogPmf0(fit, w);
+        if (!std::isfinite(l1) && !std::isfinite(l0)) {
+            // Both components underflowed. Everything this far out is real overlap.
+            posterior[w] = 1.0;
+            continue;
+        }
+        const double hi = std::max(l1, l0);
+        const double e1 = std::exp(l1 - hi);
+        const double e0 = std::exp(l0 - hi);
+        posterior[w] = e1 / (e1 + e0);
+    }
+
+    // Pool adjacent violators, over [1, lutSize). Blocks of equal value, merged whenever the
+    // next block would go down.
+    std::vector<double> blockValue;
+    std::vector<size_t> blockCount;
+    blockValue.reserve(lutSize);
+    blockCount.reserve(lutSize);
+    for (size_t w = 1; w < lutSize; ++w) {
+        blockValue.push_back(posterior[w]);
+        blockCount.push_back(1);
+        while (blockValue.size() > 1 && blockValue[blockValue.size() - 2] > blockValue.back()) {
+            const size_t n1 = blockCount[blockCount.size() - 2];
+            const size_t n2 = blockCount.back();
+            const double merged = (blockValue[blockValue.size() - 2] * static_cast<double>(n1)
+                                 + blockValue.back() * static_cast<double>(n2))
+                                / static_cast<double>(n1 + n2);
+            blockValue.pop_back();
+            blockCount.pop_back();
+            blockValue.back() = merged;
+            blockCount.back() = n1 + n2;
+        }
+    }
+    size_t w = 1;
+    for (size_t b = 0; b < blockValue.size(); ++b) {
+        const double v = std::min(1.0, std::max(0.0, blockValue[b]));
+        for (size_t j = 0; j < blockCount[b] && w < lutSize; ++j, ++w) {
+            lut[w] = static_cast<float>(v);
+        }
+    }
+    return lut;
+}
+
 // Floor for mergeGraph's per-stream read buffer. Reaching it means numOfGraph is so large
 // that even the memory budget cannot give each stream a useful buffer; mergeGraph warns,
 // and the real fix is multi-round merging (not implemented).
@@ -803,6 +1119,19 @@ inline size_t getMergeBufferElems(size_t numOfGraph, int maxRamGiB, size_t concu
     return std::max(MERGE_BUFFER_MIN_ELEMS, std::min(perStream, MAX_ELEMS));
 }
 
+// One candidate group for one read: the strongest edge this read has into that group, and what
+// the mixture makes of that weight.
+//
+// The raw weight is kept next to the score on purpose. The score depends on a fit that can come
+// out unusable -- a histogram with one population produces no posterior worth having -- and
+// without the weight the only way to recover would be another pass over relations_*.bin, which
+// by then have been deleted. Two bytes buy the output the right to outlive the model.
+struct ScoreSlot {
+    uint32_t groupId = 0;   // 0 = empty slot
+    uint16_t weight = 0;    // max edge weight from the read into that group
+    uint16_t scoreQ = 0;    // P(same | weight) quantised to [0, 65535]
+};
+
 class GroupGenerator {
 protected:
     const LocalParameters & par;
@@ -812,6 +1141,10 @@ protected:
     int kmerFormat;
     int printLog;
     int commonKmerSpan;   // --common-kmer-span; see the note above the class
+    // --score / --score-top-k. Read only by the scoring pass, which runs after Phase 3 and
+    // before relations_*.bin are removed. Nothing on the grouping path looks at either.
+    int scoreMode;
+    size_t scoreTopK;
     // The one number the routing scheme is built on. Resolved once, in the constructor, from
     // --partitions falling back to --threads, and read everywhere the old code read par.threads
     // for a routing decision. Keeping the two apart is the point: --threads may then change
@@ -896,6 +1229,13 @@ protected:
     // two comparable at a glance.
     std::vector<uint64_t> edgeWeightHist;
 
+    // --- Scoring pass state, allocated only when --score is on ------------------------------
+    // scoreTopK slots per read, indexed [(readId - 1) * scoreTopK + slot]. Read ids are 1-based
+    // everywhere else in this file and the file written from this is 0-based by position, so the
+    // conversion happens here and nowhere else.
+    std::vector<ScoreSlot> scoreTable;
+    WeightMixtureFit scoreFit;
+
 public:
     GroupGenerator(LocalParameters & par);
 
@@ -918,6 +1258,14 @@ public:
                                                          size_t offset);
 
     void makeSubGraph(size_t processedReadCnt);
+
+    // One pass over relations_*.bin after Phase 3, keeping each read's strongest edge into each
+    // of the top scoreTopK groups it touches. Reads relations_*.bin, so it has to run before
+    // startGroupGeneration removes them; writes nothing the grouping path looks at.
+    void collectGroupScores(size_t processedReadCnt,
+                            const std::vector<uint32_t> & queryGroupInfo);
+
+    void saveGroupScoresToFile(size_t processedReadCnt);
 
     // Walks one thread's kmer_delta_*/kmer_info_* files in k-mer order and hands each distinct
     // k-mer's sorted, deduplicated read ids to `onKmer`. Template rather than std::function: the

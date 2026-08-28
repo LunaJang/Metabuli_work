@@ -64,6 +64,12 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // fits under it never folds early, so machines with room pay nothing for it. This function
     // overrides LocalParameters' own initialisation, so both places have to agree.
     par.maxTmpDiskMiB = 0;
+    // Per-read group membership scores for a downstream EM. Off by default: the pass is cheap
+    // relative to edge generation but the output is not -- top-k slots at 8 bytes over a
+    // hundred-million-read run is tens of gigabytes, and nothing in this command reads it back.
+    // This function overrides LocalParameters' own initialisation, so both places have to agree.
+    par.score = 0;
+    par.scoreTopK = 8;
     par.syncmer = 1;
     par.smerLen = 5;
     par.seqMode = 2;    
@@ -112,6 +118,25 @@ static int runGroupGeneration(int argc, const char **argv, const Command& comman
         cerr << "Error: --max-kmer-quantile must be in [0, 1] (given " << par.maxKmerQuantile << ")." << endl;
         cerr << "       It is the share of k-mers (counted over those in at least two reads)" << endl;
         cerr << "       that the reads-per-k-mer cap keeps. 0 disables the automatic cap." << endl;
+        return 1;
+    }
+
+    // --print-log takes a different path through startGroupGeneration: it calls mergeGraph_one and
+    // skips the threshold, all three phases and saveGroupsToFile. There are no groups on that
+    // path, so there is nothing to score against. Stopping is better than writing an empty file
+    // that looks like a result.
+    if (par.score != 0 && par.printLog != 0) {
+        cerr << "Error: --score and --print-log cannot be used together." << endl;
+        cerr << "       --print-log stops after merging the graph; it produces no groups, and" << endl;
+        cerr << "       --score scores reads against the groups Phase 1-3 produce." << endl;
+        return 1;
+    }
+    // The score table is scoreTopK slots per read, held for the whole scoring pass. The upper
+    // bound is a memory guard, not an algorithmic one: 64 slots over a 200 M-read run is 100 GB.
+    if (par.score != 0 && (par.scoreTopK < 1 || par.scoreTopK > 64)) {
+        cerr << "Error: --score-top-k must be in [1, 64] (given " << par.scoreTopK << ")." << endl;
+        cerr << "       It is how many candidate groups each read keeps, at 8 bytes per slot" << endl;
+        cerr << "       held in memory for every read at once." << endl;
         return 1;
     }
 

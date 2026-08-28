@@ -102,6 +102,8 @@ public:
     PARAMETER(MIN_OVERLAP_RATIO)
     PARAMETER(COMMON_KMER_SPAN)
     PARAMETER(MAX_TMP_DISK)
+    PARAMETER(SCORE)
+    PARAMETER(SCORE_TOP_K)
     PARAMETER(MIN_VOTE_SCORE)
     PARAMETER(SCORE_COL)
     PARAMETER(READID_COL)
@@ -207,6 +209,10 @@ public:
     float minOverlapRatio;    // core threshold as a fraction of k-mers per read
     int commonKmerSpan;       // k-mers discarded either side of a common-k-mer hit; 0 = hit alone
     int maxTmpDiskMiB;
+    // Per-read group membership scores, for a downstream EM. An int rather than a bool so a
+    // second scoring rule can be added as a value instead of a second flag; only 0 and 1 exist.
+    int score;                // 0 = off, 1 = two-component mixture posterior
+    int scoreTopK;            // candidate groups kept per read when score != 0
 
     // Group application
     int scoreCol;

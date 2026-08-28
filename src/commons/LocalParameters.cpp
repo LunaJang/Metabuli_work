@@ -332,6 +332,39 @@ LocalParameters::LocalParameters() :
                      typeid(int),
                      (void *) &maxTmpDiskMiB,
                      "^[0-9]+$"),
+        SCORE(SCORE_ID,
+                    "--score",
+                    "Write per-read group membership scores to groupScore (0: off)",
+                    "Grouping decides membership by thresholding edge weights, so a read either "
+                    "is in a group or is not. An EM step needs the graded version of that: how "
+                    "well the read fits the group it landed in, and how well it fits the groups it "
+                    "nearly landed in. Turning this on adds one pass over relations_*.bin after "
+                    "Phase 3, before those files are removed, and writes the top candidate groups "
+                    "per read with a probability for each. The groups themselves are untouched -- "
+                    "a run with and without this flag produces the same groups and groupMap. "
+                    "The probability is the posterior of a two-component mixture fitted to the "
+                    "merged edge-weight distribution: one component for reads off the same "
+                    "genome, one for reads sharing only a conserved stretch. It is not a test "
+                    "against chance collision, which cannot discriminate here -- with roughly 100 "
+                    "k-mers per read against a syncmer space of 1e9, two unrelated reads are "
+                    "expected to share 1e-6 k-mers, so any weight at all rejects chance and every "
+                    "edge looks significant.",
+                    typeid(int),
+                    (void *) &score,
+                    "^[0-9]+$"),
+        SCORE_TOP_K(SCORE_TOP_K_ID,
+                    "--score-top-k",
+                    "Candidate groups kept per read by --score",
+                    "How many candidate groups each read keeps. The table is held in memory for "
+                    "the whole scoring pass at 8 bytes per slot, so this is what decides its size: "
+                    "8 slots over CAMI2 marine's 166 M reads is 10.7 GB. Reads touching more "
+                    "groups than this keep the strongest; the [score] summary reports how many "
+                    "reads filled every slot, which is the only evidence that the bound is biting. "
+                    "The default of 8 has no measurement behind it -- the number of groups a read "
+                    "touches has never been counted.",
+                    typeid(int),
+                    (void *) &scoreTopK,
+                    "^[0-9]+$"),
         MIN_VOTE_SCORE(MIN_VOTE_SCORE_ID,
                     "--min-vote-score",
                     "Min. classification score to vote.",
@@ -672,6 +705,9 @@ LocalParameters::LocalParameters() :
     edgeMode = 0;
     commonKmerSpan = 0;
     maxTmpDiskMiB = 0;
+    // setGroupGenerationDefaults overrides both; the two places have to agree.
+    score = 0;
+    scoreTopK = 8;
 
     buildUnirefDb.push_back(&UNIREF_XML);
     buildUnirefDb.push_back(&PARAM_THREADS);
@@ -785,6 +821,8 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&PARTITIONS);
     groupGeneration.push_back(&COMMON_KMER_SPAN);
     groupGeneration.push_back(&MAX_TMP_DISK);
+    groupGeneration.push_back(&SCORE);
+    groupGeneration.push_back(&SCORE_TOP_K);
     groupGeneration.push_back(&PRINT_LOG);
 
     // easy-grouping takes exactly grouping's parameters. The edge mode is not among them: the

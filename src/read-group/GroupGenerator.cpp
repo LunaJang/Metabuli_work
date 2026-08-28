@@ -78,6 +78,10 @@ GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     kmerFormat = par.kmerFormat;
     printLog = par.printLog;
     commonKmerSpan = par.commonKmerSpan;
+    scoreMode = par.score;
+    // Validated in runGroupGeneration; clamped here as well so a caller that builds a
+    // LocalParameters directly cannot size the table from a negative number.
+    scoreTopK = (par.scoreTopK > 0) ? static_cast<size_t>(par.scoreTopK) : 1;
     // 0 means "follow --threads", which is what every run before --partitions existed did.
     // Clamped to at least 1: routeOf takes id1 % partitionCnt, and --threads is itself >= 1.
     partitionCnt = (par.partitions > 0) ? par.partitions : par.threads;
@@ -238,9 +242,11 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                 const uint64_t n = edgeWeightHist[b];
                 if (n == 0) { continue; }
                 weightTotal += n;
-                // Bucket b covers [2^b, 2^(b+1)); classify it by its lower bound, which is exact
-                // for the powers of two and off by less than one bucket elsewhere.
-                const size_t lo = (size_t(1) << b);
+                // Classify a bucket by the smallest weight it can hold. Exact below
+                // WEIGHT_HIST_LINEAR, where each bucket is one weight; above it the bucket spans
+                // [2^e, 2^(e+1)) and the bound is off by less than one bucket. Both thresholds
+                // seen so far (25 to 45) fall inside the exact range.
+                const size_t lo = weightHistLowerBound(b);
                 if (lo < static_cast<size_t>(coreThr)) {
                     belowCore += n;
                     if (lo > static_cast<size_t>(weakThr)) { inBand += n; }
@@ -277,6 +283,15 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         }
 
         saveGroupsToFile(groupInfo, queryGroupInfo);
+
+        // The scoring pass sits here, between the groups being written and the relations being
+        // removed, because that is the one point where both exist: the group labels are final
+        // only after Phase 3, and relations_*.bin are gone one statement later. Running here
+        // costs no extra disk at all -- the files are already on it.
+        if (scoreMode != 0) {
+            collectGroupScores(processedReadCnt, queryGroupInfo);
+            saveGroupScoresToFile(processedReadCnt);
+        }
 
         // relations_*.bin are reparsed every refinement iteration but are no longer
         // needed once grouping is saved. Indices: relations_0 .. relations_{2*threads}.
@@ -1661,7 +1676,7 @@ void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & o
                                std::vector<uint64_t> & weightHistOut) {
     mergedOut = 0;
     ceilingOut = 0;
-    weightHistOut.assign(M_HIST_BUCKETS, 0);
+    weightHistOut.assign(WEIGHT_HIST_BUCKETS, 0);
 
     std::vector<std::string> files = inputFiles;
     reduceSubGraphFanIn(files, maxFanIn, route, shard);
@@ -1704,7 +1719,7 @@ void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & o
             }
         }
         if (totalWeight == UINT16_MAX) ceilingOut++;
-        weightHistOut[mHistBucket(totalWeight)]++;
+        weightHistOut[weightHistBucket(totalWeight)]++;
         mergedOut++;
 
         // Zeroed in place, not via a helper's return value -- see mergeGraph_one for why.
@@ -1866,10 +1881,10 @@ void GroupGenerator::mergeGraph() {
     cout << "[edges] merged into " << mergedEdgeCnt << " distinct edges ("
          << humanBytes(static_cast<uint64_t>(mergedEdgeCnt) * sizeof(Relation)) << ")" << endl;
 
-    edgeWeightHist.assign(M_HIST_BUCKETS, 0);
+    edgeWeightHist.assign(WEIGHT_HIST_BUCKETS, 0);
     for (size_t u = 0; u < unitCnt; ++u) {
-        if (unitWeightHist[u].size() != M_HIST_BUCKETS) { continue; }
-        for (size_t b = 0; b < M_HIST_BUCKETS; ++b) {
+        if (unitWeightHist[u].size() != WEIGHT_HIST_BUCKETS) { continue; }
+        for (size_t b = 0; b < WEIGHT_HIST_BUCKETS; ++b) {
             edgeWeightHist[b] += unitWeightHist[u][b];
         }
     }
@@ -2743,6 +2758,278 @@ void GroupGenerator::makeGroupsPhase3(
     }
 
     cout << "Phase 3 done: " << double(time(nullptr) - t0) << " s" << endl;
+}
+
+// Insert one (group, weight) observation into a read's slot range, in place.
+//
+// Aggregation is max: a read's affinity to a group is its strongest link into that group, not the
+// sum or the mean over members. Max is the only one of the three that survives this pass's shape.
+// A sum or a mean would need the read's full set of groups before any of them could be ranked,
+// and a read touching thousands of groups cannot be held; max is decided per observation and
+// never revised downwards. It also does not punish a read for the group being large, which a mean
+// does -- and Phase 2 makes groups that hold most of the reads.
+//
+// Ordering is (weight, then smaller groupId wins). The tiebreak is not cosmetic: edges arrive in
+// whatever order the routes are scheduled in, and without it two runs at different thread counts
+// could keep different groups at equal weight. With it the kept set is a function of the data.
+static inline void insertScoreCandidate(ScoreSlot * const slots, size_t k,
+                                        uint32_t groupId, uint16_t weight) {
+    size_t weakest = 0;
+    for (size_t i = 0; i < k; ++i) {
+        if (slots[i].groupId == groupId) {
+            if (weight > slots[i].weight) { slots[i].weight = weight; }
+            return;
+        }
+        if (slots[i].groupId == 0) {
+            slots[i].groupId = groupId;
+            slots[i].weight = weight;
+            return;
+        }
+        // Weakest so far, ties broken towards the larger group id so the smaller one is the one
+        // that stays when the slot has to be given up.
+        if (slots[i].weight < slots[weakest].weight
+            || (slots[i].weight == slots[weakest].weight
+                && slots[i].groupId > slots[weakest].groupId)) {
+            weakest = i;
+        }
+    }
+    if (weight > slots[weakest].weight
+        || (weight == slots[weakest].weight && groupId < slots[weakest].groupId)) {
+        slots[weakest].groupId = groupId;
+        slots[weakest].weight = weight;
+    }
+}
+
+void GroupGenerator::collectGroupScores(size_t processedReadCnt,
+                                        const std::vector<uint32_t> & queryGroupInfo) {
+    cout << "[score] collecting candidate groups per read..." << endl;
+    const time_t t0 = time(nullptr);
+
+    const size_t k = scoreTopK;
+    const size_t slotCnt = processedReadCnt * k;
+    // 8 bytes a slot, for every read at once. The [score] line reports it because it is the one
+    // number --score-top-k moves and the one that can end a run.
+    cout << "[score] table: " << processedReadCnt << " reads x " << k << " slots = "
+         << humanBytes(static_cast<uint64_t>(slotCnt) * sizeof(ScoreSlot)) << endl;
+    scoreTable.assign(slotCnt, ScoreSlot());
+
+    // One lock per read rather than one per route. A read's edges are spread over every unit --
+    // routeOf sends a pair to a residue route, a range route or the cross route depending on both
+    // ids -- so no partition of the routes gives a thread exclusive ownership of a read.
+    // Contention is low because a collision needs two threads on the same read at the same
+    // moment, and max aggregation with a deterministic tiebreak makes the order they arrive in
+    // irrelevant to the result.
+    std::vector<std::atomic_flag> slotLocks(processedReadCnt + 1);
+    for (size_t i = 0; i <= processedReadCnt; ++i) { slotLocks[i].clear(); }
+
+    std::atomic<uint64_t> edgesSeen{0};
+    std::atomic<uint64_t> observations{0};
+    // How many edges cross a group boundary. This is what decides whether a read has any
+    // alternative to score against, and it has never been counted -- the phases only ever ask
+    // whether an edge is above a threshold, not where its endpoints ended up.
+    std::atomic<uint64_t> crossGroupEdges{0};
+    std::atomic<uint64_t> danglingEdges{0};   // one endpoint ungrouped
+
+    auto observe = [&](uint32_t readId, uint32_t groupId, uint16_t weight) {
+        while (slotLocks[readId].test_and_set(std::memory_order_acquire)) { /* spin */ }
+        insertScoreCandidate(scoreTable.data() + (static_cast<size_t>(readId) - 1) * k,
+                             k, groupId, weight);
+        slotLocks[readId].clear(std::memory_order_release);
+    };
+
+    auto processFile = [&](const std::string & fname) {
+        ReadBuffer<Relation> rb(fname, 1024 * 1024);
+        uint64_t localEdges = 0;
+        uint64_t localObs = 0;
+        uint64_t localCross = 0;
+        uint64_t localDangling = 0;
+        for (Relation r = rb.getNext(); !(r == Relation()); r = rb.getNext()) {
+            const uint32_t id1 = r.id1, id2 = r.id2;
+            if (id1 == 0 || id2 == 0) { continue; }
+            if (id1 > processedReadCnt || id2 > processedReadCnt) { continue; }
+            ++localEdges;
+            // An edge is evidence about both of its endpoints, and about the group the other
+            // endpoint ended up in. An endpoint left ungrouped is not a candidate group, so it
+            // contributes nothing in that direction -- but the ungrouped read still collects
+            // candidates from the other side, which is how a read Phase 1-3 could not place gets
+            // a score at all.
+            const uint32_t g1 = queryGroupInfo[id1];
+            const uint32_t g2 = queryGroupInfo[id2];
+            if (g2 != 0) { observe(id1, g2, r.weight); ++localObs; }
+            if (g1 != 0) { observe(id2, g1, r.weight); ++localObs; }
+            if (g1 != 0 && g2 != 0) {
+                if (g1 != g2) { ++localCross; }
+            } else if (g1 != 0 || g2 != 0) {
+                ++localDangling;
+            }
+        }
+        edgesSeen.fetch_add(localEdges, std::memory_order_relaxed);
+        observations.fetch_add(localObs, std::memory_order_relaxed);
+        crossGroupEdges.fetch_add(localCross, std::memory_order_relaxed);
+        danglingEdges.fetch_add(localDangling, std::memory_order_relaxed);
+    };
+
+    // Same route layout as the phases: 2 * partitionCnt + 1 files, the last one the range tail.
+    // No barrier is needed here -- unlike the union-find phases nothing carries between routes.
+    const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
+    #pragma omp parallel for schedule(dynamic) num_threads(par.threads)
+    for (size_t route = 0; route < routeCnt; ++route) {
+        processFile(outDir + "/relations_" + std::to_string(route) + ".bin");
+    }
+
+    const uint64_t seen = edgesSeen.load();
+    cout << "[score] edges read: " << seen << endl;
+    cout << "[score] read-group observations: " << observations.load() << endl;
+    cout << "[score] edges crossing a group boundary: " << crossGroupEdges.load()
+         << (seen ? " (" + std::to_string(100.0 * static_cast<double>(crossGroupEdges.load())
+                                          / static_cast<double>(seen)) + "%)"
+                  : std::string()) << endl;
+    cout << "[score] edges with one endpoint ungrouped: " << danglingEdges.load() << endl;
+    cout << "[score] pass done: " << double(time(nullptr) - t0) << " s" << endl;
+}
+
+void GroupGenerator::saveGroupScoresToFile(size_t processedReadCnt) {
+    const size_t k = scoreTopK;
+
+    // Fit here rather than in the pass: the histogram is complete once mergeGraph returns, and
+    // keeping the fit next to the write means the LUT and the numbers written from it cannot
+    // disagree.
+    scoreFit = fitWeightMixture(edgeWeightHist);
+    const std::vector<float> lut = mixtureToLut(scoreFit, 65536);
+
+    // Earlier stages leave cout at a precision of their own choosing, which turned the gain floor
+    // of 0.02 into "0.0" the first time this ran. Set it here and put it back afterwards rather
+    // than depending on whatever the last stage wanted.
+    const std::streamsize prevPrecision = cout.precision(6);
+
+    cout << "[score] mixture fit: pi1 " << scoreFit.pi1
+         << ", conserved-region mean " << scoreFit.mean0
+         << ", same-organism mean " << scoreFit.mean1 << endl;
+    cout << "[score] mixture fit: r1 " << scoreFit.r1 << ", p1 " << scoreFit.p1
+         << ", p0 " << scoreFit.p0 << endl;
+    cout << "[score] mixture fit: " << scoreFit.iterations << " iterations over "
+         << scoreFit.fittedEdges << " edges, gain " << scoreFit.gainNats
+         << " nats/edge over one component (floor " << MIXTURE_MIN_GAIN_NATS << ")" << endl;
+    if (!scoreFit.identifiable) {
+        cerr << "[score][WARN] the edge-weight distribution does not separate into two "
+             << "components; every score is written as 0." << endl;
+        cerr << "[score][WARN] the weight in each slot is still exact -- recompute the score "
+             << "from it and the histogram in groupScore.meta." << endl;
+    } else {
+        size_t half = 0;
+        for (size_t w = 1; w < lut.size(); ++w) {
+            if (lut[w] >= 0.5f) { half = w; break; }
+        }
+        if (half != 0) {
+            cout << "[score] posterior reaches 0.5 at weight " << half << endl;
+        } else {
+            // The two components separated well enough to pass the gain test, but the
+            // same-organism one never takes half the mass at any weight -- it is the smaller
+            // component everywhere. The scores are still ordered; they are just all low.
+            cout << "[score] posterior never reaches 0.5; the same-organism component stays the "
+                 << "minority at every weight" << endl;
+        }
+    }
+
+    // Fill in the scores and put each read's slots in order. Both are needed.
+    //
+    // The order matters for reproducibility, not for looks. The pass fills the first free slot,
+    // so a slot's position records the order its edge happened to be read in, and that follows
+    // the thread schedule even though the set of candidates does not: a candidate survives
+    // eviction on (weight, then smaller group id), and the eviction threshold only ever rises,
+    // so the set is a function of the data. Sorting here discards the arrival order that is the
+    // only thread-dependent thing left, and puts the best candidate in slot 0 as a side effect.
+    //
+    // Scoring does not disturb the order: the LUT is monotone in the weight.
+    uint64_t readsWithCandidates = 0;
+    uint64_t readsAtCapacity = 0;
+    uint64_t slotsUsed = 0;
+    for (size_t readIdx = 0; readIdx < processedReadCnt; ++readIdx) {
+        ScoreSlot * const slots = scoreTable.data() + readIdx * k;
+        std::sort(slots, slots + k, [](const ScoreSlot & a, const ScoreSlot & b) {
+            // Empty slots (groupId 0) sort last: they carry weight 0, and no real candidate does.
+            if (a.weight != b.weight) { return a.weight > b.weight; }
+            return a.groupId < b.groupId;
+        });
+        size_t used = 0;
+        for (size_t i = 0; i < k; ++i) {
+            if (slots[i].groupId == 0) { continue; }
+            ++used;
+            const float p = lut[slots[i].weight];
+            slots[i].scoreQ = static_cast<uint16_t>(p * 65535.0f + 0.5f);
+        }
+        slotsUsed += used;
+        if (used > 0) { ++readsWithCandidates; }
+        if (used == k) { ++readsAtCapacity; }
+    }
+
+    const string scoreFileName = outDir + "/groupScore";
+    ofstream scoreFile(scoreFileName, std::ios::binary);
+    if (!scoreFile.is_open()) {
+        cerr << "Error opening file: " << scoreFileName << endl;
+        return;
+    }
+    scoreFile.write(reinterpret_cast<const char *>(scoreTable.data()),
+                    static_cast<std::streamsize>(scoreTable.size() * sizeof(ScoreSlot)));
+    scoreFile.close();
+
+    const string metaFileName = outDir + "/groupScore.meta";
+    ofstream metaFile(metaFileName);
+    if (!metaFile.is_open()) {
+        cerr << "Error opening file: " << metaFileName << endl;
+        return;
+    }
+    // Everything needed to read groupScore back and to recompute a score from the raw weights,
+    // so the binary file does not depend on this run's log surviving. Enough digits that a
+    // downstream reader can reproduce the LUT from the parameters rather than approximate it.
+    metaFile.precision(17);
+    metaFile << "reads\t" << processedReadCnt << "\n";
+    metaFile << "slots_per_read\t" << k << "\n";
+    metaFile << "slot_bytes\t" << sizeof(ScoreSlot) << "\n";
+    metaFile << "slot_layout\tuint32 groupId, uint16 weight, uint16 scoreQ\n";
+    metaFile << "slot_order\tdescending weight, then ascending groupId; empty slots (groupId 0) last\n";
+    metaFile << "score_scale\t65535\n";
+    metaFile << "read_id_base\t1\n";
+    metaFile << "edge_mode\t" << edgeMode << "\n";
+    metaFile << "partitions\t" << partitionCnt << "\n";
+    metaFile << "kmers_per_read\t"
+             << (processedReadCnt ? static_cast<double>(totalFilteredKmers)
+                                    / static_cast<double>(processedReadCnt)
+                                  : 0.0) << "\n";
+    metaFile << "total_filtered_kmers\t" << totalFilteredKmers << "\n";
+    metaFile << "mixture_identifiable\t" << (scoreFit.identifiable ? 1 : 0) << "\n";
+    metaFile << "mixture_pi1\t" << scoreFit.pi1 << "\n";
+    metaFile << "mixture_p0\t" << scoreFit.p0 << "\n";
+    metaFile << "mixture_r1\t" << scoreFit.r1 << "\n";
+    metaFile << "mixture_p1\t" << scoreFit.p1 << "\n";
+    metaFile << "mixture_mean0\t" << scoreFit.mean0 << "\n";
+    metaFile << "mixture_mean1\t" << scoreFit.mean1 << "\n";
+    metaFile << "mixture_gain_nats\t" << scoreFit.gainNats << "\n";
+    metaFile << "mixture_gain_floor\t" << MIXTURE_MIN_GAIN_NATS << "\n";
+    metaFile << "mixture_iterations\t" << scoreFit.iterations << "\n";
+    metaFile << "mixture_fitted_edges\t" << scoreFit.fittedEdges << "\n";
+    metaFile << "reads_with_candidates\t" << readsWithCandidates << "\n";
+    metaFile << "reads_at_capacity\t" << readsAtCapacity << "\n";
+    metaFile << "slots_used\t" << slotsUsed << "\n";
+    metaFile << "weight_hist_linear\t" << WEIGHT_HIST_LINEAR << "\n";
+    metaFile << "# weight_hist: bucket lower bound, edge count. Exact below "
+             << WEIGHT_HIST_LINEAR << ", log2 above.\n";
+    for (size_t b = 0; b < edgeWeightHist.size(); ++b) {
+        if (edgeWeightHist[b] == 0) { continue; }
+        metaFile << "weight_hist\t" << weightHistLowerBound(b) << "\t" << edgeWeightHist[b] << "\n";
+    }
+    metaFile.close();
+
+    cout << "[score] reads with at least one candidate: " << readsWithCandidates
+         << " of " << processedReadCnt << endl;
+    cout << "[score] reads filling every slot: " << readsAtCapacity
+         << " (raise --score-top-k if this is a large share)" << endl;
+    cout << "[score] slots used: " << slotsUsed << " of " << scoreTable.size() << endl;
+    cout << "Group scores saved to " << scoreFileName << " ("
+         << humanBytes(static_cast<uint64_t>(scoreTable.size()) * sizeof(ScoreSlot))
+         << ") successfully." << endl;
+    cout << "Group score metadata saved to " << metaFileName << " successfully." << endl;
+    cout.precision(prevPrecision);
 }
 
 void GroupGenerator::saveGroupsToFile(const unordered_map<uint32_t, unordered_set<uint32_t>> &groupInfo,
