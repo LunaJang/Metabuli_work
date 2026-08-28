@@ -539,6 +539,39 @@ inline size_t concurrentFlushRounds() {
     return 2;
 }
 
+// Which edge set one shared k-mer produces.
+//   clique: every pair, C(m,2) edges. An edge weight then counts the k-mers two reads share,
+//           which is what --min-overlap-ratio x k-mers-per-read assumes.
+//   star:   a hub and its m-1 spokes. Linear in m instead of quadratic, at the cost of that
+//           weight meaning: two reads that share a k-mer get no edge from it unless one of them
+//           is the hub.
+enum EdgeMode {
+    EDGE_MODE_CLIQUE = 0,
+    EDGE_MODE_STAR = 1
+};
+
+// The hub for one k-mer's read list: the read holding the most k-mers, ties going to the smaller
+// id. Reading the counts rather than the list order is what keeps the choice independent of how
+// the query file happens to be sorted -- ids follow input order, so "first in the list" would not
+// be.
+//
+// ids is sorted ascending, and the comparison is strictly greater, so the first read to reach the
+// maximum keeps it: the tie rule needs no separate branch. ids must not be empty.
+inline uint32_t pickStarHub(const std::vector<uint32_t> & ids,
+                            const std::vector<uint32_t> & kmerCntPerRead) {
+    uint32_t hub = ids[0];
+    uint32_t best = (hub < kmerCntPerRead.size()) ? kmerCntPerRead[hub] : 0;
+    for (size_t i = 1; i < ids.size(); ++i) {
+        const uint32_t id = ids[i];
+        const uint32_t cnt = (id < kmerCntPerRead.size()) ? kmerCntPerRead[id] : 0;
+        if (cnt > best) {
+            best = cnt;
+            hub = id;
+        }
+    }
+    return hub;
+}
+
 // Width of one id range in the relations_* routing scheme. The count is --partitions, not
 // --threads: the two were the same number until 2026-08-26, which is what made the result depend
 // on the thread count.
@@ -784,6 +817,10 @@ protected:
     // for a routing decision. Keeping the two apart is the point: --threads may then change
     // without changing the result, which it used to do through the support pass's cap.
     int partitionCnt;
+    // Which edge set a shared k-mer produces. Not a CLI flag: the easy-grouping command sets it,
+    // and exposing it as well would make `grouping --edge-mode 1` and `easy-grouping` two names
+    // for one thing, with two families of run tags to keep straight.
+    int edgeMode;
 
     // Agents    
     GeneticCode * geneticCode = nullptr;
@@ -844,6 +881,21 @@ protected:
     // fraction of a read the two overlap by.
     size_t totalFilteredKmers = 0;
 
+    // The same count broken down per read, indexed by global read id (1-based, so element 0 is
+    // unused). Counted over exactly the k-mers that survive the common-k-mer filter, which is the
+    // set the graph sees and the set totalFilteredKmers sums -- Sum(kmerCntPerRead) must equal it.
+    // Only the star edge mode reads this: it picks the read with the most k-mers as the hub, so
+    // the choice is a property of the data rather than of the input file's order. Four bytes per
+    // read, held for the whole run.
+    std::vector<uint32_t> kmerCntPerRead;
+
+    // Merged edge weights, in the same log2 buckets the m histogram uses. Filled by mergeGraph and
+    // read once the core threshold is known, to say where that threshold sits in the distribution
+    // it is cutting. The clique and star modes produce very different weights for the same data --
+    // star only records an edge when one of the two reads was the hub -- so this is what makes the
+    // two comparable at a glance.
+    std::vector<uint64_t> edgeWeightHist;
+
 public:
     GroupGenerator(LocalParameters & par);
 
@@ -851,9 +903,13 @@ public:
 
     void startGroupGeneration(const LocalParameters & par);
     
+    // processedReadCnt is the number of reads finished before this split, i.e. the offset that
+    // turns a split-local sequence id into the global one writeKmers later stamps into the k-mer
+    // files. Needed here because the per-read counts are accumulated globally.
     void filterCommonKmers(Buffer<Kmer>& queryKmerBuffer,
                            Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
-                           const string & db="");
+                           const string & db="",
+                           size_t processedReadCnt=0);
 
     void writeKmers(Buffer<Kmer>& queryKmerBuffer,
                     size_t processedReadCnt);
@@ -972,7 +1028,8 @@ public:
     void mergeUnit(size_t route, size_t shard, const std::string& outPath,
                    const std::vector<std::string>& files,
                    size_t bufElems, size_t maxFanIn,
-                   size_t& mergedOut, size_t& ceilingOut);
+                   size_t& mergedOut, size_t& ceilingOut,
+                   std::vector<uint64_t>& weightHistOut);
 
     // --- Incremental fold ---------------------------------------------------------------
     // Unit numbering lives in emitUnitCount/emitUnitIndex, above. There used to be a second

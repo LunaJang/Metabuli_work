@@ -75,10 +75,12 @@ void setGroupGenerationDefaults(LocalParameters & par){
     par.matchPerKmer = 4; 
 }
 
-int groupGeneration(int argc, const char **argv, const Command& command)
+// Everything the two grouping commands share. They differ only in the defaults their caller set,
+// so the body lives here once rather than being copied into each entry point -- a copy would let a
+// later fix land in one of them.
+static int runGroupGeneration(int argc, const char **argv, const Command& command,
+                              LocalParameters & par)
 {
-    LocalParameters & par = LocalParameters::getLocalInstance();
-    setGroupGenerationDefaults(par);
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_ALLOW_EMPTY, 0);
     if (par.syncmer == 0) {
         par.kmerFormat = 3;
@@ -176,4 +178,29 @@ int groupGeneration(int argc, const char **argv, const Command& command)
     groupGenerator->startGroupGeneration(par);
     delete groupGenerator;
     return 0;
+}
+
+int groupGeneration(int argc, const char **argv, const Command& command)
+{
+    LocalParameters & par = LocalParameters::getLocalInstance();
+    setGroupGenerationDefaults(par);
+    return runGroupGeneration(argc, argv, command, par);
+}
+
+// The fast, light variant. Only the edge set differs: one shared k-mer produces a hub and its
+// m-1 spokes instead of all C(m,2) pairs, so the edge volume is linear in m rather than quadratic.
+// Every other default is grouping's, on purpose -- the cap included. --max-kmer-quantile matters
+// less once the quadratic term is gone, but it also raises purity (CAMI2 strain-madness: 0.531
+// uncapped against 0.663 at 0.995), and a different value here would add a second variable to
+// every comparison between the two commands.
+void setEasyGroupGenerationDefaults(LocalParameters & par){
+    setGroupGenerationDefaults(par);
+    par.edgeMode = 1; // EdgeMode::EDGE_MODE_STAR
+}
+
+int easyGroupGeneration(int argc, const char **argv, const Command& command)
+{
+    LocalParameters & par = LocalParameters::getLocalInstance();
+    setEasyGroupGenerationDefaults(par);
+    return runGroupGeneration(argc, argv, command, par);
 }

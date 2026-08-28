@@ -82,6 +82,7 @@ GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     // Clamped to at least 1: routeOf takes id1 % partitionCnt, and --threads is itself >= 1.
     partitionCnt = (par.partitions > 0) ? par.partitions : par.threads;
     if (partitionCnt < 1) { partitionCnt = 1; }
+    edgeMode = par.edgeMode;
 
     geneticCode = new GeneticCode(par.reducedAA == 1);
     queryIndexer = new QueryIndexer(par);
@@ -154,7 +155,7 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
                                              kseq1,
                                              kseq2);
 
-            filterCommonKmers(queryKmerBuffer, matchBuffer, commonKmerDB);
+            filterCommonKmers(queryKmerBuffer, matchBuffer, commonKmerDB, processedReadCnt);
             time_t t = time(nullptr);
             writeKmers(queryKmerBuffer, processedReadCnt);
             cout << "Writing query k-mer file: " << double(time(nullptr) - t) << " s" << endl;
@@ -221,6 +222,38 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
         cout << "Weak band: (" << weakThr << ", " << coreThr << "] (ratio "
              << par.weakBandRatio << " x core " << coreThr << "); Phase 3 floor "
              << weakThr << endl;
+
+        // Where that threshold falls in the weights it is cutting. The rule is unchanged for the
+        // star edge mode on purpose: a star weight is not the number of k-mers two reads share --
+        // an edge exists only where one of the two was the hub -- so ratio x k-mers-per-read means
+        // something different there. Correcting the formula would make the correction itself the
+        // thing under test and blur the only comparison that decides whether the mode is worth
+        // having, which is the two modes' purity-recall curves. --min-overlap-ratio absorbs the
+        // shift instead; this line is how far it has to travel.
+        {
+            uint64_t weightTotal = 0;
+            uint64_t belowCore = 0;
+            uint64_t inBand = 0;
+            for (size_t b = 0; b < edgeWeightHist.size(); ++b) {
+                const uint64_t n = edgeWeightHist[b];
+                if (n == 0) { continue; }
+                weightTotal += n;
+                // Bucket b covers [2^b, 2^(b+1)); classify it by its lower bound, which is exact
+                // for the powers of two and off by less than one bucket elsewhere.
+                const size_t lo = (size_t(1) << b);
+                if (lo < static_cast<size_t>(coreThr)) {
+                    belowCore += n;
+                    if (lo > static_cast<size_t>(weakThr)) { inBand += n; }
+                }
+            }
+            cout << "[edges] weight distribution: " << weightTotal << " edges, "
+                 << (weightTotal ? 100.0 * static_cast<double>(belowCore)
+                                       / static_cast<double>(weightTotal) : 0.0)
+                 << "% below the core threshold, "
+                 << (weightTotal ? 100.0 * static_cast<double>(inBand)
+                                       / static_cast<double>(weightTotal) : 0.0)
+                 << "% in the weak band" << endl;
+        }
         if (requestedWeakThr >= coreThr) {
             cout << "[WARN] --weak-band-ratio " << par.weakBandRatio << " puts the bound at "
                  << requestedWeakThr << ", at or above the core threshold " << coreThr
@@ -257,7 +290,8 @@ void GroupGenerator::startGroupGeneration(const LocalParameters &par) {
 
 void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
                                        Buffer<std::pair<uint32_t, uint32_t>> & matchBuffer,
-                                       const string & commonKmerDB) {
+                                       const string & commonKmerDB,
+                                       size_t processedReadCnt) {
     string gtdbListDB;
     std::string diffIdxFileName = commonKmerDB +"/diffIdx";
     std::string diffIdxSplitFileName = commonKmerDB + "/split";
@@ -426,6 +460,22 @@ void GroupGenerator::filterCommonKmers(Buffer<Kmer> & qKmers,
     }
     qKmers.startIndexOfReserve = size_t(storePos);
     cout << double(time(nullptr) - here) << " s" << endl;
+
+    // Per-read counts over the k-mers that just survived, before the sort below reorders them.
+    // The copy loop preserved the <sequenceID, pos> order, so the last kept entry carries the
+    // largest id in this split and one resize covers the whole range. Split-local ids become
+    // global by adding processedReadCnt, the same offset writeKmers stamps into the files.
+    if (storePos > blankCnt) {
+        const size_t maxGlobalId =
+            static_cast<size_t>(qKmers.buffer[storePos - 1].qInfo.sequenceID) + processedReadCnt;
+        if (kmerCntPerRead.size() <= maxGlobalId) {
+            kmerCntPerRead.resize(maxGlobalId + 1, 0);
+        }
+        for (size_t i = blankCnt; i < storePos; ++i) {
+            kmerCntPerRead[static_cast<size_t>(qKmers.buffer[i].qInfo.sequenceID)
+                           + processedReadCnt]++;
+        }
+    }
     
     // sort buffer by kmer
     time_t secondSort = time(nullptr);
@@ -557,6 +607,27 @@ void GroupGenerator::scanMHistogram(size_t processedReadCnt,
 void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
+
+    // The per-read counts have to add up to the total the same filter reported, or the split
+    // offset is wrong and every hub choice built on them is wrong with it. Cheap to check and
+    // impossible to notice otherwise -- a mis-offset array still produces a plausible graph.
+    {
+        uint64_t perReadSum = 0;
+        for (size_t i = 0; i < kmerCntPerRead.size(); ++i) {
+            perReadSum += kmerCntPerRead[i];
+        }
+        cout << "[kmers] per-read counts: " << perReadSum << " summed over "
+             << (kmerCntPerRead.empty() ? 0 : kmerCntPerRead.size() - 1) << " reads, "
+             << totalFilteredKmers << " filtered in total ("
+             << (perReadSum == totalFilteredKmers ? "match" : "MISMATCH") << "), "
+             << humanBytes(kmerCntPerRead.size() * sizeof(uint32_t)) << " held" << endl;
+        if (perReadSum != totalFilteredKmers) {
+            cerr << "Error: per-read k-mer counts do not sum to the filtered k-mer total." << endl;
+            cerr << "       The star edge mode picks its hub from these counts, so a wrong sum" << endl;
+            cerr << "       means a wrong graph rather than a wrong log line." << endl;
+            exit(EXIT_FAILURE);
+        }
+    }
 
     // Shared across threads, not per thread: see getRelationBudget. Each thread still keeps its
     // own map -- concurrent writes to one map would need a lock on the hot path -- but the
@@ -797,11 +868,16 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // are fewer, because pair2weight collapses a pair seen across several k-mers into one
     // entry. emittedEdgeCnt / keptPairSum is that collapse factor, measured on this run.
     uint64_t keptPairSum = 0;
+    // Sum of (m-1) over the same kept k-mers: what a center-star would have emitted where the
+    // clique emitted C(m,2). Counted here rather than estimated because the ratio depends on the
+    // whole m distribution, not on its mean -- one m = 255 k-mer is worth 127 m = 3 k-mers.
+    uint64_t keptStarSum = 0;
 
     // m distribution over ALL k-mers, skipped or not. The [edges] summary only reports what
     // the chosen thresholds produced; this reports what any other threshold would have.
     std::vector<uint64_t> mHistKmers(M_HIST_BUCKETS, 0);
     std::vector<uint64_t> mHistPairs(M_HIST_BUCKETS, 0);
+    std::vector<uint64_t> mHistStar(M_HIST_BUCKETS, 0);
 
     // Skip threshold, resolved once. An explicit --max-kmer-reads wins and skips the pre-pass
     // entirely; otherwise --max-kmer-quantile picks the cap from the reads-per-k-mer
@@ -900,7 +976,9 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         };
         std::vector<uint64_t> localHistKmers(M_HIST_BUCKETS, 0);
         std::vector<uint64_t> localHistPairs(M_HIST_BUCKETS, 0);
+        std::vector<uint64_t> localHistStar(M_HIST_BUCKETS, 0);
         uint64_t localKeptPairs = 0;
+        uint64_t localKeptStar = 0;
 
         uint64_t localValuesDone = 0;
 
@@ -914,6 +992,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 const size_t bucket = mHistBucket(m);
                 localHistKmers[bucket]++;
                 localHistPairs[bucket] += static_cast<uint64_t>(m) * static_cast<uint64_t>(m - 1) / 2;
+                localHistStar[bucket] += static_cast<uint64_t>(m - 1);
             }
 
             if (absThr > 0 && m > absThr) {
@@ -933,6 +1012,36 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             if (m > localMaxKeptM) { localMaxKeptM = m; }
             if (m >= 2) {
                 localKeptPairs += static_cast<uint64_t>(m) * static_cast<uint64_t>(m - 1) / 2;
+                localKeptStar += static_cast<uint64_t>(m - 1);
+            }
+            if (edgeMode == EDGE_MODE_STAR) {
+                // One hub, m-1 spokes. m < 2 leaves the hub alone with no edge to draw, which is
+                // the same thing the clique loop below does with a one-read list.
+                if (m >= 2) {
+                    const uint32_t hub = pickStarHub(currentQueryIds, kmerCntPerRead);
+                    for (size_t i = 0; i < m; ++i) {
+                        const uint32_t other = currentQueryIds[i];
+                        if (other == hub) {
+                            continue;
+                        }
+                        // The hub is chosen by k-mer count, so it is not necessarily the smaller
+                        // id. The clique path below can skip this because its list is sorted and
+                        // it walks i < j; here the pair has to be ordered explicitly or the same
+                        // pair would route to two different units and the merge would count it
+                        // twice.
+                        const uint32_t id1 = (hub < other) ? hub : other;
+                        const uint32_t id2 = (hub < other) ? other : hub;
+                        const size_t route = routeOf(id1, id2, partitionCnt, emitRangeSize);
+                        const size_t u = emitUnitIndex(
+                            route, shardOf(id1, shardsForRoute(route, partitionCnt)), partitionCnt);
+                        stage[u].push_back((static_cast<uint64_t>(id1) << 32)
+                                           | static_cast<uint64_t>(id2));
+                        if (stage[u].size() >= EMIT_STAGE_BATCH) {
+                            drainStage(u);
+                        }
+                    }
+                }
+                return; // the clique loop below is the other branch of this choice
             }
             for (size_t i = 0; i + 1 < m; ++i) {
                 const uint32_t id1 = currentQueryIds[i];
@@ -988,9 +1097,11 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             if (localMaxM > skippedMaxM) { skippedMaxM = localMaxM; }
             if (localMaxKeptM > maxKeptM) { maxKeptM = localMaxKeptM; }
             keptPairSum += localKeptPairs;
+            keptStarSum += localKeptStar;
             for (size_t b = 0; b < M_HIST_BUCKETS; ++b) {
                 mHistKmers[b] += localHistKmers[b];
                 mHistPairs[b] += localHistPairs[b];
+                mHistStar[b] += localHistStar[b];
             }
         }
     }
@@ -1069,14 +1180,32 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         // Pair occurrences over-count what actually lands on disk, because pair2weight
         // collapses a pair seen across several k-mers into one record. Measure that factor
         // on this run and apply it, so the table predicts records rather than an upper bound.
-        const double dedup = (keptPairSum > 0)
-            ? static_cast<double>(emittedEdgeCnt) / static_cast<double>(keptPairSum)
+        // Against the occurrences this run actually produced: star emitted (m-1) per k-mer, not
+        // C(m,2), so dividing by the clique sum there would report a collapse that never happened.
+        const uint64_t emittedOccurrences =
+            (edgeMode == EDGE_MODE_STAR) ? keptStarSum : keptPairSum;
+        const double dedup = (emittedOccurrences > 0)
+            ? static_cast<double>(emittedEdgeCnt) / static_cast<double>(emittedOccurrences)
             : 1.0;
 
         cout << "[mhist] reads-per-k-mer distribution (m >= 2): " << totalKmers
              << " k-mers, " << totalPairs << " pair occurrences uncapped" << endl;
         cout << "[mhist] measured collapse factor: " << emittedEdgeCnt << " records / "
-             << keptPairSum << " kept pair occurrences = " << dedup << endl;
+             << emittedOccurrences << " kept "
+             << (edgeMode == EDGE_MODE_STAR ? "star" : "pair") << " occurrences = "
+             << dedup << endl;
+
+        // What a center-star would have emitted on exactly the k-mers this run kept. The clique
+        // figure is the same sum with C(m,2) in place of (m-1), so the ratio is the volume this
+        // pipeline would trade away for the graph precision a star gives up. Measured, not
+        // estimated: it is set by the whole m distribution, and one m = 255 k-mer is worth 127
+        // m = 3 ones.
+        const double starRatio = (keptStarSum > 0)
+            ? static_cast<double>(keptPairSum) / static_cast<double>(keptStarSum)
+            : 0.0;
+        cout << "[mhist] star vs clique on kept k-mers: " << keptPairSum
+             << " clique pair occurrences / " << keptStarSum << " star (m-1) = "
+             << starRatio << "x" << endl;
         cout << "[mhist] estimates below extrapolate that factor to other caps; it was"
              << " measured only on k-mers this run kept, so expect roughly +/-20%" << endl;
         if (totalKmers > 0) {
@@ -1084,11 +1213,14 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                  << setw(14) << "k-mers"
                  << setw(18) << "pairs in range"
                  << setw(18) << "cum pairs"
+                 << setw(18) << "cum star (m-1)"
                  << setw(16) << "est. records"
                  << setw(12) << "est. disk" << endl;
             uint64_t cumPairs = 0;
+            uint64_t cumStar = 0;
             for (size_t b = 0; b <= topBucket; ++b) {
                 cumPairs += mHistPairs[b];
+                cumStar += mHistStar[b];
                 if (mHistKmers[b] == 0) { continue; }
                 const size_t lo = (size_t(1) << b);
                 const size_t hi = (size_t(1) << (b + 1)) - 1;
@@ -1097,6 +1229,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                      << setw(14) << mHistKmers[b]
                      << setw(18) << mHistPairs[b]
                      << setw(18) << cumPairs
+                     << setw(18) << cumStar
                      << setw(16) << estRecords
                      << setw(12) << humanBytes(estRecords * sizeof(Relation)) << endl;
             }
@@ -1524,9 +1657,11 @@ void GroupGenerator::reduceSubGraphFanIn(std::vector<std::string> & files, size_
 void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & outPath,
                                const std::vector<std::string> & inputFiles,
                                size_t bufElems, size_t maxFanIn,
-                               size_t & mergedOut, size_t & ceilingOut) {
+                               size_t & mergedOut, size_t & ceilingOut,
+                               std::vector<uint64_t> & weightHistOut) {
     mergedOut = 0;
     ceilingOut = 0;
+    weightHistOut.assign(M_HIST_BUCKETS, 0);
 
     std::vector<std::string> files = inputFiles;
     reduceSubGraphFanIn(files, maxFanIn, route, shard);
@@ -1569,6 +1704,7 @@ void GroupGenerator::mergeUnit(size_t route, size_t shard, const std::string & o
             }
         }
         if (totalWeight == UINT16_MAX) ceilingOut++;
+        weightHistOut[mHistBucket(totalWeight)]++;
         mergedOut++;
 
         // Zeroed in place, not via a helper's return value -- see mergeGraph_one for why.
@@ -1660,6 +1796,7 @@ void GroupGenerator::mergeGraph() {
     std::vector<size_t> unitMerged(unitCnt, 0);
     std::vector<size_t> unitCeiling(unitCnt, 0);
     std::vector<double> unitSeconds(unitCnt, 0.0);
+    std::vector<std::vector<uint64_t>> unitWeightHist(unitCnt);
 
     // schedule(dynamic): units still carry different loads even after sharding.
     #pragma omp parallel for schedule(dynamic) num_threads(concurrentMergers)
@@ -1667,7 +1804,7 @@ void GroupGenerator::mergeGraph() {
         const time_t unitStart = time(nullptr);
         mergeUnit(units[u].first, units[u].second, unitOutPath(units[u].first, units[u].second),
                   unitInputFiles(units[u].first, units[u].second),
-                  mergeBufElems, maxFanIn, unitMerged[u], unitCeiling[u]);
+                  mergeBufElems, maxFanIn, unitMerged[u], unitCeiling[u], unitWeightHist[u]);
         unitSeconds[u] = double(time(nullptr) - unitStart);
     }
 
@@ -1728,6 +1865,14 @@ void GroupGenerator::mergeGraph() {
 
     cout << "[edges] merged into " << mergedEdgeCnt << " distinct edges ("
          << humanBytes(static_cast<uint64_t>(mergedEdgeCnt) * sizeof(Relation)) << ")" << endl;
+
+    edgeWeightHist.assign(M_HIST_BUCKETS, 0);
+    for (size_t u = 0; u < unitCnt; ++u) {
+        if (unitWeightHist[u].size() != M_HIST_BUCKETS) { continue; }
+        for (size_t b = 0; b < M_HIST_BUCKETS; ++b) {
+            edgeWeightHist[b] += unitWeightHist[u][b];
+        }
+    }
 
     if (ceilingEdgeCnt > 0) {
         cout << "Warning: " << ceilingEdgeCnt << " edges reached the weight ceiling ("

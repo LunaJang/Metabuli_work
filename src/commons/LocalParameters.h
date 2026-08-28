@@ -23,6 +23,7 @@ public:
 
     std::vector<MMseqsParameter*> classify;
     std::vector<MMseqsParameter*> groupGeneration;
+    std::vector<MMseqsParameter*> easyGroupGeneration;
     std::vector<MMseqsParameter*> groupApplication;
     std::vector<MMseqsParameter*> extract;
     std::vector<MMseqsParameter*> filter;
@@ -200,6 +201,7 @@ public:
     // already the unit the read geometry gives it.
     float weakBandRatio;      // weak-band lower bound as a fraction of the core threshold
     int partitions;           // intermediate partitions; 0 = follow --threads (reproduction only)
+    int edgeMode;             // 0 = clique C(m,2), 1 = center-star. Set by the command, not a flag
     int maxKmerReads;         // explicit reads-per-k-mer cap; 0 defers to maxKmerQuantile
     float maxKmerQuantile;    // share of k-mers (m >= 2) the cap keeps; picks maxKmerReads
     float minOverlapRatio;    // core threshold as a fraction of k-mers per read

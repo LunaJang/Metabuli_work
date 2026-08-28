@@ -667,6 +667,9 @@ LocalParameters::LocalParameters() :
     minOverlapRatio = 0.3f;
     weakBandRatio = 0.3333f;
     partitions = 16;
+    // 0 = clique. Spelled as a literal rather than EdgeMode: that enum lives in the read-group
+    // module, and LocalParameters must not depend on it.
+    edgeMode = 0;
     commonKmerSpan = 0;
     maxTmpDiskMiB = 0;
 
@@ -783,6 +786,11 @@ LocalParameters::LocalParameters() :
     groupGeneration.push_back(&COMMON_KMER_SPAN);
     groupGeneration.push_back(&MAX_TMP_DISK);
     groupGeneration.push_back(&PRINT_LOG);
+
+    // easy-grouping takes exactly grouping's parameters. The edge mode is not among them: the
+    // command is what selects it, and a flag as well would make `grouping --edge-mode 1` and
+    // `easy-grouping` two names for one run with two families of result tags.
+    easyGroupGeneration = groupGeneration;
 
     //groupApplication
     groupApplication.push_back(&SEQ_MODE);
