@@ -284,7 +284,7 @@ LocalParameters::LocalParameters() :
                         "^[0-9]*\\.?[0-9]+$"),
         PARTITIONS(PARTITIONS_ID,
                         "--partitions",
-                        "Intermediate partitions for the edge graph (0=follow --threads)",
+                        "Intermediate partitions for the edge graph (0=follow --threads, for reproducing old runs)",
                         "How many partitions the edge graph is split into on disk. The routing rule "
                         "sends an edge to one of 2*partitions+1 buckets by (id1, id2), and the "
                         "cross bucket -- which carries about 88% of all edges -- is sharded that "
@@ -295,7 +295,11 @@ LocalParameters::LocalParameters() :
                         "instead of 18,672 and the run took 8h 08m instead of 3h 40m. Separating "
                         "the two lets --threads decide only how many workers run at once. Partition "
                         "count does change the result, because it changes how edges are grouped for "
-                        "the support pass; thread count no longer does.",
+                        "the support pass; thread count no longer does. The default is 16, which is "
+                        "what the published measurements used. 0 restores the old behaviour of "
+                        "following --threads and exists only to reproduce runs made before this "
+                        "parameter did -- it reintroduces the dependency described above, so do not "
+                        "use it for new work.",
                         typeid(int),
                         (void *) &partitions,
                         "^[0-9]+$"),
@@ -662,7 +666,7 @@ LocalParameters::LocalParameters() :
     maxKmerQuantile = 0.0f;
     minOverlapRatio = 0.3f;
     weakBandRatio = 0.3333f;
-    partitions = 0;
+    partitions = 16;
     commonKmerSpan = 0;
     maxTmpDiskMiB = 0;
 

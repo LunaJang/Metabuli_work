@@ -12,6 +12,7 @@
 #include <cassert>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <sys/sysinfo.h>
 #include <sys/resource.h>
 #include <sys/statvfs.h>
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <algorithm>
 #include <zstd.h>
 #include "IndexCreator.h"
@@ -519,6 +521,22 @@ inline size_t getRelationBudget(int maxRamGiB) {
     const size_t MIN_THRESHOLD = 1'000'000;
     const size_t MAX_THRESHOLD = 200'000'000;
     return std::max(MIN_THRESHOLD, std::min(budget, MAX_THRESHOLD));
+}
+
+// Flush rounds that may be harvested but not yet written at the same time.
+//
+// A round's harvest empties the unit buffers, so the budget is honoured the moment it runs -- but
+// the harvested data stays in memory until the write finishes. Capping how many rounds may sit in
+// that state is what keeps the peak bounded: it is at most (this + 1) * getRelationBudget entries,
+// which at the 200 M clamp and 48 B per entry is 28.8 GB for the value below.
+//
+// A constant, deliberately not derived from --threads. Deriving it would put the peak back on the
+// worker count, which is the dependency the 2026-08-27 and 2026-08-28 work exists to remove: the
+// same input would then need a bigger machine on a bigger node. Two lets one round be written
+// while the next fills, which is the whole overlap there is to win; a third would buy nothing
+// because the harvest is serialised anyway.
+inline size_t concurrentFlushRounds() {
+    return 2;
 }
 
 // Width of one id range in the relations_* routing scheme. The count is --partitions, not

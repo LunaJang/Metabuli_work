@@ -33,10 +33,13 @@ void setGroupGenerationDefaults(LocalParameters & par){
     // strain-madness (core 33) but 0.38 on species-exclusion (core 26), and on strain-madness the
     // difference between a bound of 11 and 10 is species purity 0.932 against 0.763.
     par.weakBandRatio = 0.3333f;
-    // Intermediate partitions. 0 follows --threads, which is what every run before this parameter
-    // existed did; 16 is the value the published numbers were produced at. Kept at 0 until the
-    // route-loop and cap work below it is verified, so this build reproduces those runs exactly.
-    par.partitions = 0;
+    // Intermediate partitions. 16 is the value the published numbers were produced at, and it is
+    // a constant on purpose: 0 makes the routing follow --threads, so the same input on a machine
+    // with a different core count would be split differently and the file and flush counts would
+    // move with it. 0 is kept for reproducing runs made before this parameter existed and is not
+    // a default any more. This function overrides LocalParameters' own initialisation, so both
+    // places have to agree.
+    par.partitions = 16;
     // Phase 2 support as a fraction of the smaller unit's read count. 0 keeps the pre-ratio
     // behaviour (count weak edges, floor 2), which is the measured operating point; the ratio is
     // opt-in until a value is measured on marine. Sweeping the old absolute support over 2/3 was

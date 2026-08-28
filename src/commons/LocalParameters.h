@@ -199,7 +199,7 @@ public:
     // exception and the exception is deliberate: it counts k-mer positions on a read, which is
     // already the unit the read geometry gives it.
     float weakBandRatio;      // weak-band lower bound as a fraction of the core threshold
-    int partitions;           // intermediate partitions; 0 = follow --threads
+    int partitions;           // intermediate partitions; 0 = follow --threads (reproduction only)
     int maxKmerReads;         // explicit reads-per-k-mer cap; 0 defers to maxKmerQuantile
     float maxKmerQuantile;    // share of k-mers (m >= 2) the cap keeps; picks maxKmerReads
     float minOverlapRatio;    // core threshold as a fraction of k-mers per read

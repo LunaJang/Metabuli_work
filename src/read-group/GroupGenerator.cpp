@@ -590,9 +590,33 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             emitUnitKey[emitUnitIndex(route, shard, partitionCnt)] = {route, shard};
         }
     }
-    // Serialises flush rounds. try_lock, not lock: a thread that finds a round already running
-    // carries on filling buffers instead of waiting, and its data goes out in the next round.
+    // Serialises the harvest half of a flush round. Blocking, not try_lock: a thread that found a
+    // round already running used to return and keep inserting, so the buffers grew past
+    // RELATION_BUDGET for as long as the round took to write. Measured on CAMI2 strain-madness at
+    // --partitions 16, the worst round carried 2.3x the budget at 4 threads, 5.0x at 16 and 38.6x
+    // at 64 -- 7,721,398,786 pairs, which is 370 GB at this budget's own 48 B per entry against a
+    // --max-ram of 128 GiB. The overrun grew with the worker count because that is how many
+    // threads were racing past the closed door.
     std::mutex emitFlushMutex;
+    // Rounds that had to wait for the harvest lock, and how long in total. This is the cost the
+    // blocking lock adds; it is bounded by the harvest being emitUnitCnt pointer swaps.
+    std::atomic<uint64_t> flushHarvestWaits(0);
+    std::atomic<uint64_t> flushHarvestWaitMillis(0);
+    // Time inside saveSubGraphToFile, summed over rounds and at its worst for one round. Rounds
+    // overlap now, so the total can exceed the wall clock.
+    std::atomic<uint64_t> flushWriteMillisTotal(0);
+    std::atomic<uint64_t> flushWriteMillisMax(0);
+
+    // Rounds harvested but not yet written. The harvest empties the buffers, so the budget is
+    // honoured as soon as it runs -- but that data is still resident until the write finishes.
+    // Without a cap the peak would again be bounded only by how fast the disk keeps up, which is
+    // the same unbounded growth entered from the other side.
+    const size_t maxFlushRoundsInFlight = concurrentFlushRounds();
+    std::mutex flushInFlightMutex;
+    std::condition_variable flushInFlightCv;
+    size_t flushRoundsInFlight = 0;
+    std::atomic<uint64_t> flushInFlightWaits(0);
+    std::atomic<uint64_t> flushInFlightWaitMillis(0);
     // Contention on the per-unit locks, in the only terms that matter here -- how often a
     // thread had to wait at all. Reported so a configuration with few units (--partitions 1
     // gives three) shows the cost instead of hiding it.
@@ -637,44 +661,136 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // largest m that survived the skip -- that m sets the per-k-mer worst case.
     size_t emittedEdgeCnt = 0; // Relation records written to subGraph_*
     size_t maxKeptM = 0;       // largest reads-per-k-mer that was NOT skipped
-    // Pairs carried by each flush. The flush budget is shared across threads but the flush
-    // itself empties one thread's map, so what a flush actually writes is roughly the budget
-    // divided by the thread count -- and that, not the budget, is what sets the file size the
-    // merge then has to work through. Reported as a distribution because the mean hides the
-    // final partial flushes.
+    // Pairs carried by each flush. A round empties every unit at once, so this is what one
+    // subGraph_* generation holds and what the merge then has to work through. Reported as a
+    // distribution because the mean hides the final partial rounds.
     std::vector<size_t> flushPairCounts;
+    // Guards the two counters above. They used to be covered by emitFlushMutex, which is no
+    // longer held while a round is written -- rounds now overlap, so they need a lock of their
+    // own. Taken once per round, off the hot path.
+    std::mutex emitStatsMutex;
 
-    // Move every unit's map out under its own lock, then write the whole set under one flush
-    // index. Writing happens outside the unit locks, so threads resume inserting immediately.
-    auto flushEmitUnits = [&]() {
-        if (!emitFlushMutex.try_lock()) {
-            return; // another thread is already flushing; nothing here is lost
+    // A round has two halves with very different costs. Harvesting is a swap per unit and is
+    // over in microseconds; writing is the whole round's data through zstd and is not. Only the
+    // harvest is serialised: it decides which pairs belong to which flush index, and two threads
+    // interleaving there would split a unit across indices. The write is left outside, so a
+    // round in progress does not stop the next one from being harvested.
+    //
+    // Concurrent writes are safe because each round owns a distinct counter index and every file
+    // name carries it (subGraphName(counter, route, shard)), so no two rounds touch the same
+    // file. saveSubGraphToFile keeps its own state under subGraphSizeMutex and marks the index
+    // complete only after the last file is closed, which is what emitWatermark walks -- a fold
+    // can therefore never list a file that is still being written.
+    //
+    // Releases an in-flight slot however the round leaves. saveSubGraphToFile is fatal on error
+    // rather than throwing, but a slot leaked on any path would stall every other thread, so the
+    // release is not left to the control flow.
+    struct FlushSlot {
+        std::mutex & mutex;
+        std::condition_variable & cv;
+        size_t & count;
+        ~FlushSlot() {
+            {
+                const std::lock_guard<std::mutex> guard(mutex);
+                --count;
+            }
+            cv.notify_one();
         }
-        const std::lock_guard<std::mutex> flushGuard(emitFlushMutex, std::adopt_lock);
+    };
+
+    // `force` distinguishes the last round, after the parallel region joins, from the rounds the
+    // budget triggers. A budget-triggered round is pointless once another thread has already
+    // taken the buffers below the budget, and skipping it is what keeps the round count off the
+    // thread count: without the re-check below, every thread that crossed the threshold queues on
+    // the harvest lock and each spends a flush index on the crumbs the one before it left. On the
+    // 20x fixture at --max-ram 1 that was 2 / 3 / 4 / 8 rounds for 1 / 4 / 16 / 64 threads --
+    // exactly the dependency the unit buffers were introduced to remove.
+    auto flushEmitUnits = [&](const bool force) {
+        // Reserve a slot before touching emitFlushMutex. Waiting with the harvest lock held would
+        // stop every other thread from harvesting as well, which is the stall this cap exists to
+        // bound rather than to create.
+        {
+            std::unique_lock<std::mutex> inFlightGuard(flushInFlightMutex);
+            if (flushRoundsInFlight >= maxFlushRoundsInFlight) {
+                const std::chrono::steady_clock::time_point waitStart =
+                    std::chrono::steady_clock::now();
+                flushInFlightWaits.fetch_add(1, std::memory_order_relaxed);
+                flushInFlightCv.wait(inFlightGuard, [&]() {
+                    return flushRoundsInFlight < maxFlushRoundsInFlight;
+                });
+                flushInFlightWaitMillis.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - waitStart).count()),
+                    std::memory_order_relaxed);
+            }
+            ++flushRoundsInFlight;
+        }
+        const FlushSlot slot{flushInFlightMutex, flushInFlightCv, flushRoundsInFlight};
 
         std::vector<std::unordered_map<uint64_t, uint16_t>> taken(emitUnitCnt);
         size_t movedPairs = 0;
-        for (size_t u = 0; u < emitUnitCnt; ++u) {
-            const std::lock_guard<std::mutex> unitGuard(emitUnits[u]->lock);
-            taken[u].swap(emitUnits[u]->pairs);
-            movedPairs += taken[u].size();
+        size_t counter_now = 0;
+        {
+            // The harvest, and nothing else. Held for emitUnitCnt pointer swaps. Blocking: a
+            // thread that gives up here goes back to inserting into buffers already at the
+            // budget, which is exactly the overrun this replaces.
+            std::unique_lock<std::mutex> flushGuard(emitFlushMutex, std::try_to_lock);
+            if (!flushGuard.owns_lock()) {
+                const std::chrono::steady_clock::time_point waitStart =
+                    std::chrono::steady_clock::now();
+                flushHarvestWaits.fetch_add(1, std::memory_order_relaxed);
+                flushGuard.lock();
+                flushHarvestWaitMillis.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - waitStart).count()),
+                    std::memory_order_relaxed);
+            }
+            // Whoever held the lock may have emptied the buffers already.
+            if (!force
+                && bufferedPairs.load(std::memory_order_relaxed) < RELATION_BUDGET) {
+                return;
+            }
+            for (size_t u = 0; u < emitUnitCnt; ++u) {
+                const std::lock_guard<std::mutex> unitGuard(emitUnits[u]->lock);
+                taken[u].swap(emitUnits[u]->pairs);
+                movedPairs += taken[u].size();
+            }
+            if (movedPairs == 0) {
+                return; // do not spend a flush index on a round that would write only empty files
+            }
+            // Subtracted here rather than after the write, so a thread testing the budget while
+            // this round is still being written sees the buffers as the emptied ones they are.
+            bufferedPairs.fetch_sub(movedPairs, std::memory_order_relaxed);
+            counter_now = static_cast<size_t>(counter.fetch_add(1, std::memory_order_relaxed));
         }
-        if (movedPairs == 0) {
-            return; // do not spend a flush index on a round that would write only empty files
-        }
-        bufferedPairs.fetch_sub(movedPairs, std::memory_order_relaxed);
 
-        const size_t counter_now =
-            static_cast<size_t>(counter.fetch_add(1, std::memory_order_relaxed));
+        // Milliseconds, not the project's usual time(nullptr) seconds: a round on the fixture is
+        // under a second, and this is the half of a round that the harvest no longer waits on.
+        const std::chrono::steady_clock::time_point writeStart = std::chrono::steady_clock::now();
         saveSubGraphToFile(taken, emitUnitKey, counter_now);
+        const uint64_t writeMillis = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - writeStart).count());
+        flushWriteMillisTotal.fetch_add(writeMillis, std::memory_order_relaxed);
+        // Compare-exchange rather than a plain store: another round may finish while this one is
+        // reading, and the maximum has to survive that.
+        uint64_t prevMax = flushWriteMillisMax.load(std::memory_order_relaxed);
+        while (prevMax < writeMillis
+               && !flushWriteMillisMax.compare_exchange_weak(prevMax, writeMillis,
+                                                             std::memory_order_relaxed)) {
+        }
 
-        // Both are read only after the parallel region joins, and every write here is under
-        // emitFlushMutex, so no further synchronisation is needed.
-        emittedEdgeCnt += movedPairs;
-        flushPairCounts.push_back(movedPairs);
+        // Read only after the parallel region joins, but written here by rounds that now overlap.
+        {
+            const std::lock_guard<std::mutex> statsGuard(emitStatsMutex);
+            emittedEdgeCnt += movedPairs;
+            flushPairCounts.push_back(movedPairs);
+        }
 
         checkDiskHeadroom();
-        // Fold what is already complete instead of letting the whole emit pile up.
+        // Fold what is already complete instead of letting the whole emit pile up. Safe to call
+        // with other rounds in flight: it folds only [foldedUpTo, emitWatermark), and
+        // emitWatermark is the contiguous prefix of indices saveSubGraphToFile has finished.
         maybeFoldEmitted(tmpDiskBudget, foldFanIn);
     };
     // Sum of C(m,2) over kept k-mers = pair OCCURRENCES the clique produced. Records written
@@ -851,7 +967,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 localValuesDone = 0;
                 // No barrier: one thread writes the round while the others keep filling the
                 // now-empty buffers, and their data goes out in the next one.
-                flushEmitUnits();
+                flushEmitUnits(false);
             }
         });
 
@@ -881,7 +997,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // Final round. Every thread drained its staging before exiting, so whatever is left in the
     // unit buffers is the tail below the budget -- one more round writes it out. try_lock inside
     // flushEmitUnits cannot fail here: the parallel region has joined.
-    flushEmitUnits();
+    flushEmitUnits(true);
 
     this->numOfGraph = counter.load(std::memory_order_relaxed);
 
@@ -1037,6 +1153,31 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << ", max " << flushStats.max
              << " (budget " << RELATION_BUDGET << " shared across " << par.threads
              << " threads)" << endl;
+
+        // What the budget actually bought. A ratio above 1 means rounds carried more than the
+        // budget allows, and the excess is held in memory at RELATION_BUDGET's own 48 bytes per
+        // entry -- so this ratio times --max-ram is what the run really asked the machine for.
+        // Flat across --threads is the property that makes the tool portable; anything else means
+        // the overrun tracks the worker count and the same input needs a bigger machine on a
+        // bigger node.
+        const double budgetRatio = RELATION_BUDGET > 0
+            ? static_cast<double>(flushStats.max) / static_cast<double>(RELATION_BUDGET)
+            : 0.0;
+        cout << "[edges] flush budget: max/budget " << fixed << setprecision(3) << budgetRatio
+             << "x over " << flushPairCounts.size() << " rounds, in-flight cap "
+             << maxFlushRoundsInFlight << endl;
+
+        // What enforcing the budget costs. Harvest waits are threads queued behind a swap loop;
+        // cap waits are threads held back because two rounds were already unwritten. The second
+        // is the one that trades wall time for a bounded peak, so it is reported separately.
+        cout << "[edges] flush waits: harvest " << flushHarvestWaits.load(std::memory_order_relaxed)
+             << " (" << flushHarvestWaitMillis.load(std::memory_order_relaxed) << " ms), cap "
+             << flushInFlightWaits.load(std::memory_order_relaxed)
+             << " (" << flushInFlightWaitMillis.load(std::memory_order_relaxed) << " ms)" << endl;
+
+        cout << "[edges] flush write: " << flushWriteMillisTotal.load(std::memory_order_relaxed)
+             << " ms total, " << flushWriteMillisMax.load(std::memory_order_relaxed)
+             << " ms worst round" << endl;
 
         OrderStats fileStats{0, 0, 0};
         size_t fileCnt = 0;
