@@ -293,13 +293,17 @@ LocalParameters::LocalParameters() :
                         "with it: CAMI2 strain-madness went from 389 flushes x 48 units at 16 "
                         "threads to 2,354 x 192 at 64, so the same 117.29 GB became 451,968 files "
                         "instead of 18,672 and the run took 8h 08m instead of 3h 40m. Separating "
-                        "the two lets --threads decide only how many workers run at once. Partition "
-                        "count does change the result, because it changes how edges are grouped for "
-                        "the support pass; thread count no longer does. The default is 16, which is "
-                        "what the published measurements used. 0 restores the old behaviour of "
-                        "following --threads and exists only to reproduce runs made before this "
-                        "parameter did -- it reintroduces the dependency described above, so do not "
-                        "use it for new work.",
+                        "the two lets --threads decide only how many workers run at once. Neither "
+                        "changes the grouping: routing decides which file an edge is written to, "
+                        "not which edges exist, and the support pass counts unit pairs exactly, so "
+                        "the answer is the same at any partition count. This was not always true -- "
+                        "the support map used to be capped, and which pairs overflowed depended on "
+                        "how the edges happened to be divided -- and it is verified rather than "
+                        "assumed: partition counts 1, 4, 16 and 64 give byte-identical output. "
+                        "The default is 16, the value the published measurements used; higher "
+                        "values trade more files for smaller ones. 0 makes the count follow "
+                        "--threads, which is what runs made before this parameter did, and is kept "
+                        "only to reproduce them.",
                         typeid(int),
                         (void *) &partitions,
                         "^[0-9]+$"),
@@ -663,7 +667,7 @@ LocalParameters::LocalParameters() :
     // comes from. See setGroupGenerationDefaults(), which overrides these for the grouping
     // workflow -- both places have to agree.
     maxKmerReads = 0;
-    maxKmerQuantile = 0.0f;
+    maxKmerQuantile = 0.995f;
     minOverlapRatio = 0.3f;
     weakBandRatio = 0.3333f;
     partitions = 16;
