@@ -859,6 +859,24 @@ protected:
     size_t foldRounds = 0;
     std::vector<std::vector<std::string>> foldedOutputs; // [unit] -> folded file names
 
+    // Where a flush round's time goes, split three ways, summed over every round in microseconds.
+    // The round total is already reported; this says whether it is the sort, the map-to-vector
+    // build, or zstd that owns it, which is what decides whether parallelising the unit loop is
+    // worth doing and what its ceiling is. Rounds overlap, so these sums can exceed the wall clock.
+    std::atomic<uint64_t> emitBuildMicros{0};
+    std::atomic<uint64_t> emitSortMicros{0};
+    std::atomic<uint64_t> emitWriteMicros{0};
+
+    // How lopsided a round is. Splitting the unit loop across workers cannot go faster than its
+    // largest unit, so the largest unit's share of a round is the speed-up ceiling: a round whose
+    // biggest unit holds 1/x of the records can at best be x times faster. Summed over rounds so
+    // the ratio of the two gives the average share; the worst single round is tracked separately
+    // in hundred-thousandths -- coarser scaling truncates the worst round below the average,
+    // which reads as a contradiction.
+    std::atomic<uint64_t> emitMaxUnitRecords{0};
+    std::atomic<uint64_t> emitRoundRecords{0};
+    std::atomic<uint64_t> emitWorstShareScaled{0};
+
     // Live footprint of subGraph_* and its high-water mark. Signed because a fold subtracts its
     // inputs before adding its output.
     std::atomic<int64_t> subGraphLiveBytes{0};

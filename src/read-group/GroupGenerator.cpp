@@ -1312,6 +1312,28 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << " ms total, " << flushWriteMillisMax.load(std::memory_order_relaxed)
              << " ms worst round" << endl;
 
+        // The same time, split by what spends it. Whichever of the three dominates is the one a
+        // parallel unit loop would actually shorten.
+        const uint64_t buildMs = emitBuildMicros.load(std::memory_order_relaxed) / 1000;
+        const uint64_t sortMs = emitSortMicros.load(std::memory_order_relaxed) / 1000;
+        const uint64_t writeMs = emitWriteMicros.load(std::memory_order_relaxed) / 1000;
+        cout << "[edges] flush write split: build " << buildMs << " ms, sort " << sortMs
+             << " ms, compress+io " << writeMs << " ms" << endl;
+
+        // The ceiling on splitting the unit loop across workers: a round is never finished before
+        // its largest unit is, so the largest unit's share of a round bounds the speed-up at
+        // 1/share whatever the worker count.
+        const uint64_t maxUnitRec = emitMaxUnitRecords.load(std::memory_order_relaxed);
+        const uint64_t roundRec = emitRoundRecords.load(std::memory_order_relaxed);
+        const double meanShare = roundRec ? static_cast<double>(maxUnitRec)
+                                                / static_cast<double>(roundRec) : 0.0;
+        const double worstShare =
+            static_cast<double>(emitWorstShareScaled.load(std::memory_order_relaxed)) / 100000.0;
+        cout << "[edges] unit skew: largest unit is " << fixed << setprecision(2)
+             << (100.0 * meanShare) << "% of a round on average (worst " << (100.0 * worstShare)
+             << "%), so a parallel unit loop caps at "
+             << (meanShare > 0.0 ? 1.0 / meanShare : 0.0) << "x" << endl;
+
         OrderStats fileStats{0, 0, 0};
         size_t fileCnt = 0;
         {
@@ -1366,7 +1388,19 @@ void GroupGenerator::saveSubGraphToFile(
     std::vector<uint64_t> flushFileBytes;
     flushFileBytes.reserve(units.size());
 
+    // Per-round, so the three sums below and the skew are recorded once per round rather than once
+    // per unit. Microseconds, not milliseconds: a unit on the regression fixture finishes well
+    // under a millisecond and would round to nothing.
+    uint64_t buildMicros = 0, sortMicros = 0, writeMicros = 0;
+    uint64_t roundRecords = 0, maxUnitRecords = 0;
+    const auto microsSince = [](const std::chrono::steady_clock::time_point & from) -> uint64_t {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - from).count());
+    };
+
     for (size_t u = 0; u < units.size(); ++u) {
+        const std::chrono::steady_clock::time_point buildStart =
+            std::chrono::steady_clock::now();
         std::vector<Relation> relations;
         relations.reserve(units[u].size());
         for (const auto & entry : units[u]) {
@@ -1375,7 +1409,14 @@ void GroupGenerator::saveSubGraphToFile(
                                              static_cast<uint32_t>(pairKey & 0xFFFFFFFF),
                                              entry.second));
         }
+        buildMicros += microsSince(buildStart);
+
+        const std::chrono::steady_clock::time_point sortStart = std::chrono::steady_clock::now();
         sort(relations.begin(), relations.end(), Relation::compare);
+        sortMicros += microsSince(sortStart);
+
+        roundRecords += relations.size();
+        if (relations.size() > maxUnitRecords) { maxUnitRecords = relations.size(); }
 
         // Empty units still get an empty file: the merge's input list is then simply
         // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
@@ -1383,13 +1424,29 @@ void GroupGenerator::saveSubGraphToFile(
                                                      unitKey[u].second);
         // A failed write used to be reported and skipped. It is fatal now: the merge would
         // otherwise read a file that is missing or short and produce a silently wrong graph.
+        const std::chrono::steady_clock::time_point writeStart = std::chrono::steady_clock::now();
         RelationWriter out(subGraphFileName);
         for (size_t i = 0; i < relations.size(); ++i) {
             out.write(relations[i]);
         }
         out.finish();
+        writeMicros += microsSince(writeStart);
         compressedBytes += out.compressedBytes();
         flushFileBytes.push_back(out.compressedBytes());
+    }
+
+    emitBuildMicros.fetch_add(buildMicros, std::memory_order_relaxed);
+    emitSortMicros.fetch_add(sortMicros, std::memory_order_relaxed);
+    emitWriteMicros.fetch_add(writeMicros, std::memory_order_relaxed);
+    emitMaxUnitRecords.fetch_add(maxUnitRecords, std::memory_order_relaxed);
+    emitRoundRecords.fetch_add(roundRecords, std::memory_order_relaxed);
+    if (roundRecords > 0) {
+        const uint64_t shareScaled = (maxUnitRecords * 100000) / roundRecords;
+        uint64_t worst = emitWorstShareScaled.load(std::memory_order_relaxed);
+        while (worst < shareScaled
+               && !emitWorstShareScaled.compare_exchange_weak(worst, shareScaled,
+                                                              std::memory_order_relaxed)) {
+        }
     }
 
     {
