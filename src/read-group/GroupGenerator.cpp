@@ -1312,13 +1312,21 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << " ms total, " << flushWriteMillisMax.load(std::memory_order_relaxed)
              << " ms worst round" << endl;
 
-        // The same time, split by what spends it. Whichever of the three dominates is the one a
-        // parallel unit loop would actually shorten.
+        // The same time, split by what spends it. These are summed over every worker of every
+        // round, so they exceed both the line above and the wall clock once the unit loop runs in
+        // parallel -- the ratio between the three is what they are for, not their total.
         const uint64_t buildMs = emitBuildMicros.load(std::memory_order_relaxed) / 1000;
         const uint64_t sortMs = emitSortMicros.load(std::memory_order_relaxed) / 1000;
         const uint64_t writeMs = emitWriteMicros.load(std::memory_order_relaxed) / 1000;
         cout << "[edges] flush write split: build " << buildMs << " ms, sort " << sortMs
              << " ms, compress+io " << writeMs << " ms" << endl;
+
+        // What the split costs in memory. The maps of a round are already resident at 48 B per
+        // pair; these vectors are the same pairs at sizeof(Relation), held only while a worker
+        // sorts and writes one unit.
+        cout << "[edges] flush writers: " << emitWriterCnt.load(std::memory_order_relaxed)
+             << " per round, vector peak "
+             << humanBytes(emitVectorPeakBytes.load(std::memory_order_relaxed)) << endl;
 
         // The ceiling on splitting the unit loop across workers: a round is never finished before
         // its largest unit is, so the largest unit's share of a round bounds the speed-up at
@@ -1382,57 +1390,114 @@ void GroupGenerator::saveSubGraphToFile(
     // The units arrive already partitioned: routeOf/shardOf ran at insertion time, so a pair
     // reached exactly one unit and cannot appear under two. That is what still makes the
     // per-route merges independent.
-    uint64_t compressedBytes = 0;
-    // One entry per file, appended to the shared vector once at the end of the flush rather
-    // than per file, so the lock is taken once per flush instead of once per unit.
-    std::vector<uint64_t> flushFileBytes;
-    flushFileBytes.reserve(units.size());
+    // One entry per file, indexed by unit rather than appended: the units are written by several
+    // workers below and the order they finish in is not fixed, but the log has to be.
+    std::vector<uint64_t> flushFileBytes(units.size(), 0);
 
-    // Per-round, so the three sums below and the skew are recorded once per round rather than once
-    // per unit. Microseconds, not milliseconds: a unit on the regression fixture finishes well
-    // under a millisecond and would round to nothing.
-    uint64_t buildMicros = 0, sortMicros = 0, writeMicros = 0;
-    uint64_t roundRecords = 0, maxUnitRecords = 0;
+    // A unit owns its map, its sort and its file, and two units never touch the same bytes, so the
+    // loop below splits with nothing to synchronise. That the output cannot change with the split
+    // rests on three facts, in order of how easy they are to get wrong:
+    //   - a unit's file name is subGraphName(counter_now, route, shard) and no two units share one;
+    //   - a file's contents are a function of its unit's map alone. Relation::compare is a total
+    //     order on (id1, id2) and a map cannot hold the same key twice, so the sort has one answer;
+    //   - everything written outside a worker's own slots is either a sum (compressedBytes, the
+    //     three timing totals) or a maximum (the skew), both order-independent.
+    // markEmitComplete stays after the join for the same reason it was after the loop: it is what
+    // lets a fold list this index, and a fold may not see an index whose files are still open.
+    // RelationWriter failure calls relationStreamFatal, which exits the process -- dying inside a
+    // worker ends the run just as it did inside the loop, and this repository does not use
+    // exceptions, so there is nothing to propagate across the join.
+    const size_t writerCnt = subGraphWriters(units.size(), par.threads);
+    std::vector<uint64_t> wBuild(writerCnt, 0), wSort(writerCnt, 0), wWrite(writerCnt, 0);
+    std::vector<uint64_t> wRecords(writerCnt, 0), wMaxUnit(writerCnt, 0), wBytes(writerCnt, 0);
+
     const auto microsSince = [](const std::chrono::steady_clock::time_point & from) -> uint64_t {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - from).count());
     };
 
-    for (size_t u = 0; u < units.size(); ++u) {
-        const std::chrono::steady_clock::time_point buildStart =
-            std::chrono::steady_clock::now();
-        std::vector<Relation> relations;
-        relations.reserve(units[u].size());
-        for (const auto & entry : units[u]) {
-            const uint64_t pairKey = entry.first;
-            relations.push_back(makeRelation(static_cast<uint32_t>(pairKey >> 32),
-                                             static_cast<uint32_t>(pairKey & 0xFFFFFFFF),
-                                             entry.second));
+    // Strided, not blocked: adjacent units are the shards of one route and carry similar loads, so
+    // a stride spreads the heavy cross shards over every worker. Static either way, which keeps a
+    // run reproducible.
+    const auto writeUnits = [&](const size_t w) {
+        for (size_t u = w; u < units.size(); u += writerCnt) {
+            const std::chrono::steady_clock::time_point buildStart =
+                std::chrono::steady_clock::now();
+            std::vector<Relation> relations;
+            relations.reserve(units[u].size());
+            for (const auto & entry : units[u]) {
+                const uint64_t pairKey = entry.first;
+                relations.push_back(makeRelation(static_cast<uint32_t>(pairKey >> 32),
+                                                 static_cast<uint32_t>(pairKey & 0xFFFFFFFF),
+                                                 entry.second));
+            }
+            wBuild[w] += microsSince(buildStart);
+
+            const std::chrono::steady_clock::time_point sortStart =
+                std::chrono::steady_clock::now();
+            sort(relations.begin(), relations.end(), Relation::compare);
+            wSort[w] += microsSince(sortStart);
+
+            wRecords[w] += relations.size();
+            if (relations.size() > wMaxUnit[w]) { wMaxUnit[w] = relations.size(); }
+
+            // Empty units still get an empty file: the merge's input list is then simply
+            // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
+            const string subGraphFileName = subGraphName(counter_now, unitKey[u].first,
+                                                         unitKey[u].second);
+            const std::chrono::steady_clock::time_point writeStart =
+                std::chrono::steady_clock::now();
+            RelationWriter out(subGraphFileName);
+            for (size_t i = 0; i < relations.size(); ++i) {
+                out.write(relations[i]);
+            }
+            out.finish();
+            wWrite[w] += microsSince(writeStart);
+            wBytes[w] += out.compressedBytes();
+            flushFileBytes[u] = out.compressedBytes();
         }
-        buildMicros += microsSince(buildStart);
+    };
 
-        const std::chrono::steady_clock::time_point sortStart = std::chrono::steady_clock::now();
-        sort(relations.begin(), relations.end(), Relation::compare);
-        sortMicros += microsSince(sortStart);
-
-        roundRecords += relations.size();
-        if (relations.size() > maxUnitRecords) { maxUnitRecords = relations.size(); }
-
-        // Empty units still get an empty file: the merge's input list is then simply
-        // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
-        const string subGraphFileName = subGraphName(counter_now, unitKey[u].first,
-                                                     unitKey[u].second);
-        // A failed write used to be reported and skipped. It is fatal now: the merge would
-        // otherwise read a file that is missing or short and produce a silently wrong graph.
-        const std::chrono::steady_clock::time_point writeStart = std::chrono::steady_clock::now();
-        RelationWriter out(subGraphFileName);
-        for (size_t i = 0; i < relations.size(); ++i) {
-            out.write(relations[i]);
+    if (writerCnt <= 1) {
+        writeUnits(0);
+    } else {
+        // Worker 0 runs here rather than in a thread of its own: one fewer thread per round, and
+        // --threads 1 then takes exactly the serial path above.
+        std::vector<std::thread> writers;
+        writers.reserve(writerCnt - 1);
+        for (size_t w = 1; w < writerCnt; ++w) {
+            writers.emplace_back(writeUnits, w);
         }
-        out.finish();
-        writeMicros += microsSince(writeStart);
-        compressedBytes += out.compressedBytes();
-        flushFileBytes.push_back(out.compressedBytes());
+        writeUnits(0);
+        for (size_t w = 0; w < writers.size(); ++w) {
+            writers[w].join();
+        }
+    }
+
+    uint64_t compressedBytes = 0;
+    uint64_t buildMicros = 0, sortMicros = 0, writeMicros = 0;
+    uint64_t roundRecords = 0, maxUnitRecords = 0;
+    for (size_t w = 0; w < writerCnt; ++w) {
+        compressedBytes += wBytes[w];
+        buildMicros += wBuild[w];
+        sortMicros += wSort[w];
+        writeMicros += wWrite[w];
+        roundRecords += wRecords[w];
+        if (wMaxUnit[w] > maxUnitRecords) { maxUnitRecords = wMaxUnit[w]; }
+    }
+
+    // Records held as vectors at once, which is what this change adds to the peak. Each worker
+    // holds one unit at a time, so the bound is writers x the largest unit -- against the maps of
+    // the same round, already resident at 48 B per pair to this 12.
+    {
+        const uint64_t vectorBound = static_cast<uint64_t>(writerCnt) * maxUnitRecords
+                                     * sizeof(Relation);
+        uint64_t peak = emitVectorPeakBytes.load(std::memory_order_relaxed);
+        while (peak < vectorBound
+               && !emitVectorPeakBytes.compare_exchange_weak(peak, vectorBound,
+                                                             std::memory_order_relaxed)) {
+        }
+        emitWriterCnt.store(writerCnt, std::memory_order_relaxed);
     }
 
     emitBuildMicros.fetch_add(buildMicros, std::memory_order_relaxed);

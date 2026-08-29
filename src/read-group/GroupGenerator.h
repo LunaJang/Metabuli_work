@@ -572,6 +572,28 @@ inline uint32_t pickStarHub(const std::vector<uint32_t> & ids,
     return hub;
 }
 
+// Workers that write one flush round's unit files at the same time.
+//
+// The unit loop is the round's whole cost and it is embarrassingly parallel: a unit owns its map,
+// its sort and its file, and two units never touch the same bytes. Splitting it is what takes a
+// round off the critical path.
+//
+// Bounded by the thread count because that is what the user asked for -- a job given four cores by
+// its scheduler gets no more CPU by spawning sixteen writers, only more contention -- and by the
+// unit count because there is nothing for a further worker to do. No constant ceiling: the useful
+// maximum is set by how lopsided a round is, and that follows --partitions (the cross route is
+// sharded that many ways), so a literal here would be right at one partition count and wrong at
+// every other.
+//
+// Deriving this from --threads does not reintroduce the dependency that 0b44e30d and e984f9f1
+// removed. Those were about the grouping itself; this only decides who writes which file, and a
+// file's name and contents are fixed by its unit. concurrentFlushRounds() is the opposite case and
+// stays a constant: it bounds resident memory, which must not follow the core count.
+inline size_t subGraphWriters(size_t unitCnt, int threads) {
+    const size_t workers = static_cast<size_t>(threads < 1 ? 1 : threads);
+    return std::min(unitCnt < 1 ? 1 : unitCnt, workers);
+}
+
 // Width of one id range in the relations_* routing scheme. The count is --partitions, not
 // --threads: the two were the same number until 2026-08-26, which is what made the result depend
 // on the thread count.
@@ -876,6 +898,12 @@ protected:
     std::atomic<uint64_t> emitMaxUnitRecords{0};
     std::atomic<uint64_t> emitRoundRecords{0};
     std::atomic<uint64_t> emitWorstShareScaled{0};
+
+    // What parallelising the unit loop adds to the peak: each worker holds one unit's records as a
+    // vector while it sorts and writes them, so the bound is writers x the largest unit. Reported
+    // next to the round's maps, which hold the same pairs at 48 B each against this 12.
+    std::atomic<uint64_t> emitVectorPeakBytes{0};
+    std::atomic<size_t> emitWriterCnt{0};
 
     // Live footprint of subGraph_* and its high-water mark. Signed because a fold subtracts its
     // inputs before adding its output.
