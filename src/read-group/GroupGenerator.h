@@ -1119,17 +1119,16 @@ inline size_t getMergeBufferElems(size_t numOfGraph, int maxRamGiB, size_t concu
     return std::max(MERGE_BUFFER_MIN_ELEMS, std::min(perStream, MAX_ELEMS));
 }
 
-// One candidate group for one read: the strongest edge this read has into that group, and what
-// the mixture makes of that weight.
+// One candidate group for one read: the strongest edge this read has into that group.
 //
-// The raw weight is kept next to the score on purpose. The score depends on a fit that can come
-// out unusable -- a histogram with one population produces no posterior worth having -- and
-// without the weight the only way to recover would be another pass over relations_*.bin, which
-// by then have been deleted. Two bytes buy the output the right to outlive the model.
+// In-memory only. The weight, not the score, is what the pass carries: selection and eviction
+// both go by weight, and the score is a monotone function of it applied once, at write time.
+// Keeping the score out of here also keeps it out of the fixed-size table, which is the thing
+// --score-top-k has to be sized against.
 struct ScoreSlot {
     uint32_t groupId = 0;   // 0 = empty slot
     uint16_t weight = 0;    // max edge weight from the read into that group
-    uint16_t scoreQ = 0;    // P(same | weight) quantised to [0, 65535]
+    uint16_t pad = 0;       // the struct is 8 B either way; named so the padding is not a surprise
 };
 
 class GroupGenerator {

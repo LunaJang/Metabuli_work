@@ -1,6 +1,7 @@
 #include "GroupGenerator.h"
 #include "FileUtil.h"
 #include "QueryIndexer.h"
+#include "CandidateDBWriter.h"
 #include "common.h"
 #include "Kmer.h"
 #include <sys/stat.h>
@@ -2912,9 +2913,10 @@ void GroupGenerator::saveGroupScoresToFile(size_t processedReadCnt) {
          << " nats/edge over one component (floor " << MIXTURE_MIN_GAIN_NATS << ")" << endl;
     if (!scoreFit.identifiable) {
         cerr << "[score][WARN] the edge-weight distribution does not separate into two "
-             << "components; every score is written as 0." << endl;
-        cerr << "[score][WARN] the weight in each slot is still exact -- recompute the score "
-             << "from it and the histogram in groupScore.meta." << endl;
+             << "components; every idScore is written as 0." << endl;
+        cerr << "[score][WARN] the candidate list is still the right one -- only the number "
+             << "attached to each candidate is missing. Refit from the histogram in "
+             << "group_candidates.meta if a score is needed." << endl;
     } else {
         size_t half = 0;
         for (size_t w = 1; w < lut.size(); ++w) {
@@ -2931,19 +2933,33 @@ void GroupGenerator::saveGroupScoresToFile(size_t processedReadCnt) {
         }
     }
 
-    // Fill in the scores and put each read's slots in order. Both are needed.
-    //
-    // The order matters for reproducibility, not for looks. The pass fills the first free slot,
-    // so a slot's position records the order its edge happened to be read in, and that follows
-    // the thread schedule even though the set of candidates does not: a candidate survives
-    // eviction on (weight, then smaller group id), and the eviction threshold only ever rises,
-    // so the set is a function of the data. Sorting here discards the arrival order that is the
-    // only thread-dependent thing left, and puts the best candidate in slot 0 as a side effect.
-    //
-    // Scoring does not disturb the order: the LUT is monotone in the weight.
+    // Group ids are read ids, and the record field they go into is a signed 32-bit TaxID. A run
+    // with more reads than that would silently write negative ids. Stop instead -- nothing this
+    // large has been run, and a wrong id is worse than a missing file.
+    if (processedReadCnt > static_cast<size_t>(INT32_MAX)) {
+        cerr << "Error: --score cannot write " << processedReadCnt << " reads." << endl;
+        cerr << "       Group ids go into the candidate record's speciesId field, which is a"
+             << " signed 32-bit integer, and a group id is a read id." << endl;
+        return;
+    }
+
+    const string dataFileName = outDir + "/group_candidates";
+    // One writer thread. The loop below is sequential and already visits reads in ascending id,
+    // so there is nothing for more writers to overlap and the keys need no reordering.
+    CandidateDBWriter writer(dataFileName, 1, 0);
+    writer.open();
+
+    // Sort each read's slots, then emit. The sort is for reproducibility, not looks: the pass
+    // fills the first free slot, so a slot's position records the order its edge happened to be
+    // read in, and that follows the thread schedule even though the set of candidates does not.
+    // A candidate survives eviction on (weight, then smaller group id) and the eviction threshold
+    // only ever rises, so the set is a function of the data; the arrival order is the one
+    // thread-dependent thing left, and sorting discards it. Descending weight also means the LUT
+    // being monotone puts the best candidate first.
     uint64_t readsWithCandidates = 0;
     uint64_t readsAtCapacity = 0;
     uint64_t slotsUsed = 0;
+    Query query;
     for (size_t readIdx = 0; readIdx < processedReadCnt; ++readIdx) {
         ScoreSlot * const slots = scoreTable.data() + readIdx * k;
         std::sort(slots, slots + k, [](const ScoreSlot & a, const ScoreSlot & b) {
@@ -2951,45 +2967,63 @@ void GroupGenerator::saveGroupScoresToFile(size_t processedReadCnt) {
             if (a.weight != b.weight) { return a.weight > b.weight; }
             return a.groupId < b.groupId;
         });
-        size_t used = 0;
+
+        // queryLength and name stay at their defaults. Grouping does not keep either: the
+        // per-split queryList that holds them is cleared at the top of every split, and
+        // recovering them would mean reading the query files a second time. What consumes this
+        // DB reads speciesId and idScore.
+        query.queryLength = 0;
+        query.queryLength2 = 0;
+        query.name.clear();
+        query.speciesCandidates.clear();
+
         for (size_t i = 0; i < k; ++i) {
-            if (slots[i].groupId == 0) { continue; }
-            ++used;
-            const float p = lut[slots[i].weight];
-            slots[i].scoreQ = static_cast<uint16_t>(p * 65535.0f + 0.5f);
+            if (slots[i].groupId == 0) { break; } // sorted, so the empties are all behind this
+            SpeciesCandidate candidate;
+            // A group id, in the field create-candidates fills with a species. The record does
+            // not record which of the two it is holding; the file name is the only signal.
+            candidate.speciesId = static_cast<TaxID>(slots[i].groupId);
+            candidate.idScore = lut[slots[i].weight];
+            // subScore, logE, taxCnt and kmerPositions are left at their defaults. Grouping has
+            // no analogue of any of them, and writing something invented would be worse than
+            // writing nothing.
+            query.speciesCandidates.push_back(candidate);
         }
+
+        const size_t used = query.speciesCandidates.size();
         slotsUsed += used;
         if (used > 0) { ++readsWithCandidates; }
         if (used == k) { ++readsAtCapacity; }
-    }
 
-    const string scoreFileName = outDir + "/groupScore";
-    ofstream scoreFile(scoreFileName, std::ios::binary);
-    if (!scoreFile.is_open()) {
-        cerr << "Error opening file: " << scoreFileName << endl;
-        return;
+        // Every read gets a record, including one with no candidates at all. Keys stay dense and
+        // in step with groups and groupMap, so a reader can go straight to a read id instead of
+        // discovering that its absence meant "no candidates".
+        writer.writeQuery(static_cast<uint32_t>(readIdx + 1), query, 0);
     }
-    scoreFile.write(reinterpret_cast<const char *>(scoreTable.data()),
-                    static_cast<std::streamsize>(scoreTable.size() * sizeof(ScoreSlot)));
-    scoreFile.close();
+    writer.close();
 
-    const string metaFileName = outDir + "/groupScore.meta";
+    const string metaFileName = dataFileName + ".meta";
     ofstream metaFile(metaFileName);
     if (!metaFile.is_open()) {
         cerr << "Error opening file: " << metaFileName << endl;
         return;
     }
-    // Everything needed to read groupScore back and to recompute a score from the raw weights,
-    // so the binary file does not depend on this run's log surviving. Enough digits that a
-    // downstream reader can reproduce the LUT from the parameters rather than approximate it.
+    // What the candidate DB itself cannot say: which run produced it, what the score means, and
+    // enough of the fit to recompute a score without this run's log. Enough digits that a reader
+    // can reproduce the LUT from the parameters rather than approximate it.
     metaFile.precision(17);
     metaFile << "reads\t" << processedReadCnt << "\n";
-    metaFile << "slots_per_read\t" << k << "\n";
-    metaFile << "slot_bytes\t" << sizeof(ScoreSlot) << "\n";
-    metaFile << "slot_layout\tuint32 groupId, uint16 weight, uint16 scoreQ\n";
-    metaFile << "slot_order\tdescending weight, then ascending groupId; empty slots (groupId 0) last\n";
-    metaFile << "score_scale\t65535\n";
-    metaFile << "read_id_base\t1\n";
+    metaFile << "candidate_db_data\t" << dataFileName << "\n";
+    metaFile << "candidate_db_index\t" << dataFileName << ".index\n";
+    // Read ids, not create-candidates' query ids. create-candidates keys from 0; grouping keys
+    // from 1 so that this DB, groups and groupMap all name a read the same way. Two DBs over the
+    // same reads are therefore off by one against each other.
+    metaFile << "candidate_key_base\t1\n";
+    metaFile << "candidate_key_field\tspeciesId holds a group id, not a taxon\n";
+    metaFile << "candidate_score_field\tidScore holds P(same | edge weight)\n";
+    metaFile << "candidate_unset_fields\tsubScore, logE, taxCnt, kmerPositions, name, queryLength\n";
+    metaFile << "candidate_order\tdescending edge weight, then ascending group id\n";
+    metaFile << "max_candidates_per_read\t" << k << "\n";
     metaFile << "edge_mode\t" << edgeMode << "\n";
     metaFile << "partitions\t" << partitionCnt << "\n";
     metaFile << "kmers_per_read\t"
@@ -3010,7 +3044,7 @@ void GroupGenerator::saveGroupScoresToFile(size_t processedReadCnt) {
     metaFile << "mixture_fitted_edges\t" << scoreFit.fittedEdges << "\n";
     metaFile << "reads_with_candidates\t" << readsWithCandidates << "\n";
     metaFile << "reads_at_capacity\t" << readsAtCapacity << "\n";
-    metaFile << "slots_used\t" << slotsUsed << "\n";
+    metaFile << "candidates_written\t" << slotsUsed << "\n";
     metaFile << "weight_hist_linear\t" << WEIGHT_HIST_LINEAR << "\n";
     metaFile << "# weight_hist: bucket lower bound, edge count. Exact below "
              << WEIGHT_HIST_LINEAR << ", log2 above.\n";
@@ -3024,11 +3058,12 @@ void GroupGenerator::saveGroupScoresToFile(size_t processedReadCnt) {
          << " of " << processedReadCnt << endl;
     cout << "[score] reads filling every slot: " << readsAtCapacity
          << " (raise --score-top-k if this is a large share)" << endl;
-    cout << "[score] slots used: " << slotsUsed << " of " << scoreTable.size() << endl;
-    cout << "Group scores saved to " << scoreFileName << " ("
-         << humanBytes(static_cast<uint64_t>(scoreTable.size()) * sizeof(ScoreSlot))
+    cout << "[score] candidates written: " << slotsUsed << " over " << processedReadCnt
+         << " records" << endl;
+    cout << "Group candidates saved to " << dataFileName << " ("
+         << humanBytes(static_cast<uint64_t>(FileUtil::getFileSize(dataFileName)))
          << ") successfully." << endl;
-    cout << "Group score metadata saved to " << metaFileName << " successfully." << endl;
+    cout << "Group candidate metadata saved to " << metaFileName << " successfully." << endl;
     cout.precision(prevPrecision);
 }
 
