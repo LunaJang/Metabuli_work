@@ -92,6 +92,26 @@ struct Classification {
     double score;
 };
 
+// One candidate for one read, as the candidate DB stores it. Definition copied from
+// jaebeom-kim/Metabuli commit cd7d5686 so that CandidateDBWriter serialises the same bytes
+// create-candidates does; do not reorder or retype the members.
+//
+// The name says species because that is what create-candidates puts here. The grouping path
+// puts a group id in the same field: --score writes candidates over groups, not taxa, and
+// borrowing the record layout is cheaper than defining a parallel one. Anything reading a
+// grouping-produced DB has to know which it is holding -- the record does not say.
+struct SpeciesCandidate {
+    TaxID speciesId = 0;
+    float idScore = 0.0f;
+    float subScore = 0.0f;
+    float logE = 0.0f;
+    std::vector<std::pair<TaxID, uint32_t>> taxCnt;
+    // Unique genome bins (k-mer positions, posId) this read touched for this
+    // species. Populated only when the DB stores k-mer positions. Used later to
+    // estimate per-species genome coverage from a candidate DB.
+    std::vector<uint16_t> kmerPositions;
+};
+
 struct Query {
     int queryId;
     int classification;
@@ -101,7 +121,11 @@ struct Query {
     int queryLength2;
     int kmerCnt;
     int kmerCnt2;
-    TaxID topSpeciesId; 
+    // Two of the three constructors below never named this in their init list, so a Query built
+    // through either of them carried an indeterminate topSpeciesId. Nothing read it on those
+    // paths, which is why it went unnoticed; a default member initialiser settles it for every
+    // constructor at once, including any added later.
+    TaxID topSpeciesId = 0;
     bool isClassified;
     bool newSpecies; // 36 byte
 
@@ -109,6 +133,10 @@ struct Query {
     std::map<TaxID,int> taxCnt; // 8 byte per element
     std::vector<std::pair<TaxID, float>> species2Score;
     // std::vector<float> pathScores;
+    // What CandidateDBWriter::serializeQuery reads. Empty for every existing user of Query --
+    // only the grouping score pass fills it. It lives here rather than in a separate struct so
+    // the imported writer compiles against this Query without being edited.
+    std::vector<SpeciesCandidate> speciesCandidates;
 
     bool operator==(int id) const { return queryId == id;}
 

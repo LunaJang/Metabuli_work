@@ -32,6 +32,8 @@ set(commons_source_files
 		commons/Taxonomer.cpp
 		commons/Reporter.h
 		commons/Reporter.cpp
+		commons/CandidateDBWriter.h
+		commons/CandidateDBWriter.cpp
 		commons/TaxonomyWrapper.h
 		commons/TaxonomyWrapper.cpp
 		commons/SyncmerScanner.h
