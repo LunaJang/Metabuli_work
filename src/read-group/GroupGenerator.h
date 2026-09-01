@@ -918,13 +918,16 @@ protected:
     size_t foldRounds = 0;
     std::vector<std::vector<std::string>> foldedOutputs; // [unit] -> folded file names
 
-    // Where a flush round's time goes, split three ways, summed over every round in microseconds.
+    // Where a flush round's time goes, split four ways, summed over every round in microseconds.
     // The round total is already reported; this says whether it is the sort, the map-to-vector
-    // build, or zstd that owns it, which is what decides whether parallelising the unit loop is
-    // worth doing and what its ceiling is. Rounds overlap, so these sums can exceed the wall clock.
+    // build, zstd or releasing the maps that owns it, which is what decides whether parallelising
+    // the unit loop is worth doing and what its ceiling is. Rounds overlap, so these sums can
+    // exceed the wall clock. `free` was measured last and was the largest single item on the
+    // calling thread before it moved into the workers.
     std::atomic<uint64_t> emitBuildMicros{0};
     std::atomic<uint64_t> emitSortMicros{0};
     std::atomic<uint64_t> emitWriteMicros{0};
+    std::atomic<uint64_t> emitFreeMicros{0};
 
     // How lopsided a round is. Splitting the unit loop across workers cannot go faster than its
     // largest unit, so the largest unit's share of a round is the speed-up ceiling: a round whose
@@ -1083,8 +1086,13 @@ public:
     // checking existence, and a missing file would be read as a short stream.
     // `units[u]` is the unit's key shards, whose key sets are disjoint (see emitShardOf), so the
     // file is built by concatenating them and sorting once -- no re-summing of weights.
+    // Takes `units` by mutable reference and empties each unit as soon as its records are copied
+    // out: a round holds up to RELATION_BUDGET individually allocated nodes, and freeing them on
+    // the calling thread afterwards cost 3.9x the parallel write it followed while still holding
+    // the round's in-flight slot. Emptying here spreads that over the same workers and drops the
+    // unit's resident bytes from 60 per pair to the vector's 12 before the sort begins.
     void saveSubGraphToFile(
-            const std::vector<std::vector<std::unordered_map<uint64_t, uint16_t>>> & units,
+            std::vector<std::vector<std::unordered_map<uint64_t, uint16_t>>> & units,
             const std::vector<std::pair<size_t, size_t>> & unitKey,
             const size_t counter_now);
 
