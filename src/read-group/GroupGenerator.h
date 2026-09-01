@@ -664,14 +664,51 @@ inline size_t emitUnitIndex(size_t route, size_t shard, int partitionCnt) {
     return cross + shardsForRoute(cross, partitionCnt) + (route - cross - 1);
 }
 
-// One emit buffer per unit, shared by every thread. Holding the map per unit rather than per
-// thread is what takes the flush unit off --threads: a flush empties all of these at once, so
-// what lands in a file is the whole budget divided by the unit count, whatever the thread count.
-// Non-copyable and non-movable because of the mutex, hence held by unique_ptr in a vector.
+// One emit buffer per (unit, key shard), shared by every thread. Holding the map per unit rather
+// than per thread is what takes the flush unit off --threads: a flush empties all of these at
+// once, so what lands in a file is the whole budget divided by the unit count, whatever the
+// thread count. Non-copyable and non-movable because of the mutex, hence held by unique_ptr in a
+// vector.
 struct EmitUnitBuffer {
     std::mutex lock;
     std::unordered_map<uint64_t, uint16_t> pairs;
 };
+
+// Lock domains a unit's buffer is split into. One buffer per unit put 128 threads on 48 mutexes
+// and 74.74% of the takes had to wait for one (CAMI2 strain-madness, job 550906); striping the
+// unit's keys over several mutexes multiplies the domains by this factor.
+//
+// Two domains per worker, so a worker usually finds a free one on its first try. A power of two
+// because the shard of a key is picked inside the C(m,2) loop -- the hottest loop in the program
+// -- where a 64-bit division would cost more than the hash insert it is there to spread. Capped
+// at 16 because a thread's staging batch is split S ways to keep its footprint fixed, and past
+// that the sub-batch is too small to amortise the lock it exists to amortise.
+//
+// --threads 1 gives 1, which is byte-for-byte the pre-shard code path.
+inline size_t emitUnitShards(size_t unitCnt, int threads) {
+    const size_t workers = static_cast<size_t>(threads < 1 ? 1 : threads);
+    const size_t units = (unitCnt < 1) ? 1 : unitCnt;
+    const size_t want = (workers * 2 + units - 1) / units;
+    size_t shards = 1;
+    while (shards < want && shards < 16) {
+        shards <<= 1;
+    }
+    return shards;
+}
+
+// Which of a unit's shards a pair belongs to. A function of the key alone, which is the whole
+// reason this split cannot change what a file holds: every occurrence of a pair meets in one
+// shard, so a unit's shards hold disjoint key sets and their union is the map they replace --
+// same keys, same weights, same count. Sharding by thread instead would scatter one pair over
+// several maps, turning it into several records and making the budget count it several times.
+//
+// Multiplied before masking: the low bits of pairKey are id2 and the high bits id1, and within a
+// unit id1 is already constrained by routeOf/shardOf, so masking the raw key would leave the
+// spread to id2 alone. shardCnt is a power of two, so the mask replaces a division.
+inline size_t emitShardOf(uint64_t pairKey, size_t shardCnt) {
+    const uint64_t mixed = pairKey * 0x9E3779B97F4A7C15ULL;
+    return static_cast<size_t>(mixed >> 32) & (shardCnt - 1);
+}
 
 // How many pair occurrences a thread stages for one unit before taking that unit's lock. The
 // insertion site is the C(m,2) loop, the hottest in the program -- locking per occurrence would
@@ -1044,9 +1081,12 @@ public:
     // (route, shard) of unit u, so the caller's flat index survives into the file name.
     // Every unit gets a file even when empty: the merge lists its inputs by name without
     // checking existence, and a missing file would be read as a short stream.
-    void saveSubGraphToFile(const std::vector<std::unordered_map<uint64_t, uint16_t>> & units,
-                            const std::vector<std::pair<size_t, size_t>> & unitKey,
-                            const size_t counter_now);
+    // `units[u]` is the unit's key shards, whose key sets are disjoint (see emitShardOf), so the
+    // file is built by concatenating them and sorting once -- no re-summing of weights.
+    void saveSubGraphToFile(
+            const std::vector<std::vector<std::unordered_map<uint64_t, uint16_t>>> & units,
+            const std::vector<std::pair<size_t, size_t>> & unitKey,
+            const size_t counter_now);
 
     // No processedReadCnt: routing now happens in saveSubGraphToFile, which is where the
     // read count is needed. This function only folds and merges what is already partitioned.

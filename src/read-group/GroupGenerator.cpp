@@ -644,14 +644,21 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     const size_t emitUnitCnt = emitUnitCount(partitionCnt);
     const size_t emitRouteCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
     const size_t emitRangeSize = getRouteRangeSize(processedReadCnt, partitionCnt);
+    // A unit's buffer is striped over this many mutexes. The stripe of a pair is a function of
+    // its key, so a unit's stripes hold disjoint keys and together hold exactly what one map
+    // held: same entries, same weights, same count against the budget. Only the contention
+    // changes -- see emitUnitShards and emitShardOf.
+    const size_t emitShardCnt = emitUnitShards(emitUnitCnt, par.threads);
+    const size_t emitBufferCnt = emitUnitCnt * emitShardCnt;
     std::vector<std::unique_ptr<EmitUnitBuffer>> emitUnits;
-    emitUnits.reserve(emitUnitCnt);
-    for (size_t u = 0; u < emitUnitCnt; ++u) {
+    emitUnits.reserve(emitBufferCnt);
+    for (size_t b = 0; b < emitBufferCnt; ++b) {
         emitUnits.push_back(std::unique_ptr<EmitUnitBuffer>(new EmitUnitBuffer()));
-        // The budget is shared across units, so a unit's fair share is its slice of it. The
+        // The budget is shared across units, so a buffer's fair share is its slice of it. The
         // per-thread reserve this replaces divided by --threads instead, which is the same
-        // arithmetic applied to the wrong denominator.
-        emitUnits.back()->pairs.reserve(std::max<size_t>(1, RELATION_BUDGET / emitUnitCnt));
+        // arithmetic applied to the wrong denominator. Striping divides the same total further,
+        // so the reserved capacity summed over buffers does not change.
+        emitUnits.back()->pairs.reserve(std::max<size_t>(1, RELATION_BUDGET / emitBufferCnt));
     }
     // (route, shard) of each flat unit index, so the file name survives the flattening.
     std::vector<std::pair<size_t, size_t>> emitUnitKey(emitUnitCnt, {0, 0});
@@ -798,7 +805,8 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         }
         const FlushSlot slot{flushInFlightMutex, flushInFlightCv, flushRoundsInFlight};
 
-        std::vector<std::unordered_map<uint64_t, uint16_t>> taken(emitUnitCnt);
+        std::vector<std::vector<std::unordered_map<uint64_t, uint16_t>>> taken(
+                emitUnitCnt, std::vector<std::unordered_map<uint64_t, uint16_t>>(emitShardCnt));
         size_t movedPairs = 0;
         size_t counter_now = 0;
         {
@@ -822,9 +830,12 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 return;
             }
             for (size_t u = 0; u < emitUnitCnt; ++u) {
-                const std::lock_guard<std::mutex> unitGuard(emitUnits[u]->lock);
-                taken[u].swap(emitUnits[u]->pairs);
-                movedPairs += taken[u].size();
+                for (size_t s = 0; s < emitShardCnt; ++s) {
+                    EmitUnitBuffer & buffer = *emitUnits[u * emitShardCnt + s];
+                    const std::lock_guard<std::mutex> unitGuard(buffer.lock);
+                    taken[u][s].swap(buffer.pairs);
+                    movedPairs += taken[u][s].size();
+                }
             }
             if (movedPairs == 0) {
                 return; // do not spend a flush index on a round that would write only empty files
@@ -940,36 +951,40 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         size_t localSumM = 0;
         double localPairEst = 0.0;
         size_t localMaxKeptM = 0;
-        // Pair occurrences staged for each unit, flushed into the shared unit map in batches.
-        // The batch is what makes the per-unit lock affordable: the alternative is taking it
-        // inside the C(m,2) loop below, once per occurrence.
-        std::vector<std::vector<uint64_t>> stage(emitUnitCnt);
-        for (size_t u = 0; u < emitUnitCnt; ++u) {
-            stage[u].reserve(EMIT_STAGE_BATCH);
+        // Pair occurrences staged for each (unit, key shard), flushed into the shared buffer in
+        // batches. The batch is what makes the per-buffer lock affordable: the alternative is
+        // taking it inside the C(m,2) loop below, once per occurrence. The sub-batch is the
+        // whole batch divided by the shard count, so what a thread stages in total does not
+        // grow with the striping.
+        const size_t stageBatch = std::max<size_t>(1, EMIT_STAGE_BATCH / emitShardCnt);
+        std::vector<std::vector<uint64_t>> stage(emitBufferCnt);
+        for (size_t b = 0; b < emitBufferCnt; ++b) {
+            stage[b].reserve(stageBatch);
         }
 
-        // Merge one unit's staged occurrences into the shared map. Only newly created keys
-        // count towards the budget: a repeat of a pair already buffered adds no footprint.
-        auto drainStage = [&](size_t u) {
-            if (stage[u].empty()) {
+        // Merge one buffer's staged occurrences into its shared map. Only newly created keys
+        // count towards the budget: a repeat of a pair already buffered adds no footprint. The
+        // count is exact rather than conservative because a key reaches one buffer only.
+        auto drainStage = [&](size_t b) {
+            if (stage[b].empty()) {
                 return;
             }
             size_t newKeys = 0;
             {
-                std::unique_lock<std::mutex> guard(emitUnits[u]->lock, std::try_to_lock);
+                std::unique_lock<std::mutex> guard(emitUnits[b]->lock, std::try_to_lock);
                 if (!guard.owns_lock()) {
                     unitLockWaits.fetch_add(1, std::memory_order_relaxed);
                     guard.lock();
                 }
                 unitLockTakes.fetch_add(1, std::memory_order_relaxed);
-                std::unordered_map<uint64_t, uint16_t> & shared = emitUnits[u]->pairs;
-                for (const uint64_t pairKey : stage[u]) {
+                std::unordered_map<uint64_t, uint16_t> & shared = emitUnits[b]->pairs;
+                for (const uint64_t pairKey : stage[b]) {
                     const size_t before = shared.size();
                     addSat16(shared[pairKey], 1);
                     if (shared.size() != before) { newKeys++; }
                 }
             }
-            stage[u].clear();
+            stage[b].clear();
             if (newKeys != 0) {
                 bufferedPairs.fetch_add(newKeys, std::memory_order_relaxed);
             }
@@ -1034,10 +1049,13 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                         const size_t route = routeOf(id1, id2, partitionCnt, emitRangeSize);
                         const size_t u = emitUnitIndex(
                             route, shardOf(id1, shardsForRoute(route, partitionCnt)), partitionCnt);
-                        stage[u].push_back((static_cast<uint64_t>(id1) << 32)
-                                           | static_cast<uint64_t>(id2));
-                        if (stage[u].size() >= EMIT_STAGE_BATCH) {
-                            drainStage(u);
+                        const uint64_t pairKey = (static_cast<uint64_t>(id1) << 32)
+                                                 | static_cast<uint64_t>(id2);
+                        const size_t b = u * emitShardCnt
+                                         + emitShardOf(pairKey, emitShardCnt);
+                        stage[b].push_back(pairKey);
+                        if (stage[b].size() >= stageBatch) {
+                            drainStage(b);
                         }
                     }
                 }
@@ -1055,9 +1073,11 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                     const size_t route = routeOf(id1, id2, partitionCnt, emitRangeSize);
                     const size_t u = emitUnitIndex(
                         route, shardOf(id1, shardsForRoute(route, partitionCnt)), partitionCnt);
-                    stage[u].push_back(idHi | static_cast<uint64_t>(id2));
-                    if (stage[u].size() >= EMIT_STAGE_BATCH) {
-                        drainStage(u);
+                    const uint64_t pairKey = idHi | static_cast<uint64_t>(id2);
+                    const size_t b = u * emitShardCnt + emitShardOf(pairKey, emitShardCnt);
+                    stage[b].push_back(pairKey);
+                    if (stage[b].size() >= stageBatch) {
+                        drainStage(b);
                     }
                 }
             }
@@ -1067,8 +1087,8 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             if (bufferedPairs.load(std::memory_order_relaxed) >= RELATION_BUDGET) {
                 // Everything this thread is holding goes in before the round starts, so a
                 // flush carries as much as it can rather than leaving a batch behind.
-                for (size_t u = 0; u < emitUnitCnt; ++u) {
-                    drainStage(u);
+                for (size_t b = 0; b < emitBufferCnt; ++b) {
+                    drainStage(b);
                 }
                 // Publish progress before the guards read it, so the projection matches the
                 // bytes that are about to be written.
@@ -1081,8 +1101,8 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         });
 
         // Nothing may stay staged past the end of this thread's scan.
-        for (size_t u = 0; u < emitUnitCnt; ++u) {
-            drainStage(u);
+        for (size_t b = 0; b < emitBufferCnt; ++b) {
+            drainStage(b);
         }
 
         // No per-thread final write: what this thread built is in the shared unit buffers, and
@@ -1354,17 +1374,19 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << " over " << fileCnt << " files, "
              << this->foldRounds << " folds" << endl;
 
-        // Cost of holding the buffers per unit rather than per thread. Units are the lock
-        // domain, so few of them and many threads is the configuration to watch:
-        // --partitions 1 leaves three. Staging keeps the take count down to roughly
+        // Cost of holding the buffers per unit rather than per thread. The lock domain is a
+        // (unit, key shard), so few units and many threads is the configuration to watch:
+        // --partitions 1 leaves three units. Staging keeps the take count down to roughly
         // occurrences / EMIT_STAGE_BATCH, and a wait share near zero means the batch is doing
-        // its job.
+        // its job. Takes rise with the shard count because a batch is split that many ways;
+        // the share is what to compare across configurations, not the count.
         const uint64_t takes = unitLockTakes.load(std::memory_order_relaxed);
         const uint64_t waits = unitLockWaits.load(std::memory_order_relaxed);
         cout << "[edges] unit lock: " << takes << " takes, " << waits << " contended ("
              << fixed << setprecision(2)
              << (takes > 0 ? 100.0 * static_cast<double>(waits) / static_cast<double>(takes) : 0.0)
-             << "%), " << emitUnitCnt << " units for " << par.threads << " threads" << endl;
+             << "%), " << emitUnitCnt << " units x " << emitShardCnt << " key shards = "
+             << emitBufferCnt << " lock domains for " << par.threads << " threads" << endl;
     }
     // What the run actually held at once, which is the number a shared filesystem cares about.
     // "0 folds" means the data fit under the budget and nothing was folded early -- the path
@@ -1384,7 +1406,7 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
 }
 
 void GroupGenerator::saveSubGraphToFile(
-        const std::vector<std::unordered_map<uint64_t, uint16_t>> & units,
+        const std::vector<std::vector<std::unordered_map<uint64_t, uint16_t>>> & units,
         const std::vector<std::pair<size_t, size_t>> & unitKey,
         const size_t counter_now) {
     // The units arrive already partitioned: routeOf/shardOf ran at insertion time, so a pair
@@ -1394,12 +1416,13 @@ void GroupGenerator::saveSubGraphToFile(
     // workers below and the order they finish in is not fixed, but the log has to be.
     std::vector<uint64_t> flushFileBytes(units.size(), 0);
 
-    // A unit owns its map, its sort and its file, and two units never touch the same bytes, so the
+    // A unit owns its maps, its sort and its file, and two units never touch the same bytes, so the
     // loop below splits with nothing to synchronise. That the output cannot change with the split
     // rests on three facts, in order of how easy they are to get wrong:
     //   - a unit's file name is subGraphName(counter_now, route, shard) and no two units share one;
-    //   - a file's contents are a function of its unit's map alone. Relation::compare is a total
-    //     order on (id1, id2) and a map cannot hold the same key twice, so the sort has one answer;
+    //   - a file's contents are a function of its unit's maps alone. Relation::compare is a total
+    //     order on (id1, id2), a map cannot hold the same key twice, and the unit's key shards hold
+    //     disjoint keys (emitShardOf is a function of the key), so the sort has one answer;
     //   - everything written outside a worker's own slots is either a sum (compressedBytes, the
     //     three timing totals) or a maximum (the skew), both order-independent.
     // markEmitComplete stays after the join for the same reason it was after the loop: it is what
@@ -1423,13 +1446,21 @@ void GroupGenerator::saveSubGraphToFile(
         for (size_t u = w; u < units.size(); u += writerCnt) {
             const std::chrono::steady_clock::time_point buildStart =
                 std::chrono::steady_clock::now();
+            // The unit's shards are concatenated, not merged: their key sets are disjoint, so no
+            // pair can appear twice in the result and no weight needs re-summing.
+            size_t unitRecords = 0;
+            for (const auto & shard : units[u]) {
+                unitRecords += shard.size();
+            }
             std::vector<Relation> relations;
-            relations.reserve(units[u].size());
-            for (const auto & entry : units[u]) {
-                const uint64_t pairKey = entry.first;
-                relations.push_back(makeRelation(static_cast<uint32_t>(pairKey >> 32),
-                                                 static_cast<uint32_t>(pairKey & 0xFFFFFFFF),
-                                                 entry.second));
+            relations.reserve(unitRecords);
+            for (const auto & shard : units[u]) {
+                for (const auto & entry : shard) {
+                    const uint64_t pairKey = entry.first;
+                    relations.push_back(makeRelation(static_cast<uint32_t>(pairKey >> 32),
+                                                     static_cast<uint32_t>(pairKey & 0xFFFFFFFF),
+                                                     entry.second));
+                }
             }
             wBuild[w] += microsSince(buildStart);
 
