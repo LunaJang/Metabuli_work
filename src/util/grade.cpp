@@ -69,6 +69,11 @@ int grade(int argc, const char **argv, const Command &command) {
     const string mappingFileList = par.filenames[1];
     const string taxonomy = par.filenames[2];
 
+    // No negative-value check on --readid-col / --taxid-col: their parameter regex is ^[0-9]+$,
+    // so the argument parser rejects a negative before it reaches here. The bound that does need
+    // checking is the upper one, against each line's field count, and that is done at the parse
+    // site below where the count is known.
+
     // Parse ranks
     vector<string> ranks;
     if (!par.testRank.empty()) {
@@ -220,8 +225,30 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                 // Parse classification result
                 fields = Util::split(resultLine, "\t");
 
+                // A line with too few fields is fatal, not skipped. Every classifier this reads
+                // writes one record per line with a fixed column count, so a short line means the
+                // column indices do not match the file -- the whole run is being graded against
+                // the wrong columns and the score would be silently meaningless. It also used to
+                // be a segmentation fault: centrifuge's readID/seqID/taxID layout against the
+                // metabuli defaults (--readid-col 1 --taxid-col 2) indexed past the end here.
+                const size_t neededCols = static_cast<size_t>(
+                    par.readIdCol > par.taxidCol ? par.readIdCol : par.taxidCol) + 1;
+                // exit, not return: this loop sits inside the #pragma omp parallel above, and
+                // branching out of a structured block is not allowed. The repository handles
+                // fatal I/O the same way (relationStreamFatal).
+                if (fields.size() < neededCols) {
+                    cerr << "Error: " << readClassificationFileName << " has a line with "
+                         << fields.size() << " tab-separated fields, but --readid-col "
+                         << par.readIdCol << " --taxid-col " << par.taxidCol << " needs at least "
+                         << neededCols << "." << endl;
+                    cerr << "       The line was: " << resultLine << endl;
+                    cerr << "       These are ZERO-based indices. Centrifuge writes"
+                         << " readID/seqID/taxID, so it needs --readid-col 0 --taxid-col 2." << endl;
+                    exit(EXIT_FAILURE);
+                }
+
                 // Skip the line if it is not a classification result
-                if (!isdigit(fields[par.taxidCol][0])) {
+                if (fields[par.taxidCol].empty() || !isdigit(fields[par.taxidCol][0])) {
                     continue;
                 }
                 
@@ -282,9 +309,18 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
                     numberOfClassifications++;
                 }
 
-                // Read column for printing
+                // Read column for printing. Bounds-checked for the same reason as the columns
+                // above: --print-columns is given by hand and indexes `fields` directly.
                 if (!printColumnsIdx.empty()) {
                     vector<string> values;
+                    for (const auto &idx: printColumnsIdx) {
+                        if (idx >= fields.size()) {
+                            cerr << "Error: --print-columns names field " << idx << " but "
+                                 << readClassificationFileName << " has a line with only "
+                                 << fields.size() << " fields (zero-based)." << endl;
+                            exit(EXIT_FAILURE);
+                        }
+                    }
                     for (const auto &idx: printColumnsIdx) {
                         values.push_back(fields[idx]);
                     }

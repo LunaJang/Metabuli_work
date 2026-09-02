@@ -345,8 +345,10 @@ LocalParameters::LocalParameters() :
                     "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         SCORE_COL(SCORE_COL_ID,
                   "--score-col",
-                  "Score column index (1-based).",
-                  "Score column index (1-based).",
+                  "Score column index (ONE-based; apply-group only reader).",
+                  "Score column index. ONE-based -- apply-group subtracts one before indexing,\n"
+                  "              and it is the only command that reads this. Unlike --readid-col\n"
+                  "              and --taxid-col, there is no zero-based reader to disagree with.",
                   typeid(int),
                   (void *) &scoreCol,
                   "^[0-9]+$"),
@@ -462,17 +464,33 @@ LocalParameters::LocalParameters() :
                   typeid(std::string),
                   (void *) &testType,
                   "^.*$"),
+        // The base is NOT the same in every command that takes these, and it cannot be unified
+        // without changing what every existing script means:
+        //   grade, gradeByCoverage, gradeGroup*, gradeStrain -- ZERO-based (fields[col])
+        //   apply-group, binning2report                      -- ONE-based  (fields[col - 1])
+        // Centrifuge writes readID/seqID/taxID, so it is --readid-col 0 --taxid-col 2 for grade
+        // but --readid-col 1 --taxid-col 3 for apply-group. Getting this wrong used to segfault
+        // grade and to make gradeByCoverage silently score nothing; both now stop with a message
+        // naming the field count they found. Say the base in the help text of every command that
+        // registers these so the difference is visible at the point of use.
         READID_COL(READID_COL_ID,
                    "--readid-col",
-                   "Column number of accession in classification result",
-                   "Column number of accession in classification result",
+                   "Read ID column. ZERO-based for grade*; ONE-based for apply-group.",
+                   "Read ID column index in the classification result.\n"
+                   "              Base differs by command: grade, gradeByCoverage, gradeGroup,\n"
+                   "              gradeGroupByCoverage and gradeStrain index the fields directly\n"
+                   "              (ZERO-based), while apply-group and binning2report subtract one\n"
+                   "              (ONE-based). Centrifuge's readID/seqID/taxID layout is therefore\n"
+                   "              --readid-col 0 for grade and --readid-col 1 for apply-group.",
                    typeid(int),
                    (void *) &readIdCol,
                    "^[0-9]+$"),
         TAXID_COL(TAXID_COL_ID,
                   "--taxid-col",
-                  "Tax ID column index (1-based).",
-                  "Tax ID column index (1-based).",
+                  "Tax ID column. ZERO-based for grade*; ONE-based for apply-group.",
+                  "Tax ID column index in the classification result.\n"
+                  "              Base differs by command -- see --readid-col. Centrifuge needs\n"
+                  "              --taxid-col 2 for grade and --taxid-col 3 for apply-group.",
                   typeid(int),
                   (void *) &taxidCol,
                   "^[0-9]+$"),
