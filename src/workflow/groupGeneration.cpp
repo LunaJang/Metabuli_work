@@ -7,21 +7,49 @@
 #include <string>
 
 void setGroupGenerationDefaults(LocalParameters & par){
-    // Absolute cap on reads per k-mer -- the primary brake on Sum C(m,2). It bounds a single
-    // k-mer's edge contribution regardless of read count, which is why it is kept as a resource
-    // knob rather than expressed as a fraction of the read count: a fraction cannot fit both a
-    // 5k-read and a 62M-read run (0.0001 skipped everything on the former and 11 k-mers on the
-    // latter, which is why --max-kmer-freq-ratio was dropped).
-    par.maxKmerReads = 1000; // provisional; C(1000,2) = 499,500 edges per k-mer
-    // Automatic selection of the cap above from the reads-per-k-mer distribution. Off for now:
-    // --max-kmer-reads is set, and an explicit cap wins, so this changes nothing until the
-    // default above is dropped to 0.
-    par.maxKmerQuantile = 0.0f;
+    // The reads-per-k-mer cap, chosen from the sample rather than fixed. A k-mer shared by m reads
+    // contributes C(m,2) edges, so the frequency tail decides the edge volume, and the tail is not
+    // the same shape on two datasets: at this quantile the cap resolves to 63 on species-inclusion,
+    // 127 on species-exclusion and 255 on CAMI2 strain-madness. An absolute default cannot be
+    // right on all three -- 1000, the value this replaces, was above every one of them and so cut
+    // nothing where cutting mattered most.
+    //
+    // maxKmerReads is the absolute form and stays available, but it is off by default: an explicit
+    // cap wins over the quantile, so leaving it set would make the quantile dead. Every published
+    // measurement passed --max-kmer-reads 0 --max-kmer-quantile 0.995 explicitly for exactly that
+    // reason; the defaults now say the same thing.
+    par.maxKmerReads = 0;
+    par.maxKmerQuantile = 0.995f;
 
-    // Phase 1 core threshold as a fraction of k-mers per read. Measured on the species-inclusion
-    // benchmark (61.7 M reads, 49.6 k-mers/read -> core threshold 15): 0.3 is the peak, with 0.2,
-    // 0.4 and 0.5 all below it.
-    par.minOverlapRatio = 0.3f;
+    // Phase 1 core threshold as a fraction of k-mers per read.
+    //
+    // 0.5 since 2026-09-03, chosen for purity. The earlier 0.3 came from an F1 peak on the
+    // species-inclusion benchmark; sweeping 0.30 / 0.40 / 0.50 / 0.60 at 203c83a3 on two datasets
+    // says F1 is the wrong thing to read.
+    //
+    // CAMI2 strain-madness, species purity and Recall x c (c = grouped reads / all reads, because
+    // gradeGroup's recall denominator excludes ungrouped reads):
+    //
+    //   rho    purity     Recall x c   core
+    //   0.30   0.670474   0.3379       24
+    //   0.40   0.939313   0.1827       33
+    //   0.50   0.953477   0.0482       41
+    //   0.60   0.958674   0.0274       49
+    //
+    // Purity saturates: +0.269, then +0.014, then +0.005. It never reaches the 0.98 bar, and past
+    // 0.5 the remaining purity is bought at a steep price -- 0.5 -> 0.6 gains 0.005 of purity for
+    // 43% of what is left of Recall x c. 0.5 is where that trade stops being worth taking.
+    //
+    // species-exclusion wants the opposite: purity is 0.999 at every rho, so the bar cannot
+    // choose, and Recall x c falls monotonically (0.1679 / 0.1374 / 0.1209 / 0.1092). A simulated
+    // benchmark with a per-read key and controlled coverage does not constrain rho; real
+    // strain-level data does. The default follows the harder case.
+    //
+    // This is a default, not a bound: every script passes --min-overlap-ratio explicitly, so the
+    // value here only decides what a bare `metabuli grouping` does. It is set to the operating
+    // point the paper reports so those two cannot disagree -- the same failure --max-kmer-reads
+    // and --max-kmer-quantile had until 2026-08-29.
+    par.minOverlapRatio = 0.5f;
     // Weak-band lower bound as a fraction of the core threshold, also Phase 3's floor.
     // 5/15 = 0.3333 reproduces the species-inclusion operating point, where the band was (5, 15].
     // The absolute 5 it replaces meant different things per dataset: 5/15 = 0.333 of the core on

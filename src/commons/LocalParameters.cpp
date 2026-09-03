@@ -293,13 +293,17 @@ LocalParameters::LocalParameters() :
                         "with it: CAMI2 strain-madness went from 389 flushes x 48 units at 16 "
                         "threads to 2,354 x 192 at 64, so the same 117.29 GB became 451,968 files "
                         "instead of 18,672 and the run took 8h 08m instead of 3h 40m. Separating "
-                        "the two lets --threads decide only how many workers run at once. Partition "
-                        "count does change the result, because it changes how edges are grouped for "
-                        "the support pass; thread count no longer does. The default is 16, which is "
-                        "what the published measurements used. 0 restores the old behaviour of "
-                        "following --threads and exists only to reproduce runs made before this "
-                        "parameter did -- it reintroduces the dependency described above, so do not "
-                        "use it for new work.",
+                        "the two lets --threads decide only how many workers run at once. Neither "
+                        "changes the grouping: routing decides which file an edge is written to, "
+                        "not which edges exist, and the support pass counts unit pairs exactly, so "
+                        "the answer is the same at any partition count. This was not always true -- "
+                        "the support map used to be capped, and which pairs overflowed depended on "
+                        "how the edges happened to be divided -- and it is verified rather than "
+                        "assumed: partition counts 1, 4, 16 and 64 give byte-identical output. "
+                        "The default is 16, the value the published measurements used; higher "
+                        "values trade more files for smaller ones. 0 makes the count follow "
+                        "--threads, which is what runs made before this parameter did, and is kept "
+                        "only to reproduce them.",
                         typeid(int),
                         (void *) &partitions,
                         "^[0-9]+$"),
@@ -374,8 +378,10 @@ LocalParameters::LocalParameters() :
                     "^0(\\.[0-9]+)?|1(\\.0+)?$"),
         SCORE_COL(SCORE_COL_ID,
                   "--score-col",
-                  "Score column index (1-based).",
-                  "Score column index (1-based).",
+                  "Score column index (ONE-based; apply-group only reader).",
+                  "Score column index. ONE-based -- apply-group subtracts one before indexing,\n"
+                  "              and it is the only command that reads this. Unlike --readid-col\n"
+                  "              and --taxid-col, there is no zero-based reader to disagree with.",
                   typeid(int),
                   (void *) &scoreCol,
                   "^[0-9]+$"),
@@ -491,17 +497,33 @@ LocalParameters::LocalParameters() :
                   typeid(std::string),
                   (void *) &testType,
                   "^.*$"),
+        // The base is NOT the same in every command that takes these, and it cannot be unified
+        // without changing what every existing script means:
+        //   grade, gradeByCoverage, gradeGroup*, gradeStrain -- ZERO-based (fields[col])
+        //   apply-group, binning2report                      -- ONE-based  (fields[col - 1])
+        // Centrifuge writes readID/seqID/taxID, so it is --readid-col 0 --taxid-col 2 for grade
+        // but --readid-col 1 --taxid-col 3 for apply-group. Getting this wrong used to segfault
+        // grade and to make gradeByCoverage silently score nothing; both now stop with a message
+        // naming the field count they found. Say the base in the help text of every command that
+        // registers these so the difference is visible at the point of use.
         READID_COL(READID_COL_ID,
                    "--readid-col",
-                   "Column number of accession in classification result",
-                   "Column number of accession in classification result",
+                   "Read ID column. ZERO-based for grade*; ONE-based for apply-group.",
+                   "Read ID column index in the classification result.\n"
+                   "              Base differs by command: grade, gradeByCoverage, gradeGroup,\n"
+                   "              gradeGroupByCoverage and gradeStrain index the fields directly\n"
+                   "              (ZERO-based), while apply-group and binning2report subtract one\n"
+                   "              (ONE-based). Centrifuge's readID/seqID/taxID layout is therefore\n"
+                   "              --readid-col 0 for grade and --readid-col 1 for apply-group.",
                    typeid(int),
                    (void *) &readIdCol,
                    "^[0-9]+$"),
         TAXID_COL(TAXID_COL_ID,
                   "--taxid-col",
-                  "Tax ID column index (1-based).",
-                  "Tax ID column index (1-based).",
+                  "Tax ID column. ZERO-based for grade*; ONE-based for apply-group.",
+                  "Tax ID column index in the classification result.\n"
+                  "              Base differs by command -- see --readid-col. Centrifuge needs\n"
+                  "              --taxid-col 2 for grade and --taxid-col 3 for apply-group.",
                   typeid(int),
                   (void *) &taxidCol,
                   "^[0-9]+$"),
@@ -690,14 +712,16 @@ LocalParameters::LocalParameters() :
     rank = "";
     higherRankFile = 0;
 
-    // Group generation. Both thresholds are ratios so that one value transfers across datasets;
-    // the operating point comes from the species-inclusion benchmark (61.7 M reads, 49.6 k-mers
-    // per read -> core threshold 15, weak band (5, 15]). 5/15 = 0.3333 is where --weak-band-ratio
-    // comes from. See setGroupGenerationDefaults(), which overrides these for the grouping
-    // workflow -- both places have to agree.
+    // Group generation. Both thresholds are ratios so that one value transfers across datasets.
+    // --weak-band-ratio's 0.3333 comes from the species-inclusion benchmark (61.7 M reads,
+    // 49.6 k-mers per read -> core threshold 15, weak band (5, 15]); --min-overlap-ratio's 0.5
+    // comes from the 2026-09-03 rho sweep on CAMI2 strain-madness and species-exclusion, where
+    // purity saturates and 0.5 is the last point whose purity gain is worth its recall cost.
+    // See setGroupGenerationDefaults(), which carries that reasoning in full and overrides these
+    // for the grouping workflow -- both places have to agree.
     maxKmerReads = 0;
-    maxKmerQuantile = 0.0f;
-    minOverlapRatio = 0.3f;
+    maxKmerQuantile = 0.995f;
+    minOverlapRatio = 0.5f;
     weakBandRatio = 0.3333f;
     partitions = 16;
     // 0 = clique. Spelled as a literal rather than EdgeMode: that enum lives in the read-group

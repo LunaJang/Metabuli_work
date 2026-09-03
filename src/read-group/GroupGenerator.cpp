@@ -660,14 +660,21 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     const size_t emitUnitCnt = emitUnitCount(partitionCnt);
     const size_t emitRouteCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
     const size_t emitRangeSize = getRouteRangeSize(processedReadCnt, partitionCnt);
+    // A unit's buffer is striped over this many mutexes. The stripe of a pair is a function of
+    // its key, so a unit's stripes hold disjoint keys and together hold exactly what one map
+    // held: same entries, same weights, same count against the budget. Only the contention
+    // changes -- see emitUnitShards and emitShardOf.
+    const size_t emitShardCnt = emitUnitShards(emitUnitCnt, par.threads);
+    const size_t emitBufferCnt = emitUnitCnt * emitShardCnt;
     std::vector<std::unique_ptr<EmitUnitBuffer>> emitUnits;
-    emitUnits.reserve(emitUnitCnt);
-    for (size_t u = 0; u < emitUnitCnt; ++u) {
+    emitUnits.reserve(emitBufferCnt);
+    for (size_t b = 0; b < emitBufferCnt; ++b) {
         emitUnits.push_back(std::unique_ptr<EmitUnitBuffer>(new EmitUnitBuffer()));
-        // The budget is shared across units, so a unit's fair share is its slice of it. The
+        // The budget is shared across units, so a buffer's fair share is its slice of it. The
         // per-thread reserve this replaces divided by --threads instead, which is the same
-        // arithmetic applied to the wrong denominator.
-        emitUnits.back()->pairs.reserve(std::max<size_t>(1, RELATION_BUDGET / emitUnitCnt));
+        // arithmetic applied to the wrong denominator. Striping divides the same total further,
+        // so the reserved capacity summed over buffers does not change.
+        emitUnits.back()->pairs.reserve(std::max<size_t>(1, RELATION_BUDGET / emitBufferCnt));
     }
     // (route, shard) of each flat unit index, so the file name survives the flattening.
     std::vector<std::pair<size_t, size_t>> emitUnitKey(emitUnitCnt, {0, 0});
@@ -693,6 +700,12 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // overlap now, so the total can exceed the wall clock.
     std::atomic<uint64_t> flushWriteMillisTotal(0);
     std::atomic<uint64_t> flushWriteMillisMax(0);
+    // Time spent releasing the harvested maps. A round holds up to RELATION_BUDGET nodes, each an
+    // individual allocation, and freeing them is neither counted by `flush write` nor visible in
+    // its build/sort/io split -- but it happens while the round still holds an in-flight slot, so
+    // it keeps the cap closed exactly as the write does.
+    std::atomic<uint64_t> flushFreeMillisTotal(0);
+    std::atomic<uint64_t> flushFreeMillisMax(0);
 
     // Rounds harvested but not yet written. The harvest empties the buffers, so the budget is
     // honoured as soon as it runs -- but that data is still resident until the write finishes.
@@ -704,11 +717,20 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     size_t flushRoundsInFlight = 0;
     std::atomic<uint64_t> flushInFlightWaits(0);
     std::atomic<uint64_t> flushInFlightWaitMillis(0);
+    // Budget-triggered calls that found the buffers already emptied and returned without
+    // queueing for a slot. This is what the pre-queue check keeps out of the in-flight queue,
+    // so it is the measure of what that check is worth.
+    std::atomic<uint64_t> flushEarlyOuts(0);
     // Contention on the per-unit locks, in the only terms that matter here -- how often a
     // thread had to wait at all. Reported so a configuration with few units (--partitions 1
     // gives three) shows the cost instead of hiding it.
     std::atomic<uint64_t> unitLockWaits(0);
     std::atomic<uint64_t> unitLockTakes(0);
+    // Thread-microseconds spent blocked on a buffer's mutex. The counts above say how often a
+    // thread had to wait but not what the waiting cost, and without that the emit's thread-time
+    // cannot be split between scanning and contention -- job 550906 left 36.9% of it unattributed.
+    // Microseconds because a hold is a few thousand hash inserts, which is under a millisecond.
+    std::atomic<uint64_t> unitLockWaitMicros(0);
 
     cout << "Flush budget: " << RELATION_BUDGET << " pairs across all threads (memory budget "
          << humanBytes(getMemoryBudgetBytes(par.ramUsage)) << ", --max-ram "
@@ -793,6 +815,26 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // 20x fixture at --max-ram 1 that was 2 / 3 / 4 / 8 rounds for 1 / 4 / 16 / 64 threads --
     // exactly the dependency the unit buffers were introduced to remove.
     auto flushEmitUnits = [&](const bool force) {
+        // The same re-check the harvest performs below, applied before this thread commits to the
+        // in-flight queue. Without it every thread that crossed the budget queues for a slot,
+        // wins it, finds the buffers already emptied and returns -- measured on CAMI2
+        // strain-madness (job 550906) as 33,782 queue entries against 297 rounds, so 99.1% of
+        // them did no work, and 547,187 thread-seconds spent in the queue against 1,071 seconds
+        // of round writing to wait for. The threads were waiting on each other, not on the disk.
+        //
+        // The harvest subtracts from bufferedPairs before the write starts, precisely so that a
+        // thread testing the budget during a write sees the emptied buffers; reserving a slot
+        // first denied it the chance to look. Checking here narrows the window in which a herd
+        // can form from a round's write to the harvest's pointer swaps.
+        //
+        // Cannot skip a needed round: the buffers are above the budget only if no thread has
+        // harvested them, and every thread re-tests the budget after each k-mer, so one of them
+        // arrives here and proceeds. `force` is the final flush after the parallel region joins
+        // and has to run whatever the counters say.
+        if (!force && bufferedPairs.load(std::memory_order_relaxed) < RELATION_BUDGET) {
+            flushEarlyOuts.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         // Reserve a slot before touching emitFlushMutex. Waiting with the harvest lock held would
         // stop every other thread from harvesting as well, which is the stall this cap exists to
         // bound rather than to create.
@@ -814,7 +856,8 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         }
         const FlushSlot slot{flushInFlightMutex, flushInFlightCv, flushRoundsInFlight};
 
-        std::vector<std::unordered_map<uint64_t, uint16_t>> taken(emitUnitCnt);
+        std::vector<std::vector<std::unordered_map<uint64_t, uint16_t>>> taken(
+                emitUnitCnt, std::vector<std::unordered_map<uint64_t, uint16_t>>(emitShardCnt));
         size_t movedPairs = 0;
         size_t counter_now = 0;
         {
@@ -838,9 +881,12 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                 return;
             }
             for (size_t u = 0; u < emitUnitCnt; ++u) {
-                const std::lock_guard<std::mutex> unitGuard(emitUnits[u]->lock);
-                taken[u].swap(emitUnits[u]->pairs);
-                movedPairs += taken[u].size();
+                for (size_t s = 0; s < emitShardCnt; ++s) {
+                    EmitUnitBuffer & buffer = *emitUnits[u * emitShardCnt + s];
+                    const std::lock_guard<std::mutex> unitGuard(buffer.lock);
+                    taken[u][s].swap(buffer.pairs);
+                    movedPairs += taken[u][s].size();
+                }
             }
             if (movedPairs == 0) {
                 return; // do not spend a flush index on a round that would write only empty files
@@ -865,6 +911,26 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         while (prevMax < writeMillis
                && !flushWriteMillisMax.compare_exchange_weak(prevMax, writeMillis,
                                                              std::memory_order_relaxed)) {
+        }
+
+        // Released here rather than left to the scope exit, so the cost is visible. It is the same
+        // work either way -- the maps die inside this call either at this line or a few lines
+        // below -- but `flush write` above does not include it and the in-flight slot does, so a
+        // round's hold on the cap was longer than any counter reported.
+        {
+            const std::chrono::steady_clock::time_point freeStart =
+                std::chrono::steady_clock::now();
+            taken.clear();
+            taken.shrink_to_fit();
+            const uint64_t freeMillis = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - freeStart).count());
+            flushFreeMillisTotal.fetch_add(freeMillis, std::memory_order_relaxed);
+            uint64_t prevFreeMax = flushFreeMillisMax.load(std::memory_order_relaxed);
+            while (prevFreeMax < freeMillis
+                   && !flushFreeMillisMax.compare_exchange_weak(prevFreeMax, freeMillis,
+                                                                std::memory_order_relaxed)) {
+            }
         }
 
         // Read only after the parallel region joins, but written here by rounds that now overlap.
@@ -956,36 +1022,54 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         size_t localSumM = 0;
         double localPairEst = 0.0;
         size_t localMaxKeptM = 0;
-        // Pair occurrences staged for each unit, flushed into the shared unit map in batches.
-        // The batch is what makes the per-unit lock affordable: the alternative is taking it
-        // inside the C(m,2) loop below, once per occurrence.
-        std::vector<std::vector<uint64_t>> stage(emitUnitCnt);
-        for (size_t u = 0; u < emitUnitCnt; ++u) {
-            stage[u].reserve(EMIT_STAGE_BATCH);
+        // Pair occurrences staged for each (unit, key shard), flushed into the shared buffer in
+        // batches. The batch is what makes the per-buffer lock affordable: the alternative is
+        // taking it inside the C(m,2) loop below, once per occurrence. The sub-batch is the
+        // whole batch divided by the shard count, so what a thread stages in total does not
+        // grow with the striping.
+        const size_t stageBatch = std::max<size_t>(1, EMIT_STAGE_BATCH / emitShardCnt);
+        std::vector<std::vector<uint64_t>> stage(emitBufferCnt);
+        for (size_t b = 0; b < emitBufferCnt; ++b) {
+            stage[b].reserve(stageBatch);
         }
 
-        // Merge one unit's staged occurrences into the shared map. Only newly created keys
-        // count towards the budget: a repeat of a pair already buffered adds no footprint.
-        auto drainStage = [&](size_t u) {
-            if (stage[u].empty()) {
+        // Merge one buffer's staged occurrences into its shared map. Only newly created keys
+        // count towards the budget: a repeat of a pair already buffered adds no footprint. The
+        // count is exact rather than conservative because a key reaches one buffer only.
+        // Contention counters kept per thread and added once after the scan: a drain happens every
+        // few thousand pair occurrences, and touching an atomic that often would make the
+        // instrumentation a source of the contention it measures.
+        uint64_t localLockTakes = 0;
+        uint64_t localLockWaits = 0;
+        uint64_t localLockWaitMicros = 0;
+
+        auto drainStage = [&](size_t b) {
+            if (stage[b].empty()) {
                 return;
             }
             size_t newKeys = 0;
             {
-                std::unique_lock<std::mutex> guard(emitUnits[u]->lock, std::try_to_lock);
+                std::unique_lock<std::mutex> guard(emitUnits[b]->lock, std::try_to_lock);
                 if (!guard.owns_lock()) {
-                    unitLockWaits.fetch_add(1, std::memory_order_relaxed);
+                    // Timed only on the contended path, so an uncontended drain does not pay for
+                    // two clock reads.
+                    const std::chrono::steady_clock::time_point waitStart =
+                        std::chrono::steady_clock::now();
+                    ++localLockWaits;
                     guard.lock();
+                    localLockWaitMicros += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - waitStart).count());
                 }
-                unitLockTakes.fetch_add(1, std::memory_order_relaxed);
-                std::unordered_map<uint64_t, uint16_t> & shared = emitUnits[u]->pairs;
-                for (const uint64_t pairKey : stage[u]) {
+                ++localLockTakes;
+                std::unordered_map<uint64_t, uint16_t> & shared = emitUnits[b]->pairs;
+                for (const uint64_t pairKey : stage[b]) {
                     const size_t before = shared.size();
                     addSat16(shared[pairKey], 1);
                     if (shared.size() != before) { newKeys++; }
                 }
             }
-            stage[u].clear();
+            stage[b].clear();
             if (newKeys != 0) {
                 bufferedPairs.fetch_add(newKeys, std::memory_order_relaxed);
             }
@@ -1050,10 +1134,13 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                         const size_t route = routeOf(id1, id2, partitionCnt, emitRangeSize);
                         const size_t u = emitUnitIndex(
                             route, shardOf(id1, shardsForRoute(route, partitionCnt)), partitionCnt);
-                        stage[u].push_back((static_cast<uint64_t>(id1) << 32)
-                                           | static_cast<uint64_t>(id2));
-                        if (stage[u].size() >= EMIT_STAGE_BATCH) {
-                            drainStage(u);
+                        const uint64_t pairKey = (static_cast<uint64_t>(id1) << 32)
+                                                 | static_cast<uint64_t>(id2);
+                        const size_t b = u * emitShardCnt
+                                         + emitShardOf(pairKey, emitShardCnt);
+                        stage[b].push_back(pairKey);
+                        if (stage[b].size() >= stageBatch) {
+                            drainStage(b);
                         }
                     }
                 }
@@ -1071,9 +1158,11 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
                     const size_t route = routeOf(id1, id2, partitionCnt, emitRangeSize);
                     const size_t u = emitUnitIndex(
                         route, shardOf(id1, shardsForRoute(route, partitionCnt)), partitionCnt);
-                    stage[u].push_back(idHi | static_cast<uint64_t>(id2));
-                    if (stage[u].size() >= EMIT_STAGE_BATCH) {
-                        drainStage(u);
+                    const uint64_t pairKey = idHi | static_cast<uint64_t>(id2);
+                    const size_t b = u * emitShardCnt + emitShardOf(pairKey, emitShardCnt);
+                    stage[b].push_back(pairKey);
+                    if (stage[b].size() >= stageBatch) {
+                        drainStage(b);
                     }
                 }
             }
@@ -1083,8 +1172,8 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
             if (bufferedPairs.load(std::memory_order_relaxed) >= RELATION_BUDGET) {
                 // Everything this thread is holding goes in before the round starts, so a
                 // flush carries as much as it can rather than leaving a batch behind.
-                for (size_t u = 0; u < emitUnitCnt; ++u) {
-                    drainStage(u);
+                for (size_t b = 0; b < emitBufferCnt; ++b) {
+                    drainStage(b);
                 }
                 // Publish progress before the guards read it, so the projection matches the
                 // bytes that are about to be written.
@@ -1097,9 +1186,13 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         });
 
         // Nothing may stay staged past the end of this thread's scan.
-        for (size_t u = 0; u < emitUnitCnt; ++u) {
-            drainStage(u);
+        for (size_t b = 0; b < emitBufferCnt; ++b) {
+            drainStage(b);
         }
+        // After the last drain, so nothing this thread did is left out.
+        unitLockTakes.fetch_add(localLockTakes, std::memory_order_relaxed);
+        unitLockWaits.fetch_add(localLockWaits, std::memory_order_relaxed);
+        unitLockWaitMicros.fetch_add(localLockWaitMicros, std::memory_order_relaxed);
 
         // No per-thread final write: what this thread built is in the shared unit buffers, and
         // the last round after the parallel region joins carries it out.
@@ -1319,14 +1412,56 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         // What enforcing the budget costs. Harvest waits are threads queued behind a swap loop;
         // cap waits are threads held back because two rounds were already unwritten. The second
         // is the one that trades wall time for a bounded peak, so it is reported separately.
+        // Early-outs are the threads that crossed the budget but found the buffers already
+        // emptied: they used to queue for a slot to learn that. Cap waits near the round count
+        // mean the queue now holds only threads that go on to write something.
         cout << "[edges] flush waits: harvest " << flushHarvestWaits.load(std::memory_order_relaxed)
              << " (" << flushHarvestWaitMillis.load(std::memory_order_relaxed) << " ms), cap "
              << flushInFlightWaits.load(std::memory_order_relaxed)
-             << " (" << flushInFlightWaitMillis.load(std::memory_order_relaxed) << " ms)" << endl;
+             << " (" << flushInFlightWaitMillis.load(std::memory_order_relaxed) << " ms), "
+             << flushEarlyOuts.load(std::memory_order_relaxed)
+             << " early-outs before the queue" << endl;
 
         cout << "[edges] flush write: " << flushWriteMillisTotal.load(std::memory_order_relaxed)
              << " ms total, " << flushWriteMillisMax.load(std::memory_order_relaxed)
              << " ms worst round" << endl;
+
+        // Reported next to the write because it is the other half of what keeps the in-flight cap
+        // closed, and it is single-threaded where the write is not.
+        cout << "[edges] flush free: " << flushFreeMillisTotal.load(std::memory_order_relaxed)
+             << " ms total, " << flushFreeMillisMax.load(std::memory_order_relaxed)
+             << " ms worst round" << endl;
+
+        // The same time, split by what spends it. These are summed over every worker of every
+        // round, so they exceed both the line above and the wall clock once the unit loop runs in
+        // parallel -- the ratio between the four is what they are for, not their total.
+        const uint64_t buildMs = emitBuildMicros.load(std::memory_order_relaxed) / 1000;
+        const uint64_t sortMs = emitSortMicros.load(std::memory_order_relaxed) / 1000;
+        const uint64_t writeMs = emitWriteMicros.load(std::memory_order_relaxed) / 1000;
+        const uint64_t freeMs = emitFreeMicros.load(std::memory_order_relaxed) / 1000;
+        cout << "[edges] flush write split: build " << buildMs << " ms, sort " << sortMs
+             << " ms, compress+io " << writeMs << " ms, free " << freeMs << " ms" << endl;
+
+        // What the split costs in memory. The maps of a round are already resident at 48 B per
+        // pair; these vectors are the same pairs at sizeof(Relation), held only while a worker
+        // sorts and writes one unit.
+        cout << "[edges] flush writers: " << emitWriterCnt.load(std::memory_order_relaxed)
+             << " per round, vector peak "
+             << humanBytes(emitVectorPeakBytes.load(std::memory_order_relaxed)) << endl;
+
+        // The ceiling on splitting the unit loop across workers: a round is never finished before
+        // its largest unit is, so the largest unit's share of a round bounds the speed-up at
+        // 1/share whatever the worker count.
+        const uint64_t maxUnitRec = emitMaxUnitRecords.load(std::memory_order_relaxed);
+        const uint64_t roundRec = emitRoundRecords.load(std::memory_order_relaxed);
+        const double meanShare = roundRec ? static_cast<double>(maxUnitRec)
+                                                / static_cast<double>(roundRec) : 0.0;
+        const double worstShare =
+            static_cast<double>(emitWorstShareScaled.load(std::memory_order_relaxed)) / 100000.0;
+        cout << "[edges] unit skew: largest unit is " << fixed << setprecision(2)
+             << (100.0 * meanShare) << "% of a round on average (worst " << (100.0 * worstShare)
+             << "%), so a parallel unit loop caps at "
+             << (meanShare > 0.0 ? 1.0 / meanShare : 0.0) << "x" << endl;
 
         OrderStats fileStats{0, 0, 0};
         size_t fileCnt = 0;
@@ -1340,17 +1475,35 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << " over " << fileCnt << " files, "
              << this->foldRounds << " folds" << endl;
 
-        // Cost of holding the buffers per unit rather than per thread. Units are the lock
-        // domain, so few of them and many threads is the configuration to watch:
-        // --partitions 1 leaves three. Staging keeps the take count down to roughly
+        // Cost of holding the buffers per unit rather than per thread. The lock domain is a
+        // (unit, key shard), so few units and many threads is the configuration to watch:
+        // --partitions 1 leaves three units. Staging keeps the take count down to roughly
         // occurrences / EMIT_STAGE_BATCH, and a wait share near zero means the batch is doing
-        // its job.
+        // its job. Takes rise with the shard count because a batch is split that many ways;
+        // the share is what to compare across configurations, not the count.
         const uint64_t takes = unitLockTakes.load(std::memory_order_relaxed);
         const uint64_t waits = unitLockWaits.load(std::memory_order_relaxed);
         cout << "[edges] unit lock: " << takes << " takes, " << waits << " contended ("
              << fixed << setprecision(2)
              << (takes > 0 ? 100.0 * static_cast<double>(waits) / static_cast<double>(takes) : 0.0)
-             << "%), " << emitUnitCnt << " units for " << par.threads << " threads" << endl;
+             << "%), " << emitUnitCnt << " units x " << emitShardCnt << " key shards = "
+             << emitBufferCnt << " lock domains for " << par.threads << " threads" << endl;
+        // The share is what the contention costs, which the counts above cannot say: a wait is
+        // reported whether it lasted a microsecond or a second. The denominator is the emit's
+        // whole thread-time, so this is directly comparable with the cap wait on the line above.
+        {
+            const uint64_t lockMicros = unitLockWaitMicros.load(std::memory_order_relaxed);
+            const double emitThreadSeconds = static_cast<double>(time(nullptr) - beforeSearch)
+                                             * static_cast<double>(par.threads < 1 ? 1
+                                                                                  : par.threads);
+            cout << "[edges] unit lock wait: " << (lockMicros / 1000) << " ms of thread time";
+            if (emitThreadSeconds > 0.0) {
+                cout << " (" << fixed << setprecision(2)
+                     << (100.0 * (static_cast<double>(lockMicros) / 1e6) / emitThreadSeconds)
+                     << "% of emit thread time)";
+            }
+            cout << endl;
+        }
     }
     // What the run actually held at once, which is the number a shared filesystem cares about.
     // "0 folds" means the data fit under the budget and nothing was folded early -- the path
@@ -1370,42 +1523,157 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
 }
 
 void GroupGenerator::saveSubGraphToFile(
-        const std::vector<std::unordered_map<uint64_t, uint16_t>> & units,
+        std::vector<std::vector<std::unordered_map<uint64_t, uint16_t>>> & units,
         const std::vector<std::pair<size_t, size_t>> & unitKey,
         const size_t counter_now) {
     // The units arrive already partitioned: routeOf/shardOf ran at insertion time, so a pair
     // reached exactly one unit and cannot appear under two. That is what still makes the
     // per-route merges independent.
+    // One entry per file, indexed by unit rather than appended: the units are written by several
+    // workers below and the order they finish in is not fixed, but the log has to be.
+    std::vector<uint64_t> flushFileBytes(units.size(), 0);
+
+    // A unit owns its maps, its sort and its file, and two units never touch the same bytes, so the
+    // loop below splits with nothing to synchronise. That the output cannot change with the split
+    // rests on three facts, in order of how easy they are to get wrong:
+    //   - a unit's file name is subGraphName(counter_now, route, shard) and no two units share one;
+    //   - a file's contents are a function of its unit's maps alone. Relation::compare is a total
+    //     order on (id1, id2), a map cannot hold the same key twice, and the unit's key shards hold
+    //     disjoint keys (emitShardOf is a function of the key), so the sort has one answer;
+    //   - everything written outside a worker's own slots is either a sum (compressedBytes, the
+    //     three timing totals) or a maximum (the skew), both order-independent.
+    // markEmitComplete stays after the join for the same reason it was after the loop: it is what
+    // lets a fold list this index, and a fold may not see an index whose files are still open.
+    // RelationWriter failure calls relationStreamFatal, which exits the process -- dying inside a
+    // worker ends the run just as it did inside the loop, and this repository does not use
+    // exceptions, so there is nothing to propagate across the join.
+    const size_t writerCnt = subGraphWriters(units.size(), par.threads);
+    std::vector<uint64_t> wBuild(writerCnt, 0), wSort(writerCnt, 0), wWrite(writerCnt, 0);
+    std::vector<uint64_t> wFree(writerCnt, 0);
+    std::vector<uint64_t> wRecords(writerCnt, 0), wMaxUnit(writerCnt, 0), wBytes(writerCnt, 0);
+
+    const auto microsSince = [](const std::chrono::steady_clock::time_point & from) -> uint64_t {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - from).count());
+    };
+
+    // Strided, not blocked: adjacent units are the shards of one route and carry similar loads, so
+    // a stride spreads the heavy cross shards over every worker. Static either way, which keeps a
+    // run reproducible.
+    const auto writeUnits = [&](const size_t w) {
+        for (size_t u = w; u < units.size(); u += writerCnt) {
+            const std::chrono::steady_clock::time_point buildStart =
+                std::chrono::steady_clock::now();
+            // The unit's shards are concatenated, not merged: their key sets are disjoint, so no
+            // pair can appear twice in the result and no weight needs re-summing.
+            size_t unitRecords = 0;
+            for (const auto & shard : units[u]) {
+                unitRecords += shard.size();
+            }
+            std::vector<Relation> relations;
+            relations.reserve(unitRecords);
+            for (const auto & shard : units[u]) {
+                for (const auto & entry : shard) {
+                    const uint64_t pairKey = entry.first;
+                    relations.push_back(makeRelation(static_cast<uint32_t>(pairKey >> 32),
+                                                     static_cast<uint32_t>(pairKey & 0xFFFFFFFF),
+                                                     entry.second));
+                }
+            }
+            wBuild[w] += microsSince(buildStart);
+
+            // The records are copied out, so the maps are dead weight from here on. Releasing them
+            // now rather than at the caller's scope exit is the same work on a different thread:
+            // this worker owns unit u alone, and no other worker or round reads it. It also takes
+            // the unit's footprint down to the vector before the sort touches it.
+            const std::chrono::steady_clock::time_point freeStart =
+                std::chrono::steady_clock::now();
+            for (auto & shard : units[u]) {
+                std::unordered_map<uint64_t, uint16_t>().swap(shard);
+            }
+            wFree[w] += microsSince(freeStart);
+
+            const std::chrono::steady_clock::time_point sortStart =
+                std::chrono::steady_clock::now();
+            sort(relations.begin(), relations.end(), Relation::compare);
+            wSort[w] += microsSince(sortStart);
+
+            wRecords[w] += relations.size();
+            if (relations.size() > wMaxUnit[w]) { wMaxUnit[w] = relations.size(); }
+
+            // Empty units still get an empty file: the merge's input list is then simply
+            // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
+            const string subGraphFileName = subGraphName(counter_now, unitKey[u].first,
+                                                         unitKey[u].second);
+            const std::chrono::steady_clock::time_point writeStart =
+                std::chrono::steady_clock::now();
+            RelationWriter out(subGraphFileName);
+            for (size_t i = 0; i < relations.size(); ++i) {
+                out.write(relations[i]);
+            }
+            out.finish();
+            wWrite[w] += microsSince(writeStart);
+            wBytes[w] += out.compressedBytes();
+            flushFileBytes[u] = out.compressedBytes();
+        }
+    };
+
+    if (writerCnt <= 1) {
+        writeUnits(0);
+    } else {
+        // Worker 0 runs here rather than in a thread of its own: one fewer thread per round, and
+        // --threads 1 then takes exactly the serial path above.
+        std::vector<std::thread> writers;
+        writers.reserve(writerCnt - 1);
+        for (size_t w = 1; w < writerCnt; ++w) {
+            writers.emplace_back(writeUnits, w);
+        }
+        writeUnits(0);
+        for (size_t w = 0; w < writers.size(); ++w) {
+            writers[w].join();
+        }
+    }
+
     uint64_t compressedBytes = 0;
-    // One entry per file, appended to the shared vector once at the end of the flush rather
-    // than per file, so the lock is taken once per flush instead of once per unit.
-    std::vector<uint64_t> flushFileBytes;
-    flushFileBytes.reserve(units.size());
+    uint64_t buildMicros = 0, sortMicros = 0, writeMicros = 0, freeMicros = 0;
+    uint64_t roundRecords = 0, maxUnitRecords = 0;
+    for (size_t w = 0; w < writerCnt; ++w) {
+        compressedBytes += wBytes[w];
+        buildMicros += wBuild[w];
+        sortMicros += wSort[w];
+        writeMicros += wWrite[w];
+        freeMicros += wFree[w];
+        roundRecords += wRecords[w];
+        if (wMaxUnit[w] > maxUnitRecords) { maxUnitRecords = wMaxUnit[w]; }
+    }
 
-    for (size_t u = 0; u < units.size(); ++u) {
-        std::vector<Relation> relations;
-        relations.reserve(units[u].size());
-        for (const auto & entry : units[u]) {
-            const uint64_t pairKey = entry.first;
-            relations.push_back(makeRelation(static_cast<uint32_t>(pairKey >> 32),
-                                             static_cast<uint32_t>(pairKey & 0xFFFFFFFF),
-                                             entry.second));
+    // Records held as vectors at once, which is what this change adds to the peak. Each worker
+    // holds one unit at a time, so the bound is writers x the largest unit -- against the maps of
+    // the same round, already resident at 48 B per pair to this 12.
+    {
+        const uint64_t vectorBound = static_cast<uint64_t>(writerCnt) * maxUnitRecords
+                                     * sizeof(Relation);
+        uint64_t peak = emitVectorPeakBytes.load(std::memory_order_relaxed);
+        while (peak < vectorBound
+               && !emitVectorPeakBytes.compare_exchange_weak(peak, vectorBound,
+                                                             std::memory_order_relaxed)) {
         }
-        sort(relations.begin(), relations.end(), Relation::compare);
+        emitWriterCnt.store(writerCnt, std::memory_order_relaxed);
+    }
 
-        // Empty units still get an empty file: the merge's input list is then simply
-        // subGraph_{0..numOfGraph-1}_{route}_{shard} with no existence checks.
-        const string subGraphFileName = subGraphName(counter_now, unitKey[u].first,
-                                                     unitKey[u].second);
-        // A failed write used to be reported and skipped. It is fatal now: the merge would
-        // otherwise read a file that is missing or short and produce a silently wrong graph.
-        RelationWriter out(subGraphFileName);
-        for (size_t i = 0; i < relations.size(); ++i) {
-            out.write(relations[i]);
+    emitBuildMicros.fetch_add(buildMicros, std::memory_order_relaxed);
+    emitSortMicros.fetch_add(sortMicros, std::memory_order_relaxed);
+    emitWriteMicros.fetch_add(writeMicros, std::memory_order_relaxed);
+    emitFreeMicros.fetch_add(freeMicros, std::memory_order_relaxed);
+    emitMaxUnitRecords.fetch_add(maxUnitRecords, std::memory_order_relaxed);
+    emitRoundRecords.fetch_add(roundRecords, std::memory_order_relaxed);
+    if (roundRecords > 0) {
+        const uint64_t shareScaled = (maxUnitRecords * 100000) / roundRecords;
+        uint64_t worst = emitWorstShareScaled.load(std::memory_order_relaxed);
+        while (worst < shareScaled
+               && !emitWorstShareScaled.compare_exchange_weak(worst, shareScaled,
+                                                              std::memory_order_relaxed)) {
         }
-        out.finish();
-        compressedBytes += out.compressedBytes();
-        flushFileBytes.push_back(out.compressedBytes());
     }
 
     {

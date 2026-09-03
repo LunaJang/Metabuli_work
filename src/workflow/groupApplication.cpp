@@ -25,29 +25,19 @@ int groupApplication(int argc, const char **argv, const Command& command)
         cout << "         Make sure that score column is correctly set using --score-col." << endl;
     }
 
-    if (par.seqMode == 2) {
-        // Check if the second argument is a directory
-        if (FileUtil::directoryExists(par.filenames[1].c_str())) {
-            cerr << "Error: " << par.filenames[1] << " is a directory. Please specify a query file name." << endl;
-            cerr << "       For '--seq-mode 2', please provide two query files." << endl;
-            exit(1);
-        }
-
-        if (!FileUtil::directoryExists(par.filenames[5].c_str())) {
-            FileUtil::makeDir(par.filenames[5].c_str());
-        }
-    } else {
-        // Check if the second argument is file
-        if (FileUtil::fileExists(par.filenames[1].c_str()) 
-            && !FileUtil::directoryExists(par.filenames[1].c_str())) {
-            cerr << "Error: " << par.filenames[1] << " is a file. Please specify a database directory." << endl;
-            cerr << "       For '--seq-mode 1' and '--seq-mode 3', please provide one query file." << endl;
-            exit(1);
-        }
-
-        if (!FileUtil::directoryExists(par.filenames[4].c_str())) {
-            FileUtil::makeDir(par.filenames[4].c_str());
-        }
+    // apply-group takes exactly five arguments -- group result, group mapping result, taxonomy
+    // directory, read-by-read result, output directory -- and GroupApplier's constructor reads
+    // filenames[0..4]. The output directory is therefore always index 4.
+    //
+    // This used to branch on --seq-mode and, for the default of 2, index filenames[5] and check
+    // filenames[1] for being a directory. Both were wrong: there is no sixth argument, so
+    // filenames[5] was an unchecked std::vector::operator[] past the end -- undefined behaviour
+    // that happened not to crash -- and filenames[1] is the group mapping FILE, so the check
+    // rejected the correct input rather than a wrong one. The branch was copied from
+    // groupGeneration, where --seq-mode does shift the argument positions. apply-group never
+    // reads par.seqMode at all (nothing in GroupApplier references it).
+    if (!FileUtil::directoryExists(par.filenames[4].c_str())) {
+        FileUtil::makeDir(par.filenames[4].c_str());
     }
 
 #ifdef OPENMP

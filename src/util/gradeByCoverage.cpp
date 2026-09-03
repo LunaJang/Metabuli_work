@@ -82,6 +82,9 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
     const string covMappingFile  = par.filenames[2]; // accession<whitespace>coverage
     const string taxonomy        = par.filenames[3];
 
+    // No negative-value check on --readid-col / --taxid-col: their parameter regex is ^[0-9]+$,
+    // so the argument parser rejects a negative before it reaches here.
+
     vector<string> ranks = par.testRank.empty()
         ? vector<string>{"class", "order", "family", "genus", "species"}
         : Util::split(par.testRank, ",");
@@ -161,8 +164,23 @@ int gradeByCoverage(int argc, const char **argv, const Command &command) {
             while (getline(cf, line)) {
                 if (line.empty() || line[0] == '#') continue;
                 auto fields = Util::split(line, "\t");
-                if ((int)fields.size() <= max(par.readIdCol, par.taxidCol)) continue;
-                if (!isdigit(fields[par.taxidCol][0])) continue;
+                // Fatal, not skipped. Blank lines are already gone above, so a short line here
+                // means the column indices do not match the file: every record would be skipped
+                // and the run would report a score computed over nothing. Silently continuing is
+                // what let a centrifuge run against the metabuli defaults produce output files
+                // while `grade` on the same input segfaulted. exit rather than return because
+                // this loop is inside the #pragma omp parallel above.
+                if ((int) fields.size() <= max(par.readIdCol, par.taxidCol)) {
+                    cerr << "Error: " << classFiles[i] << " has a line with " << fields.size()
+                         << " tab-separated fields, but --readid-col " << par.readIdCol
+                         << " --taxid-col " << par.taxidCol << " needs at least "
+                         << (max(par.readIdCol, par.taxidCol) + 1) << "." << endl;
+                    cerr << "       The line was: " << line << endl;
+                    cerr << "       These are ZERO-based indices. Centrifuge writes"
+                         << " readID/seqID/taxID, so it needs --readid-col 0 --taxid-col 2." << endl;
+                    exit(EXIT_FAILURE);
+                }
+                if (fields[par.taxidCol].empty() || !isdigit(fields[par.taxidCol][0])) continue;
 
                 string id = fields[par.readIdCol];
                 int classInt = stoi(fields[par.taxidCol]);

@@ -41,8 +41,22 @@ void GroupApplier::startGroupApplication(const LocalParameters &par) {
 
     unordered_map<uint32_t, unordered_set<uint32_t>> groupInfo;
     vector<uint32_t> groupMappingInfo;
-    groupMappingInfo.resize(processedReadCnt, 0);
+    // No pre-sizing: loadGroupsFromFile clears the vector and fills it from the file, so a
+    // resize here was dead code that read as a bounds guarantee it did not provide.
     loadGroupsFromFile(groupInfo, groupMappingInfo, groupFileDir, groupmapFileDir);
+
+    // applyRepLabel walks orgResults and indexes groupMappingInfo by the same counter, so the two
+    // have to describe the same reads in the same order. A shorter map is an unchecked read past
+    // the end of a vector; a longer one means the two files are from different runs and every
+    // label would be applied to the wrong read. Neither can be recovered from here.
+    if (groupMappingInfo.size() != processedReadCnt) {
+        cerr << "Error: " << groupmapFileDir << " has " << groupMappingInfo.size()
+             << " read-to-group rows but " << orgRes << " has " << processedReadCnt
+             << " classified reads." << endl;
+        cerr << "       These must be the same reads in the same order -- the grouping run and"
+             << " the classification run have to share their input." << endl;
+        exit(EXIT_FAILURE);
+    }
 
     std::unordered_map<int, int> external2internalTaxId;
     taxonomy->getExternal2internalTaxID(external2internalTaxId);

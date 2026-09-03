@@ -574,6 +574,28 @@ inline uint32_t pickStarHub(const std::vector<uint32_t> & ids,
     return hub;
 }
 
+// Workers that write one flush round's unit files at the same time.
+//
+// The unit loop is the round's whole cost and it is embarrassingly parallel: a unit owns its map,
+// its sort and its file, and two units never touch the same bytes. Splitting it is what takes a
+// round off the critical path.
+//
+// Bounded by the thread count because that is what the user asked for -- a job given four cores by
+// its scheduler gets no more CPU by spawning sixteen writers, only more contention -- and by the
+// unit count because there is nothing for a further worker to do. No constant ceiling: the useful
+// maximum is set by how lopsided a round is, and that follows --partitions (the cross route is
+// sharded that many ways), so a literal here would be right at one partition count and wrong at
+// every other.
+//
+// Deriving this from --threads does not reintroduce the dependency that 0b44e30d and e984f9f1
+// removed. Those were about the grouping itself; this only decides who writes which file, and a
+// file's name and contents are fixed by its unit. concurrentFlushRounds() is the opposite case and
+// stays a constant: it bounds resident memory, which must not follow the core count.
+inline size_t subGraphWriters(size_t unitCnt, int threads) {
+    const size_t workers = static_cast<size_t>(threads < 1 ? 1 : threads);
+    return std::min(unitCnt < 1 ? 1 : unitCnt, workers);
+}
+
 // Width of one id range in the relations_* routing scheme. The count is --partitions, not
 // --threads: the two were the same number until 2026-08-26, which is what made the result depend
 // on the thread count.
@@ -644,14 +666,51 @@ inline size_t emitUnitIndex(size_t route, size_t shard, int partitionCnt) {
     return cross + shardsForRoute(cross, partitionCnt) + (route - cross - 1);
 }
 
-// One emit buffer per unit, shared by every thread. Holding the map per unit rather than per
-// thread is what takes the flush unit off --threads: a flush empties all of these at once, so
-// what lands in a file is the whole budget divided by the unit count, whatever the thread count.
-// Non-copyable and non-movable because of the mutex, hence held by unique_ptr in a vector.
+// One emit buffer per (unit, key shard), shared by every thread. Holding the map per unit rather
+// than per thread is what takes the flush unit off --threads: a flush empties all of these at
+// once, so what lands in a file is the whole budget divided by the unit count, whatever the
+// thread count. Non-copyable and non-movable because of the mutex, hence held by unique_ptr in a
+// vector.
 struct EmitUnitBuffer {
     std::mutex lock;
     std::unordered_map<uint64_t, uint16_t> pairs;
 };
+
+// Lock domains a unit's buffer is split into. One buffer per unit put 128 threads on 48 mutexes
+// and 74.74% of the takes had to wait for one (CAMI2 strain-madness, job 550906); striping the
+// unit's keys over several mutexes multiplies the domains by this factor.
+//
+// Two domains per worker, so a worker usually finds a free one on its first try. A power of two
+// because the shard of a key is picked inside the C(m,2) loop -- the hottest loop in the program
+// -- where a 64-bit division would cost more than the hash insert it is there to spread. Capped
+// at 16 because a thread's staging batch is split S ways to keep its footprint fixed, and past
+// that the sub-batch is too small to amortise the lock it exists to amortise.
+//
+// --threads 1 gives 1, which is byte-for-byte the pre-shard code path.
+inline size_t emitUnitShards(size_t unitCnt, int threads) {
+    const size_t workers = static_cast<size_t>(threads < 1 ? 1 : threads);
+    const size_t units = (unitCnt < 1) ? 1 : unitCnt;
+    const size_t want = (workers * 2 + units - 1) / units;
+    size_t shards = 1;
+    while (shards < want && shards < 16) {
+        shards <<= 1;
+    }
+    return shards;
+}
+
+// Which of a unit's shards a pair belongs to. A function of the key alone, which is the whole
+// reason this split cannot change what a file holds: every occurrence of a pair meets in one
+// shard, so a unit's shards hold disjoint key sets and their union is the map they replace --
+// same keys, same weights, same count. Sharding by thread instead would scatter one pair over
+// several maps, turning it into several records and making the budget count it several times.
+//
+// Multiplied before masking: the low bits of pairKey are id2 and the high bits id1, and within a
+// unit id1 is already constrained by routeOf/shardOf, so masking the raw key would leave the
+// spread to id2 alone. shardCnt is a power of two, so the mask replaces a division.
+inline size_t emitShardOf(uint64_t pairKey, size_t shardCnt) {
+    const uint64_t mixed = pairKey * 0x9E3779B97F4A7C15ULL;
+    return static_cast<size_t>(mixed >> 32) & (shardCnt - 1);
+}
 
 // How many pair occurrences a thread stages for one unit before taking that unit's lock. The
 // insertion site is the C(m,2) loop, the hottest in the program -- locking per occurrence would
@@ -1191,6 +1250,33 @@ protected:
     size_t foldRounds = 0;
     std::vector<std::vector<std::string>> foldedOutputs; // [unit] -> folded file names
 
+    // Where a flush round's time goes, split four ways, summed over every round in microseconds.
+    // The round total is already reported; this says whether it is the sort, the map-to-vector
+    // build, zstd or releasing the maps that owns it, which is what decides whether parallelising
+    // the unit loop is worth doing and what its ceiling is. Rounds overlap, so these sums can
+    // exceed the wall clock. `free` was measured last and was the largest single item on the
+    // calling thread before it moved into the workers.
+    std::atomic<uint64_t> emitBuildMicros{0};
+    std::atomic<uint64_t> emitSortMicros{0};
+    std::atomic<uint64_t> emitWriteMicros{0};
+    std::atomic<uint64_t> emitFreeMicros{0};
+
+    // How lopsided a round is. Splitting the unit loop across workers cannot go faster than its
+    // largest unit, so the largest unit's share of a round is the speed-up ceiling: a round whose
+    // biggest unit holds 1/x of the records can at best be x times faster. Summed over rounds so
+    // the ratio of the two gives the average share; the worst single round is tracked separately
+    // in hundred-thousandths -- coarser scaling truncates the worst round below the average,
+    // which reads as a contradiction.
+    std::atomic<uint64_t> emitMaxUnitRecords{0};
+    std::atomic<uint64_t> emitRoundRecords{0};
+    std::atomic<uint64_t> emitWorstShareScaled{0};
+
+    // What parallelising the unit loop adds to the peak: each worker holds one unit's records as a
+    // vector while it sorts and writes them, so the bound is writers x the largest unit. Reported
+    // next to the round's maps, which hold the same pairs at 48 B each against this 12.
+    std::atomic<uint64_t> emitVectorPeakBytes{0};
+    std::atomic<size_t> emitWriterCnt{0};
+
     // Live footprint of subGraph_* and its high-water mark. Signed because a fold subtracts its
     // inputs before adding its output.
     std::atomic<int64_t> subGraphLiveBytes{0};
@@ -1345,9 +1431,17 @@ public:
     // (route, shard) of unit u, so the caller's flat index survives into the file name.
     // Every unit gets a file even when empty: the merge lists its inputs by name without
     // checking existence, and a missing file would be read as a short stream.
-    void saveSubGraphToFile(const std::vector<std::unordered_map<uint64_t, uint16_t>> & units,
-                            const std::vector<std::pair<size_t, size_t>> & unitKey,
-                            const size_t counter_now);
+    // `units[u]` is the unit's key shards, whose key sets are disjoint (see emitShardOf), so the
+    // file is built by concatenating them and sorting once -- no re-summing of weights.
+    // Takes `units` by mutable reference and empties each unit as soon as its records are copied
+    // out: a round holds up to RELATION_BUDGET individually allocated nodes, and freeing them on
+    // the calling thread afterwards cost 3.9x the parallel write it followed while still holding
+    // the round's in-flight slot. Emptying here spreads that over the same workers and drops the
+    // unit's resident bytes from 60 per pair to the vector's 12 before the sort begins.
+    void saveSubGraphToFile(
+            std::vector<std::vector<std::unordered_map<uint64_t, uint16_t>>> & units,
+            const std::vector<std::pair<size_t, size_t>> & unitKey,
+            const size_t counter_now);
 
     // No processedReadCnt: routing now happens in saveSubGraphToFile, which is where the
     // read count is needed. This function only folds and merges what is already partitioned.
