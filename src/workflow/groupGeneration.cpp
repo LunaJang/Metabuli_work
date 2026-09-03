@@ -21,10 +21,35 @@ void setGroupGenerationDefaults(LocalParameters & par){
     par.maxKmerReads = 0;
     par.maxKmerQuantile = 0.995f;
 
-    // Phase 1 core threshold as a fraction of k-mers per read. Measured on the species-inclusion
-    // benchmark (61.7 M reads, 49.6 k-mers/read -> core threshold 15): 0.3 is the peak, with 0.2,
-    // 0.4 and 0.5 all below it.
-    par.minOverlapRatio = 0.3f;
+    // Phase 1 core threshold as a fraction of k-mers per read.
+    //
+    // 0.5 since 2026-09-03, chosen for purity. The earlier 0.3 came from an F1 peak on the
+    // species-inclusion benchmark; sweeping 0.30 / 0.40 / 0.50 / 0.60 at 203c83a3 on two datasets
+    // says F1 is the wrong thing to read.
+    //
+    // CAMI2 strain-madness, species purity and Recall x c (c = grouped reads / all reads, because
+    // gradeGroup's recall denominator excludes ungrouped reads):
+    //
+    //   rho    purity     Recall x c   core
+    //   0.30   0.670474   0.3379       24
+    //   0.40   0.939313   0.1827       33
+    //   0.50   0.953477   0.0482       41
+    //   0.60   0.958674   0.0274       49
+    //
+    // Purity saturates: +0.269, then +0.014, then +0.005. It never reaches the 0.98 bar, and past
+    // 0.5 the remaining purity is bought at a steep price -- 0.5 -> 0.6 gains 0.005 of purity for
+    // 43% of what is left of Recall x c. 0.5 is where that trade stops being worth taking.
+    //
+    // species-exclusion wants the opposite: purity is 0.999 at every rho, so the bar cannot
+    // choose, and Recall x c falls monotonically (0.1679 / 0.1374 / 0.1209 / 0.1092). A simulated
+    // benchmark with a per-read key and controlled coverage does not constrain rho; real
+    // strain-level data does. The default follows the harder case.
+    //
+    // This is a default, not a bound: every script passes --min-overlap-ratio explicitly, so the
+    // value here only decides what a bare `metabuli grouping` does. It is set to the operating
+    // point the paper reports so those two cannot disagree -- the same failure --max-kmer-reads
+    // and --max-kmer-quantile had until 2026-08-29.
+    par.minOverlapRatio = 0.5f;
     // Weak-band lower bound as a fraction of the core threshold, also Phase 3's floor.
     // 5/15 = 0.3333 reproduces the species-inclusion operating point, where the band was (5, 15].
     // The absolute 5 it replaces meant different things per dataset: 5/15 = 0.333 of the core on

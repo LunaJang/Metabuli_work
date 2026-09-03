@@ -679,14 +679,16 @@ LocalParameters::LocalParameters() :
     rank = "";
     higherRankFile = 0;
 
-    // Group generation. Both thresholds are ratios so that one value transfers across datasets;
-    // the operating point comes from the species-inclusion benchmark (61.7 M reads, 49.6 k-mers
-    // per read -> core threshold 15, weak band (5, 15]). 5/15 = 0.3333 is where --weak-band-ratio
-    // comes from. See setGroupGenerationDefaults(), which overrides these for the grouping
-    // workflow -- both places have to agree.
+    // Group generation. Both thresholds are ratios so that one value transfers across datasets.
+    // --weak-band-ratio's 0.3333 comes from the species-inclusion benchmark (61.7 M reads,
+    // 49.6 k-mers per read -> core threshold 15, weak band (5, 15]); --min-overlap-ratio's 0.5
+    // comes from the 2026-09-03 rho sweep on CAMI2 strain-madness and species-exclusion, where
+    // purity saturates and 0.5 is the last point whose purity gain is worth its recall cost.
+    // See setGroupGenerationDefaults(), which carries that reasoning in full and overrides these
+    // for the grouping workflow -- both places have to agree.
     maxKmerReads = 0;
     maxKmerQuantile = 0.995f;
-    minOverlapRatio = 0.3f;
+    minOverlapRatio = 0.5f;
     weakBandRatio = 0.3333f;
     partitions = 16;
     // 0 = clique. Spelled as a literal rather than EdgeMode: that enum lives in the read-group
