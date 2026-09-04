@@ -608,6 +608,39 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     cout << "Connecting reads with shared k-mer..." << endl;
     time_t beforeSearch = time(nullptr);
 
+    // Checked here, before hours of work, because the alternative is finding out inside the
+    // OpenMP region where ReadBuffer's exit turns into a segmentation fault with no diagnosis.
+    // Both scans below -- the quantile pre-pass and the emit pass -- hold every split of every
+    // thread open at once; see scanKmerRunsFdDemand for why lowering the thread count only in
+    // this stage would drop whole partitions instead of fixing it.
+    {
+        const size_t demand = scanKmerRunsFdDemand(numOfSplits, par.threads);
+        const size_t limit = getOpenFileLimit();
+        const size_t held = openFdCount();
+        // Room for the subGraph writers, the relations writers, stdio and the taxonomy handles.
+        const size_t reserve = emitUnitCount(partitionCnt) + 64;
+        if (demand + held + reserve > limit) {
+            const size_t needed = demand + held + reserve;
+            cerr << "Error: this run needs about " << needed << " open files but the soft limit is "
+                 << limit << "." << endl;
+            cerr << "       The k-mer scan holds every split open on every thread: "
+                 << par.threads << " threads x " << numOfSplits << " splits x 2 = " << demand
+                 << ", plus " << held << " already open and " << reserve << " in reserve." << endl;
+            const size_t spare = (limit > held + reserve) ? (limit - held - reserve) : 0;
+            const size_t fits = (numOfSplits > 0) ? spare / (numOfSplits * 2) : 0;
+            cerr << "       Raise it with 'ulimit -n " << needed << "' (hard limit permitting)";
+            if (fits >= 1) {
+                cerr << ", or run with --threads " << fits
+                     << " or fewer -- the scan's demand is proportional to it, and the grouping"
+                     << " output does not depend on the thread count." << endl;
+            } else {
+                cerr << ". No thread count fits at this limit: even one thread needs "
+                     << (numOfSplits * 2) << " descriptors for the scan." << endl;
+            }
+            exit(EXIT_FAILURE);
+        }
+    }
+
     // The per-read counts have to add up to the total the same filter reported, or the split
     // offset is wrong and every hub choice built on them is wrong with it. Cheap to check and
     // impossible to notice otherwise -- a mis-offset array still produces a plausible graph.
@@ -716,9 +749,15 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
     // Microseconds because a hold is a few thousand hash inserts, which is under a millisecond.
     std::atomic<uint64_t> unitLockWaitMicros(0);
 
+    // The projected peak is printed next to the budget on purpose. Until 2026-09-04 the budget was
+    // whatever a 200 M clamp allowed and the peak was nowhere in the log, so a run that declared
+    // --max-ram 128 quietly used a fifth of it and nothing said so.
     cout << "Flush budget: " << RELATION_BUDGET << " pairs across all threads (memory budget "
          << humanBytes(getMemoryBudgetBytes(par.ramUsage)) << ", --max-ram "
-         << par.ramUsage << " GiB)" << endl;
+         << par.ramUsage << " GiB; projected emit peak "
+         << humanBytes(projectedEmitPeakBytes(par.ramUsage)) << " = "
+         << peakBytesPerBufferedPair() << " B/pair x " << (concurrentFlushRounds() + 1)
+         << " rounds)" << endl;
 
     // Disk counterpart of the memory budget above. A safety ceiling, not a target: a run that
     // fits under it behaves exactly as it does without one.
@@ -1459,6 +1498,18 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
              << " over " << fileCnt << " files, "
              << this->foldRounds << " folds" << endl;
 
+        // Once per run, next to the other emit costs. The [disk] fold line prints once per fold
+        // and carries no duration; this is what says whether folding is worth attacking.
+        if (this->foldRounds > 0) {
+            const uint64_t foldMs = foldMillisTotal.load(std::memory_order_relaxed);
+            const uint64_t units = foldUnitsDone.load(std::memory_order_relaxed);
+            cout << "[edges] fold cost: " << foldMs << " ms over " << this->foldRounds
+                 << " folds, worst fold " << foldMillisMax.load(std::memory_order_relaxed)
+                 << " ms, worst unit " << foldUnitMillisMax.load(std::memory_order_relaxed)
+                 << " ms, mean unit " << (units ? foldMs / units : 0) << " ms over "
+                 << units << " unit merges" << endl;
+        }
+
         // Cost of holding the buffers per unit rather than per thread. The lock domain is a
         // (unit, key shard), so few units and many threads is the configuration to watch:
         // --partitions 1 leaves three units. Staging keeps the take count down to roughly
@@ -1784,9 +1835,17 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
     // One extra stream per unit for the previous fold's output, which is re-folded below.
     const size_t bufElems = getMergeBufferElems(to - from + 1, par.ramUsage, 1);
     size_t foldedFiles = 0;
+    // Timed because nothing timed it before. A fold rewrites every unit's accumulated output, so
+    // it is the single longest thing this stage does on a large input, and it holds an in-flight
+    // slot while it runs -- yet the only trace it left was the write time of whichever round
+    // happened to overlap it.
+    uint64_t foldUnitMaxMillis = 0;
+    const std::chrono::steady_clock::time_point foldStart = std::chrono::steady_clock::now();
     for (size_t route = 0; route < routeCnt; ++route) {
         const size_t shardCnt = shardsForRoute(route, partitionCnt);
         for (size_t shard = 0; shard < shardCnt; ++shard) {
+            const std::chrono::steady_clock::time_point unitStart =
+                std::chrono::steady_clock::now();
             // Earlier folds' outputs go back in. Folding only the new flushes would let those
             // outputs pile up untouched, and the live footprint would climb past the budget one
             // fold at a time. Re-folding keeps exactly one file per unit, so the footprint
@@ -1812,6 +1871,33 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
             noteSubGraphBytes(static_cast<int64_t>(FileUtil::getFileSize(output)));
             folded.assign(1, output);
             ++foldedFiles;
+
+            const uint64_t unitMillis = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - unitStart).count());
+            if (unitMillis > foldUnitMaxMillis) { foldUnitMaxMillis = unitMillis; }
+        }
+    }
+
+    // Accumulated once per fold rather than once per unit: a fold is rare and this keeps the
+    // counters off the unit loop, which step 5 of this plan parallelises.
+    const uint64_t foldMillis = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - foldStart).count());
+    foldMillisTotal.fetch_add(foldMillis, std::memory_order_relaxed);
+    foldUnitsDone.fetch_add(foldedFiles, std::memory_order_relaxed);
+    {
+        uint64_t prev = foldMillisMax.load(std::memory_order_relaxed);
+        while (prev < foldMillis
+               && !foldMillisMax.compare_exchange_weak(prev, foldMillis,
+                                                       std::memory_order_relaxed)) {
+        }
+    }
+    {
+        uint64_t prev = foldUnitMillisMax.load(std::memory_order_relaxed);
+        while (prev < foldUnitMaxMillis
+               && !foldUnitMillisMax.compare_exchange_weak(prev, foldUnitMaxMillis,
+                                                           std::memory_order_relaxed)) {
         }
     }
 
