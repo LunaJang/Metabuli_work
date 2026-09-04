@@ -499,6 +499,38 @@ inline size_t getTmpDiskBudgetBytes(const std::string & outDir, int maxTmpDiskMi
     return freeBytes / 100 * 80;
 }
 
+// The budget below divides by the peak this many rounds can hold, so it has to come first.
+//
+// Flush rounds that may be harvested but not yet written at the same time.
+//
+// A round's harvest empties the unit buffers, so the budget is honoured the moment it runs -- but
+// the harvested data stays in memory until the write finishes. Capping how many rounds may sit in
+// that state is what keeps the peak bounded: resident is at most (this + 1) rounds' worth.
+//
+// A constant, deliberately not derived from --threads. Deriving it would put the peak back on the
+// worker count, which is the dependency the 2026-08-27 and 2026-08-28 work exists to remove: the
+// same input would then need a bigger machine on a bigger node. Two lets one round be written
+// while the next fills, which is the whole overlap there is to win; a third would buy nothing
+// because the harvest is serialised anyway.
+inline size_t concurrentFlushRounds() {
+    return 2;
+}
+
+// Bytes a buffered pair costs at the peak of a round.
+//
+// 48 is the unordered_map node. The extra 12 is sizeof(Relation): saveSubGraphToFile copies a
+// unit's entries into a vector and only then releases that unit's map, so while a worker is
+// copying it holds both representations. Across a whole round the vectors replace the maps unit
+// by unit rather than adding to them, which bounds the transient at map + vector rather than at
+// twice either -- but the bound is 60, not 48.
+//
+// The [edges] flush writers line reports a larger "vector peak" than 12 B per pair. That figure
+// is writers x largest unit x sizeof(Relation), an upper bound that assumes every worker holds a
+// copy of the biggest unit; the true total across workers cannot exceed one round's pairs.
+inline size_t peakBytesPerBufferedPair() {
+    return 48 + sizeof(Relation);
+}
+
 // Pairs the emit stage may hold in memory across ALL threads before flushing.
 //
 // This used to divide the budget by the thread count and hand each thread its own quota. Total
@@ -509,36 +541,43 @@ inline size_t getTmpDiskBudgetBytes(const std::string & outDir, int maxTmpDiskMi
 // 18,672. The merge then folded 23 times instead of once and the run took 8h 08m instead of
 // 3h 40m. Shared here so both numbers stop tracking --threads.
 //
-// MAX_THRESHOLD is now what a single thread can be asked to hold when --threads is 1:
-// 200 M entries x 48 B is 9.6 GB, which fits the budgets these runs use (128 GiB) but is worth
-// remembering if the cap is ever raised.
+// The divisor is the whole peak, not one round's share. Until 2026-09-04 it was 48 B with no
+// account of concurrentFlushRounds(), and a MAX_THRESHOLD of 200 M silently made up the
+// difference: at --max-ram 128 the formula produced 1.72e9 and the clamp cut it to 2e8, so the
+// clamp -- not the formula -- was what kept the peak at the 28.8 GB the comment above used to
+// quote. Removing the clamp without fixing the divisor would have asked for
+// 3 x 1.72e9 x 48 B = 247 GB against a declared 128 GiB.
+//
+// With the peak in the divisor the clamp is unnecessary and the declared limit means what it
+// says: --max-ram 128 now yields about 4.6e8 pairs and a peak near 82 GB, 60% of the declaration.
+// That is 2.3x the old budget, so a run needs 2.3x fewer flush rounds and folds fewer times --
+// folding is triggered by the round count passing the merge fan-in, not by disk.
+//
+// This does not change what the run produces. The budget decides only where round boundaries
+// fall; which pairs exist and what weight each carries are properties of the k-mers. Weights
+// combine with addSat16, and min(65535, sum) over non-negative addends is independent of how the
+// sum is split. Verified on the 120x fixture: 110 rounds against 112, and 80 against 92, produced
+// byte-identical output.
+//
+// MIN_THRESHOLD stays. --max-ram 1 now yields about 3.6e6, still above it, but a smaller
+// declaration or a machine with little free memory must not drive the budget to zero.
 inline size_t getRelationBudget(int maxRamGiB) {
     const size_t availableBytes = getMemoryBudgetBytes(maxRamGiB);
 
     const double safetyFactor = 0.6;
-    const size_t bytesPerEntry = 48; // unordered_map node overhead
+    const size_t peakBytesPerPair = peakBytesPerBufferedPair() * (concurrentFlushRounds() + 1);
 
-    size_t budget = (size_t)(availableBytes * safetyFactor) / bytesPerEntry;
+    const size_t budget = (size_t)(availableBytes * safetyFactor) / peakBytesPerPair;
 
     const size_t MIN_THRESHOLD = 1'000'000;
-    const size_t MAX_THRESHOLD = 200'000'000;
-    return std::max(MIN_THRESHOLD, std::min(budget, MAX_THRESHOLD));
+    return std::max(MIN_THRESHOLD, budget);
 }
 
-// Flush rounds that may be harvested but not yet written at the same time.
-//
-// A round's harvest empties the unit buffers, so the budget is honoured the moment it runs -- but
-// the harvested data stays in memory until the write finishes. Capping how many rounds may sit in
-// that state is what keeps the peak bounded: it is at most (this + 1) * getRelationBudget entries,
-// which at the 200 M clamp and 48 B per entry is 28.8 GB for the value below.
-//
-// A constant, deliberately not derived from --threads. Deriving it would put the peak back on the
-// worker count, which is the dependency the 2026-08-27 and 2026-08-28 work exists to remove: the
-// same input would then need a bigger machine on a bigger node. Two lets one round be written
-// while the next fills, which is the whole overlap there is to win; a third would buy nothing
-// because the harvest is serialised anyway.
-inline size_t concurrentFlushRounds() {
-    return 2;
+// What the budget above implies the emit stage will hold at its peak, for the log. Reported so
+// the declared --max-ram and the number actually derived from it are visible side by side.
+inline size_t projectedEmitPeakBytes(int maxRamGiB) {
+    return getRelationBudget(maxRamGiB) * peakBytesPerBufferedPair()
+           * (concurrentFlushRounds() + 1);
 }
 
 // Which edge set one shared k-mer produces.
@@ -756,6 +795,28 @@ inline size_t openFdCount() {
 
 inline size_t mergeFdsPerUnit(size_t fanIn) {
     return fanIn + 1;
+}
+
+// Descriptors scanKmerRuns needs, all at once.
+//
+// Each thread opens both files of every split and merges them in k-mer order, so all of them have
+// to be open together -- it is a k-way merge, not a sequential pass. The demand is therefore
+// threads x splits x 2, and splits grow with the read count.
+//
+// Nothing used to check it. CAMI3 human-gut toy at 332,762,102 reads produced 183 splits, which
+// needs 128 x 183 x 2 = 46,848 descriptors on top of everything else the process holds; the opens
+// past the limit failed one by one and ReadBuffer exited from inside the OpenMP region, so the run
+// died with a segmentation fault and a handful of scattered "Error opening file" lines rather than
+// a diagnosis (job 551117).
+//
+// Throttling the threads in that region is NOT a fix: the thread index is a partition index. The
+// k-mer files are named kmer_delta_<split>_<thread> and written by a region sized from --threads,
+// and both the scan and the cleanup enumerate 0..threads-1. Running the scan with fewer workers
+// would leave whole partitions unread. Making it safe means lowering --threads for the entire run,
+// which is a decision for the caller, so this reports what is needed and lets the caller act.
+inline size_t scanKmerRunsFdDemand(size_t numOfSplits, int threads) {
+    const size_t workers = static_cast<size_t>(threads < 1 ? 1 : threads);
+    return workers * numOfSplits * 2;
 }
 
 // Largest fan-in whose peak descriptor use fits the process limit.
@@ -1249,6 +1310,16 @@ protected:
     size_t foldedUpTo = 0;                               // flushes [0, foldedUpTo) folded away
     size_t foldRounds = 0;
     std::vector<std::vector<std::string>> foldedOutputs; // [unit] -> folded file names
+
+    // What folding costs. Nothing reported it before: the [disk] fold line carries file counts,
+    // bytes and descriptors but no duration, so the only evidence was the flush write worst round
+    // -- and that is the time of a round that happened to overlap a fold, not the fold itself.
+    // A fold rewrites every unit's accumulated output, so on a large dataset it is hours; without
+    // this the effect of changing the flush budget or parallelising the unit loop cannot be judged.
+    std::atomic<uint64_t> foldMillisTotal{0};
+    std::atomic<uint64_t> foldMillisMax{0};      // worst single fold
+    std::atomic<uint64_t> foldUnitMillisMax{0};  // worst single unit within any fold
+    std::atomic<uint64_t> foldUnitsDone{0};      // unit-merges performed, for the per-unit mean
 
     // Where a flush round's time goes, split four ways, summed over every round in microseconds.
     // The round total is already reported; this says whether it is the sort, the map-to-vector
