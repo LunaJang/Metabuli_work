@@ -795,6 +795,32 @@ inline size_t mergeFdsPerUnit(size_t fanIn) {
     return fanIn + 1;
 }
 
+// Units maybeFoldEmitted may fold at the same time.
+//
+// Folding was serial, one unit after another, and the comment justifying it said only that this
+// keeps one unit's streams open at a time. That is true but it is not a reason: units are
+// independent -- a unit's inputs are its own subGraph_* files and its output name carries its
+// route and shard, so no two units touch the same bytes.
+//
+// The cost of the serial loop is not small. CAMI2 plant-associated folded once and that fold took
+// 34,003 s of a 43,463 s emit -- 78% of the stage, 69% of the whole run -- with 48 units averaging
+// 708 s each on one thread while 127 cores idled.
+//
+// Derived from what is actually free, not from a constant. The scan holds threads x splits x 2
+// descriptors for the whole emit, so the headroom at fold time is a property of the run: on
+// plant-associated the log recorded 38,712 open against a 65,536 limit, leaving room for 52 units
+// at 513 descriptors each. On an input with more splits there is less, and on one with a smaller
+// limit there may be room for one -- which is the serial loop, unchanged.
+inline size_t foldWorkers(size_t unitCnt, size_t fanIn) {
+    const size_t units = (unitCnt < 1) ? 1 : unitCnt;
+    const size_t limit = static_cast<size_t>(getOpenFileLimit() * 0.75);
+    const size_t held = openFdCount();
+    const size_t spare = (limit > held) ? (limit - held) : 0;
+    const size_t perUnit = mergeFdsPerUnit(fanIn);
+    const size_t fits = (perUnit > 0) ? spare / perUnit : 1;
+    return std::max<size_t>(1, std::min(units, fits));
+}
+
 // Descriptors scanKmerRuns needs, all at once.
 //
 // Each thread opens both files of every split and merges them in k-mer order, so all of them have

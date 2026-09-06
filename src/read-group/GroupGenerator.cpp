@@ -1503,11 +1503,15 @@ void GroupGenerator::makeSubGraph(size_t processedReadCnt) {
         if (this->foldRounds > 0) {
             const uint64_t foldMs = foldMillisTotal.load(std::memory_order_relaxed);
             const uint64_t units = foldUnitsDone.load(std::memory_order_relaxed);
-            cout << "[edges] fold cost: " << foldMs << " ms over " << this->foldRounds
-                 << " folds, worst fold " << foldMillisMax.load(std::memory_order_relaxed)
-                 << " ms, worst unit " << foldUnitMillisMax.load(std::memory_order_relaxed)
-                 << " ms, mean unit " << (units ? foldMs / units : 0) << " ms over "
-                 << units << " unit merges" << endl;
+            // Wall clock per fold, not summed unit time: the unit loop runs several units at
+            // once, so dividing the fold's duration by its units would understate what a unit
+            // costs by the worker count. The worst single unit is the honest per-unit figure and
+            // the ceiling on what parallelising the loop can win.
+            cout << "[edges] fold cost: " << foldMs << " ms of wall clock over "
+                 << this->foldRounds << " folds (mean " << (this->foldRounds ? foldMs / this->foldRounds : 0)
+                 << " ms, worst " << foldMillisMax.load(std::memory_order_relaxed)
+                 << " ms), worst single unit " << foldUnitMillisMax.load(std::memory_order_relaxed)
+                 << " ms over " << units << " unit merges" << endl;
         }
 
         // Cost of holding the buffers per unit rather than per thread. The lock domain is a
@@ -1832,18 +1836,47 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
     }
 
     const size_t routeCnt = static_cast<size_t>(partitionCnt) * 2 + 1;
-    // One extra stream per unit for the previous fold's output, which is re-folded below.
-    const size_t bufElems = getMergeBufferElems(to - from + 1, par.ramUsage, 1);
-    size_t foldedFiles = 0;
+
+    // The units, flattened, so the loop below can be split across workers. Order is the order the
+    // serial loop visited them in, and every worker writes only to its own units' slots, so the
+    // result does not depend on how they are shared out.
+    std::vector<std::pair<size_t, size_t>> foldUnits;   // (route, shard)
+    foldUnits.reserve(emitUnitCount(partitionCnt));
+    for (size_t route = 0; route < routeCnt; ++route) {
+        const size_t shardCnt = shardsForRoute(route, partitionCnt);
+        for (size_t shard = 0; shard < shardCnt; ++shard) {
+            foldUnits.emplace_back(route, shard);
+        }
+    }
+
+    // Units are independent -- a unit's inputs are its own subGraph_* files, its output name
+    // carries its route and shard, and foldedOutputs is indexed by unit -- so the only thing that
+    // kept this serial was descriptors. foldWorkers asks how many are actually free.
+    //
+    // Measured on CAMI2 plant-associated, where the single fold took 34,003 s of a 43,463 s emit:
+    // 48 units at 708 s each, one at a time, while 127 cores idled.
+    const size_t workerCnt = foldWorkers(foldUnits.size(), maxFanIn);
+    // One extra stream per unit for the previous fold's output, which is re-folded below. The
+    // merger count is what it now is: passing 1 while running several would size every worker's
+    // read buffers as if it were alone and multiply the memory by the worker count.
+    const size_t bufElems = getMergeBufferElems(to - from + 1, par.ramUsage, workerCnt);
+
     // Timed because nothing timed it before. A fold rewrites every unit's accumulated output, so
     // it is the single longest thing this stage does on a large input, and it holds an in-flight
     // slot while it runs -- yet the only trace it left was the write time of whichever round
     // happened to overlap it.
-    uint64_t foldUnitMaxMillis = 0;
+    std::vector<size_t> wFiles(workerCnt, 0);
+    std::vector<uint64_t> wUnitMax(workerCnt, 0);
     const std::chrono::steady_clock::time_point foldStart = std::chrono::steady_clock::now();
-    for (size_t route = 0; route < routeCnt; ++route) {
-        const size_t shardCnt = shardsForRoute(route, partitionCnt);
-        for (size_t shard = 0; shard < shardCnt; ++shard) {
+
+    // Strided, and static either way, which keeps a run reproducible. mergeSubGraphBatch is fatal
+    // on error rather than throwing, so a worker that dies ends the process just as it did inside
+    // the serial loop; this repository does not use exceptions and there is nothing to propagate
+    // across the join.
+    const auto foldRange = [&](const size_t w) {
+        for (size_t u = w; u < foldUnits.size(); u += workerCnt) {
+            const size_t route = foldUnits[u].first;
+            const size_t shard = foldUnits[u].second;
             const std::chrono::steady_clock::time_point unitStart =
                 std::chrono::steady_clock::now();
             // Earlier folds' outputs go back in. Folding only the new flushes would let those
@@ -1870,13 +1903,36 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
             }
             noteSubGraphBytes(static_cast<int64_t>(FileUtil::getFileSize(output)));
             folded.assign(1, output);
-            ++foldedFiles;
+            ++wFiles[w];
 
             const uint64_t unitMillis = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - unitStart).count());
-            if (unitMillis > foldUnitMaxMillis) { foldUnitMaxMillis = unitMillis; }
+            if (unitMillis > wUnitMax[w]) { wUnitMax[w] = unitMillis; }
         }
+    };
+
+    if (workerCnt <= 1) {
+        foldRange(0);
+    } else {
+        // Worker 0 runs here rather than in a thread of its own, so a single worker takes exactly
+        // the serial path above.
+        std::vector<std::thread> folders;
+        folders.reserve(workerCnt - 1);
+        for (size_t w = 1; w < workerCnt; ++w) {
+            folders.emplace_back(foldRange, w);
+        }
+        foldRange(0);
+        for (size_t w = 0; w < folders.size(); ++w) {
+            folders[w].join();
+        }
+    }
+
+    size_t foldedFiles = 0;
+    uint64_t foldUnitMaxMillis = 0;
+    for (size_t w = 0; w < workerCnt; ++w) {
+        foldedFiles += wFiles[w];
+        if (wUnitMax[w] > foldUnitMaxMillis) { foldUnitMaxMillis = wUnitMax[w]; }
     }
 
     // Accumulated once per fold rather than once per unit: a fold is rare and this keeps the
@@ -1902,14 +1958,15 @@ void GroupGenerator::maybeFoldEmitted(size_t tmpDiskBudget, size_t maxFanIn) {
     }
 
     // fan-in and peak fds in the same terms the final merge reports, so the two stages can be
-    // compared. One unit at a time here, hence one merger: peak is that unit's streams plus its
-    // output. Predicted, then what the process is actually holding, because a wrong prediction
-    // is exactly how a run dies on a host with a smaller descriptor limit than the one it was
-    // tuned on.
+    // compared. Peak is one unit's streams plus its output, times the workers folding at once.
+    // Predicted, then what the process is actually holding, because a wrong prediction is exactly
+    // how a run dies on a host with a smaller descriptor limit than the one it was tuned on --
+    // and the worker count is derived from that same reading taken a moment earlier.
     cout << "[disk] fold " << round << ": flushes [" << from << ", " << to << ") -> "
          << foldedFiles << " files, live "
          << humanBytes(static_cast<uint64_t>(std::max<int64_t>(0, subGraphLiveBytes.load())))
-         << " (fan-in " << maxFanIn << ", peak fds " << mergeFdsPerUnit(maxFanIn)
+         << " (" << workerCnt << " workers, fan-in " << maxFanIn << ", peak fds "
+         << (mergeFdsPerUnit(maxFanIn) * workerCnt)
          << " predicted / " << openFdCount() << " open, soft limit " << getOpenFileLimit() << ")"
          << endl;
 }
