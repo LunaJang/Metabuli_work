@@ -214,6 +214,17 @@ void GroupApplier::applyRepLabel(const vector<OrgResult>& orgResults,
 
     vector<Query> queryList;
 
+    // 1.2.0 replaced Query's (classification, score, isClassified, name) constructor with one
+    // that takes lengths, and dropped isClassified: a read is classified iff its classification
+    // is non-zero, which held at every call site below.
+    auto makeQuery = [](int classification, float score, const std::string & name) {
+        Query q;
+        q.classification = classification;
+        q.idScore = score;
+        q.name = name;
+        return q;
+    };
+
     for (int queryIdx = 0; queryIdx < orgResults.size() ; queryIdx++){
         uint32_t groupId = groupMappingInfo[queryIdx];
         auto repLabelIt = repLabel.find(groupId);
@@ -227,14 +238,14 @@ void GroupApplier::applyRepLabel(const vector<OrgResult>& orgResults,
                 applyRep = (orgResults[queryIdx].label == 0 || orgResults[queryIdx].score < par.minVoteScr);
             }
             if (applyRep) {
-                queryList.emplace_back(Query(repLabelIt->second, orgResults[queryIdx].score, true, orgResults[queryIdx].name));
+                queryList.emplace_back(makeQuery(repLabelIt->second, orgResults[queryIdx].score, orgResults[queryIdx].name));
             } else {
-                queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, true, orgResults[queryIdx].name));
+                queryList.emplace_back(makeQuery(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, orgResults[queryIdx].name));
             }
         } else if (orgResults[queryIdx].label != 0) {
-            queryList.emplace_back(Query(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, true, orgResults[queryIdx].name));
+            queryList.emplace_back(makeQuery(external2internalTaxId[orgResults[queryIdx].label], orgResults[queryIdx].score, orgResults[queryIdx].name));
         } else {
-            queryList.emplace_back(Query(0, orgResults[queryIdx].score, false, orgResults[queryIdx].name));
+            queryList.emplace_back(makeQuery(0, orgResults[queryIdx].score, orgResults[queryIdx].name));
         }
     }
 

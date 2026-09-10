@@ -9,19 +9,21 @@
 
 
 void setDefaults_updateDB(LocalParameters & par){
+    par.dbTotalLength = 0;
+    par.noMaskTaxa = "";
     par.makeLibrary = 0;
     par.gtdb = 0;
     par.validateInput = 0;
     par.validateDb = 0;
     par.kmerFormat = 1;
     par.skipRedundancy = 0;
-    par.reducedAA = 0;
     par.ramUsage = 128;
     par.taxonomyPath = "" ;
     par.splitNum = 4096;
     par.maskProb = 0.9;
     par.maskMode = 1;
     par.accessionLevel = 0;
+    par.packInfo = 1;
     // Get current date
     time_t now = time(0);
     tm *ltm = localtime(&now);
@@ -133,8 +135,6 @@ int updateDB(int argc, const char **argv, const Command &command){
 
     // Merge index files
     cout << "Merge new and old DB files " << endl;;
-    int numOfSplits = idxCre.getNumOfFlush();
-
     idxCre.updateTaxId2SpeciesTaxId(newDbDir + "/taxID_list"); 
     idxCre.addFilesToMerge(oldDbDir + "/diffIdx", oldDbDir + "/info");
     idxCre.printFilesToMerge();

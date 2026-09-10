@@ -21,9 +21,11 @@ set(util_source_files
         util/createnewtaxalist.h
         util/classifiedRefiner.cpp
         util/validateDatabase.cpp
+        util/compactInfoIndex.cpp
         util/validateDatabase.h
         util/printDeltaIdx.cpp
         util/count_common_kmers.cpp
         util/create_common_kmer_list.cpp
         util/create_unique_kmer_list.cpp
+        util/inspect_db.cpp
         PARENT_SCOPE)

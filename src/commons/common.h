@@ -2,17 +2,22 @@
 #define ADCLASSIFIER2_COMMON_H
 #include <cstddef>
 #include <utility>
-#include "LocalParameters.h"
-#include "TaxonomyWrapper.h"
+
 #include <iostream>
 #include <unordered_set>
 #include "FileUtil.h"
+// #include "Match.h"
 #include <cstdint>
+#include <bitset>
 
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <cmath>
 
+#include "LocalParameters.h"
+#include "TaxonomyWrapper.h"
+#include "printBinary.h"
 
 
 #define likely(x) __builtin_expect((x),1)
@@ -113,46 +118,33 @@ struct SpeciesCandidate {
 };
 
 struct Query {
-    int queryId;
     int classification;
-    float score;
+    float idScore;
+    float subScore;
+    float eValue;
     int hammingDist;
     int queryLength;
     int queryLength2;
     int kmerCnt;
     int kmerCnt2;
-    // Two of the three constructors below never named this in their init list, so a Query built
-    // through either of them carried an indeterminate topSpeciesId. Nothing read it on those
-    // paths, which is why it went unnoticed; a default member initialiser settles it for every
+    // No constructor below names this in its init list, so a Query built through any of them
+    // carried an indeterminate topSpeciesId. A default member initialiser settles it for every
     // constructor at once, including any added later.
     TaxID topSpeciesId = 0;
-    bool isClassified;
-    bool newSpecies; // 36 byte
 
     std::string name;
     std::map<TaxID,int> taxCnt; // 8 byte per element
     std::vector<std::pair<TaxID, float>> species2Score;
-    // std::vector<float> pathScores;
     // What CandidateDBWriter::serializeQuery reads. Empty for every existing user of Query --
     // only the grouping score pass fills it. It lives here rather than in a separate struct so
     // the imported writer compiles against this Query without being edited.
     std::vector<SpeciesCandidate> speciesCandidates;
 
-    bool operator==(int id) const { return queryId == id;}
-
-    Query(int queryId, int classification, float score, int hammingDist, int queryLength,
-          int queryLength2, int kmerCnt, int kmerCnt2, bool isClassified, bool newSpecies, std::string name)
-            : queryId(queryId), classification(classification), score(score),
-              hammingDist(hammingDist), queryLength(queryLength), queryLength2(queryLength2), kmerCnt(kmerCnt), kmerCnt2(kmerCnt2),
-              isClassified(isClassified), newSpecies(newSpecies), name(std::move(name)) {}
-
-    Query() : queryId(0), classification(0), score(0), hammingDist(0), queryLength(0),
-              queryLength2(0), kmerCnt(0), kmerCnt2(0), isClassified(false), newSpecies(false) {}
-    
-    Query(int classification, float score, bool isClassified, std::string name)
-            : queryId(0), classification(classification), score(score),
-              hammingDist(0), queryLength(0), queryLength2(0), kmerCnt(0), kmerCnt2(0),
-              isClassified(isClassified), newSpecies(false), name(std::move(name)) {}
+    Query() = default;
+    Query(int queryLength, int kmerCnt, const std::string & name)
+        : classification(0), idScore(0), subScore(0), eValue(-1), hammingDist(0),
+          queryLength(queryLength), queryLength2(0), kmerCnt(kmerCnt), kmerCnt2(0),
+          name(name) {}
 };
 
 struct ProteinQuery {
@@ -195,10 +187,8 @@ struct Buffer {
     };
 
     void reallocateMemory(size_t sizeOfBuffer) {
-        if (sizeOfBuffer > bufferSize) {
-            buffer = (T *) realloc(buffer, sizeof(T) * sizeOfBuffer);
-            bufferSize = sizeOfBuffer;
-        }
+        buffer = (T *) realloc(buffer, sizeof(T) * sizeOfBuffer);
+        bufferSize = sizeOfBuffer;
     };
 
     void init() {
@@ -330,12 +320,7 @@ struct WriteBuffer {
     };
 
     ~WriteBuffer() {
-        if (size > 0) {
-            flush();
-        }
-        if (fp) {
-            fclose(fp);
-        }
+        close();
         if (buffer) {
             free(buffer);
         }
@@ -344,6 +329,16 @@ struct WriteBuffer {
     void flush() {
         fwrite(buffer, sizeof(T), size, fp);
         size = 0;
+    }
+
+    void close() {
+        if (fp) {
+            if (size > 0) {
+                flush();
+            }
+            fclose(fp);
+            fp = nullptr;
+        }
     }
 
     void write(T *data, size_t dataNum = 1) {
@@ -368,6 +363,8 @@ inline bool fileExist(const std::string& name) {
 void process_mem_usage(double& vm_usage, double& resident_set);
 
 TaxonomyWrapper * loadTaxonomy(const std::string & dbDir, const std::string & taxonomyDir = "");
+
+TaxonomyWrapper * loadTaxonomyDB(const std::string & taxDbFile);
 
 int loadDbParameters(LocalParameters & par, const std::string & dbDir);
 
@@ -429,7 +426,6 @@ void getObservedAccessionList(const std::string & fnaListFileName,
 void fillAcc2TaxIdMap(std::unordered_map<std::string, TaxID> & acc2taxid,
                       const std::string & acc2taxidFileName);
                                 
-bool haveRedundancyInfo(const std::string & dbDir);
 
 
 struct SeqEntry {
@@ -483,7 +479,54 @@ public:
     }
 };
 
+inline uint64_t extract_bits(uint64_t value, unsigned int start_bit, unsigned int block_size) {
+    // Edge case handling: If block_size is 64, the mask is ~0ULL (all bits set).
+    // (1ULL << 64) is Undefined Behavior, so we handle 64 separately.
+    // if (block_size >= 64) {
+    //     return value;
+    // }
+
+    // // Generalized Mask Creation: (2^L - 1) << start_bit
+    // // 1. (1ULL << block_size) - 1  -> Creates the L-bit mask (0b11...1)
+    // // 2. (...) << start_bit      -> Shifts the mask to the correct position
+    // uint64_t full_mask = ((1ULL << block_size) - 1) << start_bit;
+
+    // // Apply the mask and shift down (normalization)
+    // return (value & full_mask) >> start_bit;
+    return (value & (((1ULL << block_size) - 1) << start_bit)) >> start_bit;
+}
+
+inline unsigned bitsNeeded(unsigned N) {
+    return (N <= 1) ? 0 : static_cast<unsigned>(std::ceil(std::log2(N)));
+}
+
+int hammingDist(const std::string & codon1, const std::string & codon2);
 
 
+size_t readDbSize(const std::string& dbDir);
+
+inline double computeLEM_logE(
+    int queryLengthNt,
+    int spanLengthNt,
+    size_t dbSizeNt,
+    double logP)
+{
+    const double aaQueryLen = queryLengthNt / 3.0;    
+    const double aaMatchLen = spanLengthNt / 3.0;
+    double lenDiff = std::max(0.0, aaQueryLen - aaMatchLen);
+    return std::log((lenDiff + 1) * 6.0) + 
+        std::log(dbSizeNt / 3.0) +
+        logP;
+}
+
+uint32_t parseMask(const char* s);
+
+uint32_t safe_right_shift_32(uint32_t value, unsigned int shift);
+uint32_t safe_left_shift_32(uint32_t value, unsigned int shift);
+
+int getFirstOneAfterFirstZero(uint32_t mask);
+
+uint64_t disperseBits(uint64_t source, uint64_t pattern, int chunk_size);
+uint64_t stretchBits(uint64_t pattern, int repeat_count);
 
 #endif //ADCLASSIFIER2_COMMON_H

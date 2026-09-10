@@ -7,26 +7,31 @@
 #include "fasta_validate.h"
 #include "validateDatabase.h"
 
-void setDefaults_build(LocalParameters & par){
+void setDefaults_build(LocalParameters & par) {
+    par.noMaskTaxa = "";
+    par.readingFrame = 0;
+    par.spaceMask = "";
     par.syncmer = 0;
     par.smerLen = 5;
     par.gtdb = 0;
     par.makeLibrary = 0;
-    par.reducedAA = 0;
     par.ramUsage = 128;
     par.validateInput = 0;
     par.validateDb = 0;
-    par.taxonomyPath = "" ;
+    par.taxonomyPath = "";
+    par.customMetamer = "";
     par.splitNum = 4096;
     par.maskProb = 0.9;
     par.maskMode = 1;
     par.accessionLevel = 0;
+    par.packInfo = 1;
     time_t now = time(0);
     tm *ltm = localtime(&now);
     par.dbDate = to_string(1900 + ltm->tm_year) + "-" + to_string(1 + ltm->tm_mon) + "-" + to_string(ltm->tm_mday);
     srand(time(NULL));
     string randStr = to_string(rand());
     par.dbName = randStr.substr(0, 32);
+    par.dbTotalLength = 0;
 }
 
 int build(int argc, const char **argv, const Command &command){

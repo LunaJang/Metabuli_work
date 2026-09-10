@@ -7,14 +7,13 @@
 #include "fastq_info.cpp"
 #include "validateDatabase.h"
 
-void setClassifyDefaults(LocalParameters & par){
+void setClassifyDefaults(LocalParameters & par){    
+    par.maxEValue = 1;
     par.syncmer = 0;
     par.smerLen = 5;
     par.kmerFormat = 1;
-    par.em = false;
-    // par.maxShift = 1;
+    par.maxShift = 1;
     par.skipRedundancy = 0;
-    par.reducedAA = 0;
     par.validateInput = 0;
     par.validateDb = 0;
     par.seqMode = 2;    
@@ -24,16 +23,22 @@ void setClassifyDefaults(LocalParameters & par){
     par.verbosity = 3;
     par.ramUsage = 128;
     par.printLog = 0;
-    par.maxGap = 0;
     par.taxonomyPath = "" ;
-    par.minConsCnt = 4;
-    par.minConsCntEuk = 9;
     par.maskMode = 0;
     par.maskProb = 0.9;
     par.matchPerKmer = 4;
     par.accessionLevel = 0;
-    par.tieRatio = 0.95;
+    par.tieRatio = 0.99;
     par.printLineage = 0;
+    par.minAaMatch = 11;
+    par.minAaMatchEuk = 16;
+    par.priorityTaxa = "";
+
+    // unexposed experimental parameters
+    par.spaceMask = "";
+    par.useAllMatches = 0;
+    par.em = false;
+    par.pdmKmer = 0;
 }
 
 int classify(int argc, const char **argv, const Command& command) {
@@ -194,7 +199,8 @@ int classify(int argc, const char **argv, const Command& command) {
 #endif
 
     Classifier * classifier = new Classifier(par);
-    classifier->startClassify(par);
+    // classifier->startClassify(par);
+    classifier->classifyReads();
     delete classifier;
     return 0;
 }

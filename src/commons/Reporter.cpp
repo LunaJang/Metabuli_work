@@ -37,7 +37,7 @@ void Reporter::openReadClassificationFile(const std::string fileName) {
 
 void Reporter::writeReadClassification(const vector<Query> & queryList, bool classifiedOnly) {
     if (isFirstTime) {
-        readClassificationFile << "#is_classified\tname\ttaxID\tquery_length\tscore\trank";
+        readClassificationFile << "#is_classified\tname\ttaxID\tquery_length\tscore\te_value\trank";
         if (par.printLineage) {
             readClassificationFile << "\tlineage";
         }
@@ -45,16 +45,20 @@ void Reporter::writeReadClassification(const vector<Query> & queryList, bool cla
         isFirstTime = false;
     }
     for (size_t i = 0; i < queryList.size(); i++) {
-        if (classifiedOnly && !queryList[i].isClassified) {
+        if (classifiedOnly && !(queryList[i].classification == 0)) {
             continue;
         }
-        if (queryList[i].isClassified != 0) {
+        if (queryList[i].name.empty()) {
+            break;
+        }
+        if (queryList[i].classification != 0) {
             readClassificationFile 
-                << queryList[i].isClassified << "\t" 
+                << "1\t" 
                 << queryList[i].name << "\t"
                 << taxonomy->getOriginalTaxID(queryList[i].classification) << "\t"
                 << queryList[i].queryLength + queryList[i].queryLength2 << "\t"
-                << queryList[i].score << "\t"
+                << queryList[i].idScore << "\t"
+                << queryList[i].eValue << "\t"
                 << taxonomy->getString(taxonomy->taxonNode(queryList[i].classification)->rankIdx) << "\t";
             
             if (par.printLineage) {
@@ -67,11 +71,12 @@ void Reporter::writeReadClassification(const vector<Query> & queryList, bool cla
             readClassificationFile << "\n";
         } else {
             readClassificationFile 
-                << queryList[i].isClassified << "\t" 
+                << "0\t" 
                 << queryList[i].name << "\t"
                 << taxonomy->getOriginalTaxID(queryList[i].classification) << "\t"
                 << queryList[i].queryLength + queryList[i].queryLength2 << "\t"
-                << queryList[i].score << "\t"
+                << queryList[i].idScore << "\t"
+                << "-" << "\t" // eValue
                 << "-" << "\t";
             
             if (par.printLineage) {
@@ -100,16 +105,19 @@ void Reporter::writeReadClassification(const vector<Query> & queryList, const ve
         else{
             groupID = to_string(groupIdList[i]);
         }
-        if (classifiedOnly && !queryList[i].isClassified) {
+        // 1.2.0 dropped Query::isClassified and Query::score; a read is classified iff it
+        // carries a classification, and the score is now idScore. The column layout is left
+        // as it was -- grade*, apply-group and binning2report address these fields by index.
+        if (classifiedOnly && queryList[i].classification == 0) {
             continue;
         }
-        if (queryList[i].isClassified != 0) {
-            readClassificationFile 
-                << queryList[i].isClassified << "\t" 
+        if (queryList[i].classification != 0) {
+            readClassificationFile
+                << "1\t"
                 << queryList[i].name << "\t"
                 << taxonomy->getOriginalTaxID(queryList[i].classification) << "\t"
                 << queryList[i].queryLength + queryList[i].queryLength2 << "\t"
-                << queryList[i].score << "\t"
+                << queryList[i].idScore << "\t"
                 << taxonomy->getString(taxonomy->taxonNode(queryList[i].classification)->rankIdx) << "\t"
                 << groupID << "\t";
             
@@ -122,12 +130,12 @@ void Reporter::writeReadClassification(const vector<Query> & queryList, const ve
             }
             readClassificationFile << "\n";
         } else {
-            readClassificationFile 
-                << queryList[i].isClassified << "\t" 
+            readClassificationFile
+                << "0\t"
                 << queryList[i].name << "\t"
                 << taxonomy->getOriginalTaxID(queryList[i].classification) << "\t"
                 << queryList[i].queryLength + queryList[i].queryLength2 << "\t"
-                << queryList[i].score << "\t"
+                << queryList[i].idScore << "\t"
                 << "-" << "\t"
                 << groupID << "\t";
             
@@ -303,7 +311,17 @@ void Reporter::getReadsClassifiedToClade(TaxID cladeId,
     }
     char line[4096];
     size_t idx = 0;
-    if (taxonomy->hasInternalTaxID()) {
+    if (cladeId == -1) {
+        while (fgets(line, sizeof(line), results)) {
+            if (line[0] == '#') {
+                continue;
+            }
+            if (line[0] == '0') { // unclassified
+                readIdxs.push_back(idx);
+            }
+            idx++;
+        }
+    } else if (taxonomy->hasInternalTaxID()) {
         unordered_map<TaxID, TaxID> extern2intern;
         taxonomy->getExternal2internalTaxID(extern2intern);
         while (fgets(line, sizeof(line), results)) {

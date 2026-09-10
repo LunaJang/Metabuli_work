@@ -15,6 +15,11 @@ struct CountAtRank {
     int FP;
     int TP;
     int FN;
+    // Reads whose answer taxon does not resolve at this rank, so they are outside the score
+    // rather than a hit or a miss. Counted because the answer sheet can legitimately be missing
+    // reads -- CAMI3's is written .nohost, so every host read reaches here -- and a score over
+    // an unstated subset of the sample is not interpretable.
+    int noAnswer;
     float precision;
     float sensitivity;
     float f1;
@@ -400,18 +405,28 @@ par, cout, printColumnsIdx, cerr, names, nodes, merged)
             }
 
 
-            // Print Grade Result of each file
-            cout << readClassificationFileName << endl;
-            cout << "The number of reads: " << rightAnswers.size() << endl;
-            cout << "The number of reads classified: " << numberOfClassifications << endl;
-            for (const string &rank: ranks_local) {
-                cout << rank << " " << results[i].countsAtRanks[rank].total << " "
-                     << results[i].countsAtRanks[rank].TP + results[i].countsAtRanks[rank].FP << " "
-                     << results[i].countsAtRanks[rank].TP << " " << results[i].countsAtRanks[rank].FP << " "
-                     << results[i].countsAtRanks[rank].precision << " "
-                     << results[i].countsAtRanks[rank].sensitivity << " " << results[i].countsAtRanks[rank].f1 << endl;
+            #pragma omp critical
+            {   
+                // Print Grade Result of each file
+                cout << readClassificationFileName << endl;
+                cout << "The number of reads: " << rightAnswers.size() << endl;
+                cout << "The number of reads classified: " << numberOfClassifications << endl;
+                for (const string &rank: ranks_local) {
+                    const int noAnswer = results[i].countsAtRanks[rank].noAnswer;
+                    if (noAnswer > 0) {
+                        cout << "The number of reads without an answer at " << rank << ": "
+                             << noAnswer << " (outside precision, sensitivity and F1)" << endl;
+                    }
+                }
+                for (const string &rank: ranks_local) {
+                    cout << rank << " " << results[i].countsAtRanks[rank].total << " "
+                         << results[i].countsAtRanks[rank].TP + results[i].countsAtRanks[rank].FP << " "
+                         << results[i].countsAtRanks[rank].TP << " " << results[i].countsAtRanks[rank].FP << " "
+                         << results[i].countsAtRanks[rank].precision << " "
+                         << results[i].countsAtRanks[rank].sensitivity << " " << results[i].countsAtRanks[rank].f1 << endl;
+                }
+                cout << endl;
             }
-            cout << endl;
         }
     } // End of parallel region
 
@@ -466,10 +481,16 @@ char compareTaxonAtRank_CAMI(TaxID shot, TaxID target, const TaxonomyWrapper & n
     } else {
         // Do not count if the rank of target is higher than current rank
         TaxID targetTaxIdAtRank = ncbiTaxonomy.getTaxIdAtRank(target, rank);
-        // cout << targetTaxIdAtRank << endl;
         const TaxonNode * targetNode = ncbiTaxonomy.taxonNode(targetTaxIdAtRank);
         int rankIdx = ncbiTaxonomy.findRankIndex2(rank);
-        // cout << shot << " " << targetTaxIdAtRank << " " << targetNode->rankIdx << " " << endl;
+        // taxonNode returns null for taxon 0, which is what an absent answer looks like: the
+        // caller reads the answer out of an unordered_map with operator[], so a read the answer
+        // sheet does not carry becomes 0. getTaxIdAtRank also yields 0 when the answer has no
+        // ancestor at this rank. Either way the read cannot be scored here.
+        if (targetNode == nullptr) {
+            count.noAnswer++;
+            return '-';
+        }
         if (ncbiTaxonomy.findRankIndex2(ncbiTaxonomy.getString(targetNode->rankIdx)) > rankIdx) {
             return '-';
         }
@@ -484,6 +505,13 @@ char compareTaxonAtRank_CAMI(TaxID shot, TaxID target, const TaxonomyWrapper & n
         // False negative if the rank of shot is higher than current rank
         TaxID shotTaxIdAtRank = ncbiTaxonomy.getTaxIdAtRank(shot, rank);
         const TaxonNode * shotNode = ncbiTaxonomy.taxonNode(shotTaxIdAtRank);
+        // No ancestor at this rank means the classification sits above it, which is the miss
+        // this branch already reports.
+        if (shotNode == nullptr) {
+            count.FN ++;
+            count.total ++;
+            return 'N';
+        }
         if (ncbiTaxonomy.findRankIndex2(ncbiTaxonomy.getString(shotNode->rankIdx)) > rankIdx) {
             count.FN ++;
             count.total ++;
@@ -506,6 +534,10 @@ char compareTaxonAtRank_CAMI_euk(TaxID shot, TaxID target, TaxonomyWrapper & ncb
     TaxID targetTaxIdAtRank = ncbiTaxonomy.getTaxIdAtRank(target, rank);
     const TaxonNode * targetNode = ncbiTaxonomy.taxonNode(targetTaxIdAtRank);
     int rankIdx = NcbiTaxonomy::findRankIndex(rank);
+    if (targetNode == nullptr) {
+        count.noAnswer++;
+        return '-';
+    }
     if (NcbiTaxonomy::findRankIndex(ncbiTaxonomy.getString(targetNode->rankIdx)) > rankIdx) {
         return '-';
     }
@@ -525,6 +557,11 @@ char compareTaxonAtRank_CAMI_euk(TaxID shot, TaxID target, TaxonomyWrapper & ncb
     // False negative if the rank of shot is higher than current rank
     TaxID shotTaxIdAtRank = ncbiTaxonomy.getTaxIdAtRank(shot, rank);
     const TaxonNode * shotNode = ncbiTaxonomy.taxonNode(shotTaxIdAtRank);
+    if (shotNode == nullptr) {
+        count.FN ++;
+        count.total ++;
+        return 'N';
+    }
     if (NcbiTaxonomy::findRankIndex(ncbiTaxonomy.getString(shotNode->rankIdx)) > rankIdx) {
         count.FN ++;
         count.total ++;
@@ -547,6 +584,10 @@ char compareTaxon_overclassification(TaxID shot, TaxID target, TaxonomyWrapper &
 //    TaxID targetTaxIdAtRank = ncbiTaxonomy.getTaxIdAtRank(target, rank);
     const TaxonNode * targetNode = ncbiTaxonomy.taxonNode(target);
     int rankIdx = NcbiTaxonomy::findRankIndex(rank);
+    if (targetNode == nullptr) {
+        count.noAnswer++;
+        return '-';
+    }
     if (NcbiTaxonomy::findRankIndex(ncbiTaxonomy.getString(targetNode->rankIdx)) > rankIdx) {
         return '-';
     }
@@ -561,6 +602,11 @@ char compareTaxon_overclassification(TaxID shot, TaxID target, TaxonomyWrapper &
 
     // False negative if the rank of shot is higher than current rank
     const TaxonNode * shotNode = ncbiTaxonomy.taxonNode(shot);
+    if (shotNode == nullptr) {
+        count.FN ++;
+        count.total ++;
+        return 'N';
+    }
     if (NcbiTaxonomy::findRankIndex(ncbiTaxonomy.getString(shotNode->rankIdx)) > rankIdx) {
         count.FN ++;
         count.total ++;

@@ -81,13 +81,28 @@ int extract(int argc, const char **argv, const Command& command) {
     TaxonomyWrapper *taxonomy = loadTaxonomy(dbDir, par.taxonomyPath);
     Reporter reporter(par, taxonomy);
 
-    TaxID targetTaxID = taxonomy->getInternalTaxID(externalTaxID);
+    TaxID targetTaxID;
+    if (externalTaxID == -1) {
+        targetTaxID = -1;
+    } else {
+        targetTaxID = taxonomy->getInternalTaxID(externalTaxID);
+        if (targetTaxID == -1) {
+            cerr << "Error: Taxon ID " << externalTaxID << " not found in the taxonomy database." << endl;
+            exit(1);
+        }
+    }
 
     vector<size_t> readIdxs;
     
     cout << "Extracting reads classified to taxon " << externalTaxID << " ... " << flush;
     reporter.getReadsClassifiedToClade(targetTaxID, classificationFileName, readIdxs);
     cout << "done." << endl;
+
+    for(size_t i = 0; i < 10; i++) {
+        if (i < readIdxs.size()) {
+            cout << "  Read index " << readIdxs[i] << endl;
+        }
+    }
 
     string queryFileName = par.filenames[0];
     string outdirPath, baseName, extension;

@@ -32,6 +32,7 @@ extern int editNames(int argc, const char **argv, const Command& command);
 extern int createnewtaxalist(int argc, const char **argv, const Command& command);
 extern int classifiedRefiner(int argc, const char **argv, const Command& command);
 extern int validateDatabase(int argc, const char **argv, const Command& command);
+extern int compactInfoIndex(int argc, const char **argv, const Command& command);
 extern int printDeltaIdx(int argc, const char **argv, const Command& command); 
 extern int makeBenchmarkSet(int argc, const char **argv, const Command &command);
 extern int makeQuerySet(int argc, const char **argv, const Command &command);
@@ -42,5 +43,8 @@ extern int create_unique_kmer_list(int argc, const char **argv, const Command &c
 extern int create_unirefdb(int argc, const char **argv, const Command &command);
 extern int create_uniref_tree(int argc, const char **argv, const Command &command);
 extern int assign_uniref(int argc, const char **argv, const Command &command);
+extern int inspect_db(int argc, const char **argv, const Command &command);
+extern int mergeAssemblyFiles(int argc, const char **argv, const Command &command);
+extern int createTaxDb(int argc, const char **argv, const Command &command);
 
 #endif //ADCLASSIFIER2_LOCALCOMMANDDECLARATIONS_H

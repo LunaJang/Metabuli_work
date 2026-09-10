@@ -47,11 +47,14 @@ public:
     std::vector<MMseqsParameter*> createnewtaxalist;
     std::vector<MMseqsParameter*> classifiedRefiner;
     std::vector<MMseqsParameter*> validateDatabase;
+    std::vector<MMseqsParameter*> compactInfoIndex;
     std::vector<MMseqsParameter*> makeBenchmarkSet;
     std::vector<MMseqsParameter*> buildUnirefDb;
     std::vector<MMseqsParameter*> buildUnirefTree;
     std::vector<MMseqsParameter*> assignUniref;
     std::vector<MMseqsParameter*> createCommonKmerList;
+    std::vector<MMseqsParameter*> mergeAssemblyFiles;
+    std::vector<MMseqsParameter*> createTaxDb;
 
     // UniRef
     PARAMETER(UNIREF_NUMBERS)
@@ -69,19 +72,20 @@ public:
     PARAMETER(SMER_LEN)
     PARAMETER(KMER_FORMAT)
     PARAMETER(UNIREF_XML)
+    PARAMETER(PARAM_CUSTOM_METAMER)
+    PARAMETER(SPACE_MASK)
 
     // Classify
     PARAMETER(SEQ_MODE)
-    PARAMETER(REDUCED_AA)
+    PARAMETER(PRECISION_MODE)
     PARAMETER(MIN_SCORE)
     PARAMETER(HAMMING_MARGIN)
     PARAMETER(MIN_SP_SCORE)
     PARAMETER(TINFO_PATH)
     PARAMETER(RAM_USAGE)
     PARAMETER(PRINT_LOG)
-    PARAMETER(MAX_GAP)
-    PARAMETER(MIN_CONS_CNT)
-    PARAMETER(MIN_CONS_CNT_EUK)
+    PARAMETER(MIN_AA_MATCH)
+    PARAMETER(MIN_AA_MATCH_EUK)
     PARAMETER(MATCH_PER_KMER)
     PARAMETER(MIN_SS_MATCH)
     PARAMETER(TIE_RATIO)
@@ -89,6 +93,14 @@ public:
     PARAMETER(MAX_SHIFT)
     PARAMETER(EM)
     
+    PARAMETER(NEIGHBOR_KMERS)
+    PARAMETER(PDM_KMER)
+    PARAMETER(SCORE_MODE)
+    PARAMETER(DB_TOTAL_LENGTH)
+    PARAMETER(MAX_E_VALUE)
+    PARAMETER(USE_ALL_MATCHES)
+    PARAMETER(TIE_BRAKER)
+
     // extract
     PARAMETER(TARGET_TAX_ID)
     PARAMETER(EXTRACT_MODE)
@@ -109,6 +121,9 @@ public:
     PARAMETER(READID_COL)
     PARAMETER(TAXID_COL)
     PARAMETER(WEIGHT_MODE)
+    PARAMETER(MIN_EDGE_WEIGHT)
+    int weightMode;
+
 
     // DB build parameters
     PARAMETER(LIBRARY_PATH)
@@ -123,6 +138,9 @@ public:
     PARAMETER(MAKE_LIBRARY)
     PARAMETER(GTDB)
     PARAMETER(VALIDATE_INPUT)
+    PARAMETER(READING_FRAME)
+    PARAMETER(NO_MASK_TAXA)
+    PARAMETER(PACK_INFO)
 
     // DB updated parameters
     PARAMETER(NEW_TAXA)
@@ -172,19 +190,17 @@ public:
     int smerLen;
     int kmerFormat;
     std::string unirefXml;
+    std::string customMetamer;
 
     // Classify
     int seqMode;
-    int reducedAA;
+    int precisionMode;
     float minScore;
-    // std::string spaceMask;
-    int minConsCnt;
+    std::string spaceMask;
     uint8_t hammingMargin;
     float minSpScore;
     int ramUsage;
     int printLog;
-    int maxGap;
-    int minConsCntEuk;
     int matchPerKmer;
     int minSSMatch;
     float tieRatio;
@@ -192,6 +208,20 @@ public:
     int maxShift;
     bool em;
     
+    float thresholdK;
+    float minVoteScr;
+    int minEdgeWeight;
+    int neighborKmers;
+    int pdmKmer;
+    int scoreMode;
+    size_t dbTotalLength;
+    double maxEValue;
+    int useAllMatches;
+    int minAaMatch;
+    int minAaMatchEuk;
+    std::string priorityTaxa;
+    
+
     // Extract
     int targetTaxId;
     int extractMode;
@@ -218,8 +248,6 @@ public:
     int scoreCol;
     int readIdCol;
     int taxidCol;   
-    int weightMode;
-    float minVoteScr;
 
     // Database creation
     std::string tinfoPath;
@@ -235,6 +263,9 @@ public:
     std::string assAcc2taxid;
     int gtdb;
     int validateInput;
+    int readingFrame;
+    std::string noMaskTaxa;
+    int packInfo;
 
     // DB updated parameters
     std::string newTaxa;

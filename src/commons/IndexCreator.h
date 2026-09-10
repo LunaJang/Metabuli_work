@@ -33,7 +33,9 @@
 #include "GeneticCode.h"
 #include "KmerExtractor.h"
 #include "DeltaIdxReader.h"
+#include "InfoIndex.h"
 #include "UnirefTree.h"
+#include "MetamerPattern.h"
 
 
 enum class FilterMode { DB_CREATION, COMMON_KMER, UNIQ_KMER, UNIREF_LCA};
@@ -109,16 +111,19 @@ protected:
     bool isUpdating;
     int kmerFormat;
     int kmerLen;
+    int windowSize;
 
     uint64_t MARKER;
     BaseMatrix *subMat;
     bool removeRedundancyInfo;
     unordered_map<TaxID, TaxID> taxId2speciesId;
+    std::vector<TaxID> taxaNotToMask;
 
     // Inputs
     TaxonomyWrapper * taxonomy = nullptr;
     UnirefTree * unirefTree = nullptr;
-    GeneticCode * geneticCode;
+    MetamerPattern * metamerPattern = nullptr;
+    GeneticCode * geneticCode = nullptr;
     KmerExtractor * kmerExtractor;
 
     bool externTaxonomy;
@@ -137,6 +142,7 @@ protected:
     std::unordered_set<TaxID> taxIdSet;
     vector<string> fastaPaths;
     size_t numOfFlush=0;
+    size_t totalLength=0;
 
     // Database splits
     std::vector<std::string> deltaIdxFileNames;
@@ -144,6 +150,7 @@ protected:
     std::string mergedDeltaIdxFileName;
     std::string mergedInfoFileName;
     std::string deltaIdxSplitFileName;
+    InfoIndexMetadata finalInfoMetadata;
     struct Split{
         Split(size_t offset, size_t end) : offset(offset), end(end) {}
         size_t offset;
@@ -166,6 +173,8 @@ protected:
         const vector<pair<size_t, size_t>> & uniqKmerIdxRanges);
 
     void writeDbParameters();
+    void writeInfoMetadata();
+    void finalizeInfoIndex(const std::string &infoFileName, uint32_t maxInfoId, size_t idCount);
 
     size_t fillTargetKmerBuffer(
         Buffer<Kmer> &kmerBuffer,                 
@@ -268,7 +277,7 @@ protected:
 public:
     IndexCreator(const LocalParameters & par, TaxonomyWrapper * taxonomy, int kmerFormat);
     IndexCreator(const LocalParameters & par, UnirefTree * unirefTree, int kmerFormat);
-    IndexCreator(const LocalParameters & par, int kmerFormat);
+    IndexCreator(const LocalParameters & par, int kmerFormat); // Used in create_unique_kmer_list.cpp
     ~IndexCreator();
     void createIndex();
     void createCommonKmerIndex();
@@ -323,6 +332,8 @@ template <FilterMode M>
 void IndexCreator::mergeTargetFiles() {
     size_t bufferSize = 1024 * 1024 * 512;
     WriteBuffer<uint16_t> diffBuffer(mergedDeltaIdxFileName, bufferSize);
+    // Merge output is written as uint32 first. After the stream is complete,
+    // finalizeInfoIndex() either packs it or records the raw uint32 metadata.
     WriteBuffer<uint32_t> infoBuffer(mergedInfoFileName, bufferSize);
     
     // Prepare files to merge
@@ -365,7 +376,10 @@ void IndexCreator::mergeTargetFiles() {
     std::vector<std::atomic<bool>> completedSplits(splitNum);
     int remainingSplits = splitNum;
     vector<pair<size_t, size_t>> uniqKmerIdxRanges;
-    size_t lastKmer = 0;
+    uint64_t lastKmer = 0;
+    // Track the selected IDs that actually reach disk. If packing is enabled,
+    // this determines the smallest useful bit width for the final info file.
+    uint32_t maxInfoId = 0;
     auto * uniqKmerIdx = new size_t[kmerBuffer.bufferSize];
     vector<size_t> splitToProcess;
     while (remainingSplits > 0) {
@@ -385,7 +399,7 @@ void IndexCreator::mergeTargetFiles() {
                 }
                 splitToProcess.push_back(i);
             }
-#pragma omp parallel for default(none), shared(cout, kmerBuffer, deltaIdxReaders, splitToProcess, completedSplits, posToWrite, max, splitNum, valueBufferSize, taxId2speciesId, mask, remainingSplits)
+            #pragma omp parallel for default(none), shared(cout, kmerBuffer, deltaIdxReaders, splitToProcess, completedSplits, posToWrite, max, splitNum, valueBufferSize, taxId2speciesId, mask, remainingSplits)
             for (size_t i = 0; i < splitToProcess.size(); i ++) {
                 size_t split = splitToProcess[i];
                 size_t offset = posToWrite + i * valueBufferSize;
@@ -431,10 +445,13 @@ void IndexCreator::mergeTargetFiles() {
         // Write       
         for (size_t i = 0; i < uniqKmerIdxRanges.size(); i ++) {
             for (size_t j = uniqKmerIdxRanges[i].first; j < uniqKmerIdxRanges[i].second; j ++) {
-                infoBuffer.write(&kmerBuffer.buffer[uniqKmerIdx[j]].id);
+                uint32_t infoId = kmerBuffer.buffer[uniqKmerIdx[j]].id;
+                maxInfoId = std::max(maxInfoId, infoId);
+                infoBuffer.write(&infoId);
                 getDiffIdx(lastKmer, kmerBuffer.buffer[uniqKmerIdx[j]].value, diffBuffer);
 
-                // Write split info
+                // Split offsets stay in logical ID units, independent of the
+                // final physical info encoding.
                 if (AminoAcidPart(lastKmer) != AAofTempSplitOffset && splitCheck == 1) {
                     splitList[splitListIdx++] = {lastKmer, diffBuffer.writeCnt, infoBuffer.writeCnt};
                     splitCheck = 0;
@@ -458,11 +475,16 @@ void IndexCreator::mergeTargetFiles() {
     FILE * diffIdxSplitFile = fopen(deltaIdxSplitFileName.c_str(), "wb");
     fwrite(splitList, sizeof(DiffIdxSplit), par.splitNum, diffIdxSplitFile);
     fclose(diffIdxSplitFile);
+    const size_t finalInfoCount = infoBuffer.writeCnt;
+    infoBuffer.close();
+    // Finalization happens only after close so optional packing can stream the
+    // complete uint32 file into a compact replacement.
+    finalizeInfoIndex(mergedInfoFileName, maxInfoId, finalInfoCount);
     // for(int i = 0; i < par.splitNum; i++) {
     //     cout<<splitList[i].ADkmer<< " "<<splitList[i].diffIdxOffset<< " "<<splitList[i].infoIdxOffset<<endl;
     // }
     cout<<"DB creation completed"<<endl;
-    cout<<"Total k-mer count   : " << infoBuffer.writeCnt <<endl;
+    cout<<"Total k-mer count   : " << finalInfoCount <<endl;
 
     cout<<"DB files you need   : " << endl;
     cout<<mergedDeltaIdxFileName<<endl;
