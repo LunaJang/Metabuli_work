@@ -125,8 +125,8 @@ public:
 };
 class DeltaIdxReader {
 private:
-    std::string infoFileName;
     std::string deltaIdxFileName;
+    std::string infoFileName;
     size_t totalValueNum;
 
     // To manage values
@@ -202,7 +202,6 @@ public:
     }
 
     ~DeltaIdxReader() {
-
         delete[] valueBuffer;
     }
 

@@ -84,10 +84,14 @@ GroupGenerator::GroupGenerator(LocalParameters & par) : par(par) {
     if (partitionCnt < 1) { partitionCnt = 1; }
     edgeMode = par.edgeMode;
 
-    geneticCode = new GeneticCode(par.reducedAA == 1);
+    // 1.2.0 turned GeneticCode into an abstract base with RegularGeneticCode and
+    // ReducedGeneticCode below it, and dropped --reduced-aa. Grouping only ever ran on the
+    // regular 21-letter alphabet, and every upstream call site that would pick the reduced
+    // one is commented out, so name the regular code directly.
+    geneticCode = new RegularGeneticCode();
     queryIndexer = new QueryIndexer(par);
     queryIndexer->setKmerLen(12);
-    kmerExtractor = new KmerExtractor(par, *geneticCode, kmerFormat);
+    kmerExtractor = new KmerExtractor(par, geneticCode, kmerFormat);
 }
 
 GroupGenerator::~GroupGenerator() {

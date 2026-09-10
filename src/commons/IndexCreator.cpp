@@ -28,28 +28,71 @@ IndexCreator::IndexCreator(
     versionFileName = dbDir + "/db.version";
     paramterFileName = dbDir + "/db.parameters";
 
-    if (par.reducedAA == 1){
-        MARKER = 0Xffffffff;
-        MARKER = ~ MARKER;
+    this->totalLength = par.dbTotalLength;
+
+    if (kmerFormat == 1) { // Use the legacy metamer pattern
+        metamerPattern = new LegacyPattern(std::make_unique<RegularGeneticCode>(), 8);
+    } else if (!par.customMetamer.empty()) {
+        // Use custom metamer pattern
+        int codeNum = getCodeNum(par.customMetamer);
+        int weightedPosNum = getWeightedPosNum(par.customMetamer);
+        if (codeNum == 1) {
+            if (par.spaceMask == "") {
+                metamerPattern = new SingleCodePattern(par.customMetamer);
+            } else {
+                uint32_t mask = parseMask(par.spaceMask.c_str());
+                int setBitNum = __builtin_popcount(mask);
+                if (setBitNum != weightedPosNum) {
+                    std::cerr << "Error: The number of set bits in space mask (" << setBitNum 
+                              << ") does not match length (" 
+                              << weightedPosNum << ") in custom metamer pattern." << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+                metamerPattern = new SpacedPattern(par.customMetamer, mask);
+            }
+        } else if (codeNum > 1) {
+            if (par.spaceMask != "") {
+                cout << "Error: Spaced k-mer isn't supported with a multi-code custom metamer pattern." << endl;
+                exit(EXIT_FAILURE);
+            }
+            metamerPattern = new MultiCodePattern(par.customMetamer);
+        }
     } else {
-        MARKER = 16777215;
-        MARKER = ~ MARKER;
+        if (par.spaceMask.empty()) {
+            metamerPattern = new SingleCodePattern(std::make_unique<RegularGeneticCode>(), 8);
+        } else {
+            uint32_t mask = parseMask(par.spaceMask.c_str());
+            metamerPattern = new SpacedPattern(std::make_unique<RegularGeneticCode>(), __builtin_popcount(mask), mask);
+        }
     }
-    geneticCode = new GeneticCode(par.reducedAA == 1);
-    kmerExtractor = new KmerExtractor(par, *geneticCode, kmerFormat);
+    kmerExtractor = new KmerExtractor(par, metamerPattern);
+    MARKER = ~ metamerPattern->dnaMask;
     isUpdating = false;
     subMat = new NucleotideMatrix(par.scoringMatrixFile.values.nucleotide().c_str(), 1.0, 0.0);
+
+    if (!par.noMaskTaxa.empty()) { 
+        vector<string> taxaNotToMaskStr = Util::split(par.noMaskTaxa, ",");
+        for (const string &taxIdStr : taxaNotToMaskStr) {
+            TaxID taxId = taxonomy->getInternalTaxID(stoi(taxIdStr));
+            taxaNotToMask.push_back(taxId);
+        }
+    }
+
 }
 
 IndexCreator::IndexCreator(
     const LocalParameters & par, 
     UnirefTree * unirefTree,
     int kmerFormat) 
-    : par(par), unirefTree(unirefTree), kmerFormat(kmerFormat) 
+    : par(par), kmerFormat(kmerFormat), unirefTree(unirefTree)
 {
     dbDir = par.filenames[0];
-    geneticCode = new GeneticCode(par.reducedAA == 1);
-    kmerExtractor = new KmerExtractor(par, *geneticCode, kmerFormat);
+    // if (par.reducedAA) {
+    //     geneticCode = new ReducedGeneticCode();
+    // } else {
+        geneticCode = new RegularGeneticCode();
+    // }
+    kmerExtractor = new KmerExtractor(par, geneticCode, kmerFormat);
     isUpdating = false;
 }
 
@@ -58,15 +101,22 @@ IndexCreator::IndexCreator(
     int kmerFormat) : par(par), kmerFormat(kmerFormat) 
 {
     dbDir = par.filenames[0];
-    geneticCode = new GeneticCode(par.reducedAA == 1);
-    kmerExtractor = new KmerExtractor(par, *geneticCode, kmerFormat);
+    // if (par.reducedAA) {
+    //     geneticCode = new ReducedGeneticCode();
+    // } else {
+        geneticCode = new RegularGeneticCode();
+    // }
+    kmerExtractor = new KmerExtractor(par, geneticCode, kmerFormat);
     isUpdating = false;
     subMat = new NucleotideMatrix(par.scoringMatrixFile.values.nucleotide().c_str(), 1.0, 0.0);
 }
 
 
 IndexCreator::~IndexCreator() {
-    delete geneticCode;
+    delete metamerPattern;
+    if (geneticCode != nullptr) {
+        delete geneticCode;
+    }   
     delete kmerExtractor;
     delete subMat;
 }
@@ -79,7 +129,6 @@ void IndexCreator::createLcaKmerIndex() {
     string fileName = par.filenames[1];
     KSeqWrapper * kseq = KSeqFactory(fileName.c_str());
     std::unordered_map<string, uint32_t> name2id;
-    uint32_t idOffset = 0;
 
     std::cout << "Filling UniRef100 name to ID mapping ... " << std::endl;
     time_t start = time(nullptr);
@@ -352,6 +401,7 @@ void IndexCreator::createIndex() {
         SORT_PARALLEL(kmerBuffer.buffer, kmerBuffer.buffer + kmerBuffer.startIndexOfReserve,
                       Kmer::compareTargetKmer);
         time_t sort = time(nullptr);
+        cout << kmerBuffer.startIndexOfReserve << " k-mers extracted" << endl;
         cout << "Reference k-mer sort : " << sort - start << endl;
 
         // Reduce redundancy
@@ -376,9 +426,11 @@ void IndexCreator::createIndex() {
 }
 
 
-string IndexCreator::addToLibrary(const std::string & dbDir,
-                                  const std::string & fnaListFileName,
-                                  const std::string & acc2taxIdFileName) {
+string IndexCreator::addToLibrary(
+    const std::string & dbDir,
+    const std::string & fnaListFileName,
+    const std::string & acc2taxIdFileName) 
+{
     // Make library directory
     time_t now = time(0);
     tm *ltm = localtime(&now);
@@ -534,6 +586,7 @@ void IndexCreator::getObservedAccessions(
                     *pos = '\0';
                 }
                 if (duplicateCheck.find(e.name.s) != duplicateCheck.end()) {
+                    order++; 
                     continue;
                 } else {
                     duplicateCheck.insert(e.name.s);
@@ -669,20 +722,26 @@ void IndexCreator::getTaxonomyOfAccessions(vector<Accession> & observedAccession
     std::unordered_map<TaxID, TaxID> external2internalTaxID;
     taxonomy->getExternal2internalTaxID(external2internalTaxID);
     std::unordered_set<TaxID> spIdSet;
-    for (size_t i = 0; i < observedAccessionsVec.size(); ++i) {    
-        auto it = external2internalTaxID.find(observedAccessionsVec[i].taxID);
-        if (it == external2internalTaxID.end() || observedAccessionsVec[i].taxID == 0) {
-            cout << "TaxID is not found for accession " << observedAccessionsVec[i].accession << " " << observedAccessionsVec[i].taxID << endl;
-            unmappedAccessions.push_back(observedAccessionsVec[i].accession);
-            continue;
+    for (size_t i = 0; i < observedAccessionsVec.size(); ++i) {
+        TaxID curId = 0;
+        if (taxonomy->hasInternalTaxID()) {
+            auto it = external2internalTaxID.find(observedAccessionsVec[i].taxID);
+            if (it == external2internalTaxID.end() || observedAccessionsVec[i].taxID == 0) {
+                cout << "TaxID is not found for accession " << observedAccessionsVec[i].accession << " " << observedAccessionsVec[i].taxID << endl;
+                unmappedAccessions.push_back(observedAccessionsVec[i].accession);
+                continue;
+            }
+            curId = it->second;
+        } else {
+            curId = observedAccessionsVec[i].taxID;
         }
-        observedAccessionsVec[i].taxID = it->second; // store the internal taxID
-        observedAccessionsVec[i].speciesID = taxonomy->getTaxIdAtRank(it->second, "species");
+        observedAccessionsVec[i].taxID = curId;
+        observedAccessionsVec[i].speciesID = taxonomy->getTaxIdAtRank(curId, "species");
         spIdSet.insert(observedAccessionsVec[i].speciesID);
-        taxIdSet.insert(it->second);
-        taxId2speciesId[it->second] = observedAccessionsVec[i].speciesID;
+        taxIdSet.insert(curId);
+        taxId2speciesId[curId] = observedAccessionsVec[i].speciesID;
         if (observedAccessionsVec[i].speciesID == 0) {
-            cout << "Species ID is not found for accession " << observedAccessionsVec[i].accession << " " << it->second << endl;
+            cout << "Species ID is not found for accession " << observedAccessionsVec[i].accession << " " << curId << endl;
             unmappedAccessions.push_back(observedAccessionsVec[i].accession);
             exit(1);
         }
@@ -755,6 +814,7 @@ void IndexCreator::getAccessionBatches(std::vector<Accession> & observedAccessio
                     trainingSeq = observedAccessionsVec[i].order;
                 }
                 lengthSum += observedAccessionsVec[i].length;
+                totalLength += observedAccessionsVec[i].length;
                 kmerCntSum += static_cast<size_t>(observedAccessionsVec[i].length * 0.4);
                 orders.push_back(observedAccessionsVec[i].order);
                 lengths.push_back(observedAccessionsVec[i].length);
@@ -776,6 +836,11 @@ void IndexCreator::getAccessionBatches(std::vector<Accession> & observedAccessio
             accessionBatches[j].trainingSeqIdx = trainingSeq;
         }
     }
+
+    // for (size_t i = 0; i < accessionBatches.size(); ++i) {
+    //     accessionBatches[i].print();
+    // }
+
 }
 
 
@@ -831,7 +896,6 @@ void IndexCreator::writeTargetFilesAndSplits(
     numOfFlush++;
     size_t bufferSize = 1024 * 1024 * 32;
     uint64_t lastKmer = 0;
-    size_t splitIdx = 1;
     WriteBuffer<uint16_t> diffBuffer(dbDir + "/diffIdx", bufferSize);
     
     WriteBuffer<uint32_t> infoBuffer(dbDir + "/info", bufferSize); 
@@ -1045,7 +1109,7 @@ size_t IndexCreator::fillTargetKmerBuffer(Buffer<Kmer> &kmerBuffer,
 
             if (par.syncmer) {
                 estimatedKmerCnt = static_cast<size_t>(
-                    (totalLength * 1.3 / 3.0) / ((8 - par.smerLen + 1) / 2.0)
+                    (totalLength * 1.3 / 3.0) / ((metamerPattern->kmerLen - par.smerLen + 1) / 2.0)
                 );
             } else {
                 estimatedKmerCnt = static_cast<size_t>(
@@ -1064,6 +1128,16 @@ size_t IndexCreator::fillTargetKmerBuffer(Buffer<Kmer> &kmerBuffer,
                 size_t idx = 0;
                 while (kseq->ReadEntry()) {
                     if (seqCnt == accessionBatches[batchIdx].orders[idx]) {
+                        bool doMasking = par.maskMode;
+                        bool isNotToMask = taxonomy->isAunderB(accessionBatches[batchIdx].taxIDs[idx], taxaNotToMask);
+                        if (isNotToMask) {
+                            #pragma omp critical
+                            {
+                                cout << "Masking is not applied to " << kseq->entry.name.s << " because it belongs to a taxon that is set to be not masked.\n";
+                            }
+                        }
+                        doMasking = doMasking && !isNotToMask;
+
                         if (accessionBatches[batchIdx].taxIDs[idx] == 0) {
                             #pragma omp critical
                             {
@@ -1074,7 +1148,7 @@ size_t IndexCreator::fillTargetKmerBuffer(Buffer<Kmer> &kmerBuffer,
                         const KSeqWrapper::KSeqEntry & e = kseq->entry;
                         // Mask low complexity regions
                         char *maskedSeq = nullptr;
-                        if (par.maskMode) {
+                        if (doMasking) {
                             maskedSeq = new char[e.sequence.l + 1]; // TODO: reuse the buffer
                             SeqIterator::maskLowComplexityRegions((unsigned char *) e.sequence.s, (unsigned char *) maskedSeq, probMatrix, par.maskProb, subMat);
                             maskedSeq[e.sequence.l] = '\0';
@@ -1085,8 +1159,23 @@ size_t IndexCreator::fillTargetKmerBuffer(Buffer<Kmer> &kmerBuffer,
                         orfNum = 0;
                         extendedORFs.clear();
                         int tempCheck = 0;
-                        if (cdsInfoMap.find(string(e.name.s)) != cdsInfoMap.end()) {
-                            // Get CDS and non-CDS
+                        if (par.readingFrame != 0) {
+                            // USE PROVIDED READING FRAME
+                
+                            tempCheck = kmerExtractor->extractTargetKmers(
+                                            maskedSeq,
+                                            kmerBuffer,
+                                            posToWrite,
+                                            accessionBatches[batchIdx].taxIDs[idx],
+                                            accessionBatches[batchIdx].speciesID,
+                                            {par.readingFrame-1, (int) e.sequence.l - 1, par.readingFrame < 3 ? 1 : -1});
+                            if (tempCheck == -1) {
+                                cout << "ERROR: Buffer overflow " << e.name.s << e.sequence.l << endl;
+                            }   
+                        }
+                        else if (cdsInfoMap.find(string(e.name.s)) != cdsInfoMap.end()) {
+                            // USE PROVIDED CDS ANNOTATION
+
                             cds.clear();
                             nonCds.clear();
                             seqIterator.devideToCdsAndNonCds(maskedSeq,
@@ -1161,9 +1250,10 @@ size_t IndexCreator::fillTargetKmerBuffer(Buffer<Kmer> &kmerBuffer,
                                 // Get extended ORFs
                                 prodigal->getPredictedGenes((unsigned char *) e.sequence.s, e.sequence.l);
                                 prodigal->removeCompletelyOverlappingGenes();
-                                prodigal->getExtendedORFs(prodigal->finalGenes, prodigal->nodes, extendedORFs,
-                                                             prodigal->fng, e.sequence.l,
-                                                        orfNum, intergenicKmers, e.sequence.s);
+                                prodigal->getExtendedORFs_fixed(
+                                    prodigal->finalGenes, prodigal->nodes, extendedORFs,
+                                    prodigal->fng, e.sequence.l,
+                                    orfNum, intergenicKmers, e.sequence.s, metamerPattern->windowSize * 3);
                                 // Get k-mers from extended ORFs
                                 for (size_t orfCnt = 0; orfCnt < orfNum; orfCnt++) {
                                     tempCheck = kmerExtractor->extractTargetKmers(
@@ -1182,12 +1272,13 @@ size_t IndexCreator::fillTargetKmerBuffer(Buffer<Kmer> &kmerBuffer,
                                 // Get extended ORFs
                                 prodigal->getPredictedGenes((unsigned char *) reverseComplement, e.sequence.l);
                                 prodigal->removeCompletelyOverlappingGenes();
-                                prodigal->getExtendedORFs(prodigal->finalGenes, prodigal->nodes, extendedORFs,
-                                                                 prodigal->fng, e.sequence.l,
-                                                            orfNum, intergenicKmers, reverseComplement);
+                                prodigal->getExtendedORFs_fixed(
+                                    prodigal->finalGenes, prodigal->nodes, extendedORFs,
+                                    prodigal->fng, e.sequence.l,
+                                    orfNum, intergenicKmers, reverseComplement, metamerPattern->windowSize * 3);
 
                                 // Get reverse masked sequence
-                                if (par.maskMode) {
+                                if (doMasking) {
                                     delete[] maskedSeq;
                                     maskedSeq = new char[e.sequence.l + 1];
                                     SeqIterator::maskLowComplexityRegions((unsigned char *) reverseComplement, (unsigned char *) maskedSeq, probMatrix, par.maskProb, subMat);
@@ -1212,7 +1303,7 @@ size_t IndexCreator::fillTargetKmerBuffer(Buffer<Kmer> &kmerBuffer,
                             }                            
                         }
                         idx++;
-                        if (par.maskMode) {
+                        if (doMasking) {
                             delete[] maskedSeq;
                         }
                         if (idx == accessionBatches[batchIdx].lengths.size()) {
@@ -1223,11 +1314,11 @@ size_t IndexCreator::fillTargetKmerBuffer(Buffer<Kmer> &kmerBuffer,
                 }
                 delete kseq;
                 __sync_fetch_and_add(&processedBatchCnt, 1);
-                #pragma omp critical
-                {
-                    cout << processedBatchCnt << " batches processed out of " << accessionBatches.size() << endl;
-                        // cout << fastaPaths[accessionBatches[batchIdx].whichFasta] << " processed\n";
-                }
+                // #pragma omp critical
+                // {
+                //     cout << processedBatchCnt << " batches processed out of " << accessionBatches.size() << endl;
+                //         // cout << fastaPaths[accessionBatches[batchIdx].whichFasta] << " processed\n";
+                // }
             } else {
                 batchChecker[batchIdx].store(false, std::memory_order_release);
                 hasOverflow.fetch_add(1, std::memory_order_relaxed);
@@ -1251,8 +1342,7 @@ void IndexCreator::writeDbParameters() {
     fprintf(handle, "DB_name\t%s\n", par.dbName.c_str());
     fprintf(handle, "Creation_date\t%s\n", par.dbDate.c_str());
     fprintf(handle, "Metabuli commit used to create the DB\t%s\n", version);
-    fprintf(handle, "Reduced_alphabet\t%d\n", par.reducedAA);
-    // fprintf(handle, "Spaced_kmer_mask\t%s\n", spaceMask.c_str());
+    fprintf(handle, "Spaced_kmer_mask\t%s\n", par.spaceMask.c_str());
     fprintf(handle, "Accession_level\t%d\n", par.accessionLevel);
     fprintf(handle, "Mask_mode\t%d\n", par.maskMode);
     fprintf(handle, "Mask_prob\t%f\n", par.maskProb);
@@ -1262,6 +1352,37 @@ void IndexCreator::writeDbParameters() {
         fprintf(handle, "Syncmer_len\t%d\n", par.smerLen);
     }
     fprintf(handle, "Kmer_format\t%d\n", kmerFormat);
+    fprintf(handle, "Total_seq_length\t%lu\n", totalLength);
+
+    if (!par.customMetamer.empty()) {
+        // Read the custom metamer file and write to parameter file
+        ifstream metamerFile(par.customMetamer);
+        if (!metamerFile.is_open()) {
+            Debug(Debug::ERROR) << "Could not open " << par.customMetamer << " for reading\n";
+            EXIT(EXIT_FAILURE);
+        }
+        string line;
+        bool inSection = false;
+        while (getline(metamerFile, line)) {
+            if (line.empty()) {
+                continue;
+            }
+
+            if (line.find("===BEGIN_CUSTOM_METAMER===") != string::npos) {
+                inSection = true;
+            }
+
+            if (inSection) {            
+               fprintf(handle, "%s\n", line.c_str());
+            }
+
+            // Stop printing AFTER we have printed the END tag
+            if (line.find("===END_CUSTOM_METAMER===") != string::npos) {
+                inSection = false;
+            }
+        }
+        metamerFile.close();
+    }
     fclose(handle);
 }
 

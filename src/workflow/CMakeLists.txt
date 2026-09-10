@@ -5,9 +5,9 @@ set(workflow_source_files
         workflow/updateDB.cpp
         workflow/add_to_library.cpp
         workflow/build.cpp
-        workflow/filter.cpp
         workflow/extract.cpp
         workflow/create-unirefdb.cpp
         workflow/create-uniref-tree.cpp
         workflow/assign-uniref.cpp
+        workflow/create-tax-db.cpp
         PARENT_SCOPE)

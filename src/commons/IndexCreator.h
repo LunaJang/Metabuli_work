@@ -34,6 +34,7 @@
 #include "KmerExtractor.h"
 #include "DeltaIdxReader.h"
 #include "UnirefTree.h"
+#include "MetamerPattern.h"
 
 
 enum class FilterMode { DB_CREATION, COMMON_KMER, UNIQ_KMER, UNIREF_LCA};
@@ -109,16 +110,19 @@ protected:
     bool isUpdating;
     int kmerFormat;
     int kmerLen;
+    int windowSize;
 
     uint64_t MARKER;
     BaseMatrix *subMat;
     bool removeRedundancyInfo;
     unordered_map<TaxID, TaxID> taxId2speciesId;
+    std::vector<TaxID> taxaNotToMask;
 
     // Inputs
     TaxonomyWrapper * taxonomy = nullptr;
     UnirefTree * unirefTree = nullptr;
-    GeneticCode * geneticCode;
+    MetamerPattern * metamerPattern = nullptr;
+    GeneticCode * geneticCode = nullptr;
     KmerExtractor * kmerExtractor;
 
     bool externTaxonomy;
@@ -137,6 +141,7 @@ protected:
     std::unordered_set<TaxID> taxIdSet;
     vector<string> fastaPaths;
     size_t numOfFlush=0;
+    size_t totalLength=0;
 
     // Database splits
     std::vector<std::string> deltaIdxFileNames;
@@ -268,7 +273,7 @@ protected:
 public:
     IndexCreator(const LocalParameters & par, TaxonomyWrapper * taxonomy, int kmerFormat);
     IndexCreator(const LocalParameters & par, UnirefTree * unirefTree, int kmerFormat);
-    IndexCreator(const LocalParameters & par, int kmerFormat);
+    IndexCreator(const LocalParameters & par, int kmerFormat); // Used in create_unique_kmer_list.cpp
     ~IndexCreator();
     void createIndex();
     void createCommonKmerIndex();
@@ -365,7 +370,7 @@ void IndexCreator::mergeTargetFiles() {
     std::vector<std::atomic<bool>> completedSplits(splitNum);
     int remainingSplits = splitNum;
     vector<pair<size_t, size_t>> uniqKmerIdxRanges;
-    size_t lastKmer = 0;
+    uint64_t lastKmer = 0;
     auto * uniqKmerIdx = new size_t[kmerBuffer.bufferSize];
     vector<size_t> splitToProcess;
     while (remainingSplits > 0) {
@@ -385,7 +390,7 @@ void IndexCreator::mergeTargetFiles() {
                 }
                 splitToProcess.push_back(i);
             }
-#pragma omp parallel for default(none), shared(cout, kmerBuffer, deltaIdxReaders, splitToProcess, completedSplits, posToWrite, max, splitNum, valueBufferSize, taxId2speciesId, mask, remainingSplits)
+            #pragma omp parallel for default(none), shared(cout, kmerBuffer, deltaIdxReaders, splitToProcess, completedSplits, posToWrite, max, splitNum, valueBufferSize, taxId2speciesId, mask, remainingSplits)
             for (size_t i = 0; i < splitToProcess.size(); i ++) {
                 size_t split = splitToProcess[i];
                 size_t offset = posToWrite + i * valueBufferSize;
