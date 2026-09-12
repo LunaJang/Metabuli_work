@@ -37,6 +37,23 @@ KmerExtractor::KmerExtractor(
     spaceNum = 0;
     maskMode = par.maskMode;
     maskProb = par.maskProb;
+
+    // windowSize is the k the query-length checks measure against, and the loop above has just
+    // settled kmerLen to 8 or 12 depending on the format. Before the MetamerPattern constructor
+    // was added, those checks read kmerLen directly; they now read windowSize, which only that
+    // other constructor sets. Left unset here it is indeterminate, and a value above the 49 amino
+    // acids a 150 bp read covers makes getQueryKmerNumber return 0 for every read: the whole
+    // query is marked empty and extraction yields no k-mers at all.
+    windowSize = kmerLen;
+
+    // Same omission. getKmerCount multiplies by this, so an indeterminate value scales every
+    // per-read count. The formula is the one the other constructor uses.
+    syncmerRatio = 1;
+    if (par.syncmer && par.smerLen > 0) {
+        float c = (kmerLen - par.smerLen + 1) / 2.0f;
+        syncmerRatio = 1 / c + 0.1f;
+    }
+
     subMat = new NucleotideMatrix(par.scoringMatrixFile.values.nucleotide().c_str(), 1.0, 0.0);
     probMatrix = new ProbabilityMatrix(*(subMat));
 }
