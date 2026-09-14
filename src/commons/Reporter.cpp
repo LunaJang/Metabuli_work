@@ -200,9 +200,10 @@ void Reporter::writeReportFile(
     writeReport(fp, cladeCounts, numOfQuery);
     fclose(fp);
 
-    // Write Krona chart
-    if (jobId.empty()) { return; }
-    
+    // Write Krona chart. jobId is what the default name is built from, so without one there is
+    // nothing to write -- unless the caller named the file itself, which apply-group does.
+    if (jobId.empty() && kronaFileName.empty()) { return; }
+
     FILE *kronaFile = nullptr;
 
     if (reportType == ReportType::Default) {

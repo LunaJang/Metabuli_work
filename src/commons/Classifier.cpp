@@ -220,6 +220,17 @@ void Classifier::classifyReads() {
                 matchPerKmer *= 2;
                 moreReads = true;
                 std::cout << "--match-per-kmer was increased to " << matchPerKmer << " and searching again..." << std::endl;
+                // The retry reopens the query files and skips processedReadCnt entries, a count
+                // this split did not contribute to. A sequence left in savedSeq was read from the
+                // old stream but never counted, so the reopened stream hands it over a second
+                // time while extractQueryKmers still emits the saved copy -- one duplicated read
+                // in the output for every retry. Drop it; the reopened stream has it.
+                savedSeq_1->name.clear();
+                savedSeq_1->s.clear();
+                if (par.seqMode == 2) {
+                    savedSeq_2->name.clear();
+                    savedSeq_2->s.clear();
+                }
                 break;
             }
             std::cout << "--------------------" << std::endl;

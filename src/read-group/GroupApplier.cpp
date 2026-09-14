@@ -18,7 +18,10 @@ GroupApplier::GroupApplier(LocalParameters & par) : par(par) {
     updatedResultFileName = outDir + "/updated_classifications.tsv";
     updatedReportFileName = outDir + "/updated_report.tsv";
 
-    reporter = new Reporter(par, taxonomy);
+    // Named explicitly: Reporter's own naming reads par.filenames[3] and [4] as the classify
+    // command lays them out, and apply-group's fifth argument is the output directory, not a job
+    // id. Passing the name also leaves jobId empty, so the krona file has to be named too.
+    reporter = new Reporter(par, taxonomy, updatedReportFileName);
 }
 
 GroupApplier::~GroupApplier() {
@@ -256,6 +259,16 @@ void GroupApplier::applyRepLabel(const vector<OrgResult>& orgResults,
     reporter->writeReadClassification(queryList, groupMappingInfo);    
     cout << "writing done" << endl;
     reporter->closeReadClassificationFile();
+
+    unordered_map<TaxID, unsigned int> taxCounts;
+    for (const Query & q : queryList) {
+        ++taxCounts[q.classification];
+    }
+    reporter->writeReportFile(static_cast<int>(queryList.size()),
+                              taxCounts,
+                              ReportType::Default,
+                              outDir + "/updated_krona.html");
+    cout << "Report saved to " << updatedReportFileName << endl;
     
     cout << "Result saved to " << updatedResultFileName << " successfully." << endl;    
     cout << "Time spent: " << double(time(nullptr) - beforeSearch) << " seconds." << endl;
