@@ -2,6 +2,7 @@
 #include "FileUtil.h"
 #include "common.h"
 #include "Kmer.h"
+#include <cstdlib>
 GroupApplier::GroupApplier(LocalParameters & par) : par(par) {
     groupFileDir    = par.filenames[0];
     groupmapFileDir = par.filenames[1];
@@ -91,14 +92,32 @@ void GroupApplier::loadOrgResult(vector<OrgResult>& orgResults, size_t& processe
         }
     } else {
         string line;
+        size_t unreadableScores = 0;
         while (getline(inFile, line)) {
             if (line.empty()) continue;
             if (line.front() == '#') continue;
             std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
             TaxID taxId = stoi(columns[classificationCol]);
-            float score = stof(columns[scoreCol]);
+
+            // Not every classifier writes a score. Kraken2's fifth column is its LCA mapping,
+            // which begins with a taxon id often enough to parse and with an 'A' -- its marker for
+            // ambiguous k-mers -- often enough to throw, so stof killed the run part way through a
+            // file it had been reading happily. A read whose score cannot be read scores 0, which
+            // is what --weight-mode 0 wants anyway: uniform weighting is the only mode that means
+            // anything without scores, and it ignores this value.
+            const char * scoreStr = columns[scoreCol].c_str();
+            char * scoreEnd = nullptr;
+            float score = strtof(scoreStr, &scoreEnd);
+            if (scoreEnd == scoreStr) {
+                score = 0.0f;
+                unreadableScores++;
+            }
             orgResults.push_back({taxId, score, columns[readNameCol]});
             processedReadCnt++;
+        }
+        if (unreadableScores > 0) {
+            cout << "Warning: column " << (scoreCol + 1) << " held no number on "
+                 << unreadableScores << " lines; those reads scored 0." << endl;
         }
     }
     inFile.close();
