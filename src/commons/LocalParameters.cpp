@@ -410,7 +410,7 @@ LocalParameters::LocalParameters() :
         WEIGHT_MODE(WEIGHT_MODE_ID,
                     "--weight-mode",
                     "Majority LCA weight mode.",
-                    "Majority LCA weight mode. 0:uniform, 1:score, 2:score squared",
+                    "How a group's members are weighted when its label is decided. 0:uniform, 1:score, 2:score squared. It does not decide who the label is written to -- that is always the members with no label of their own, or one scoring below --min-vote-score",
                     typeid(int),
                     (void *) &weightMode,
                     "[0-2]"),

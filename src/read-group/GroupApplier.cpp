@@ -253,12 +253,20 @@ void GroupApplier::applyRepLabel(const vector<OrgResult>& orgResults,
         bool hasRepLabel = (repLabelIt != repLabel.end() && repLabelIt->second != 0);
 
         if (hasRepLabel) {
-            bool applyRep;
-            if (par.weightMode == 0) {
-                applyRep = true;
-            } else {
-                applyRep = (orgResults[queryIdx].label == 0 || orgResults[queryIdx].score < par.minVoteScr);
-            }
+            // --weight-mode says how a group's members are weighted when its label is
+            // decided. It used to also decide who that label is written to: mode 0 overwrote
+            // every member, the others only the unlabelled and the low-scoring. Those are two
+            // different questions and conflating them made mode 0 unusable on a classifier
+            // that was already accurate -- it replaced correct labels with a group LCA that
+            // sits higher up the tree. Kraken2 writes no score, so mode 0 was the only mode
+            // available to it, and propagation cost it species F1 0.8262 -> 0.5705 on
+            // species-inclusion while gaining 0.4417 -> 0.5778 on species-exclusion.
+            //
+            // The rule is now the same in every mode: a member keeps its own label unless it
+            // has none or scores below the vote threshold. Under mode 0 every score is 1, so
+            // it reduces to overwriting the unlabelled, which is what propagation is for.
+            bool applyRep = (orgResults[queryIdx].label == 0
+                             || orgResults[queryIdx].score < par.minVoteScr);
             if (applyRep) {
                 queryList.emplace_back(makeQuery(repLabelIt->second, orgResults[queryIdx].score, orgResults[queryIdx].name));
             } else {
