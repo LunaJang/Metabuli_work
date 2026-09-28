@@ -322,6 +322,13 @@ void IndexCreator::createCommonKmerIndex() {
         lastShiftSum = shiftSum;
         cout << double(time(nullptr) - start) << " s" << endl;
         
+        // Whatever the reservations did, the sort may only touch what was allocated.
+        // Slots between the last write and this bound hold zeroed k-mers, which sort to
+        // the front and are skipped where the first meaningful k-mer is found.
+        if (kmerBuffer.startIndexOfReserve > kmerBuffer.bufferSize) {
+            kmerBuffer.startIndexOfReserve = kmerBuffer.bufferSize;
+        }
+
         // Sort the k-mers
         start = time(nullptr);
         cout << "Sort k-mers      : " << flush;
@@ -1119,10 +1126,15 @@ bool IndexCreator::extractKmerFromSixFrames(
             } else {
                 batchChecker[batchIdx].store(false, std::memory_order_release);
                 hasOverflow.fetch_add(1, std::memory_order_relaxed);
-                // The reservation is not given back. Returning it races with the threads
-                // that reserved after this one: their regions sit above it, and lowering
-                // the counter hands those same addresses out twice. The gap is left empty
-                // and skipped, which costs a little of one buffer and nothing else.
+                // Give the reservation back only if nothing was reserved after it.
+                // Subtracting unconditionally hands the addresses above it out twice;
+                // not giving it back at all leaves startIndexOfReserve past the end of
+                // the buffer, and the sort that follows reads off it. The compare and
+                // swap does neither: it fails when someone reserved behind this thread,
+                // and the gap it then leaves is zeroed and skipped.
+                const size_t reservedEnd = posToWrite + estimatedKmerCnt;
+                __sync_bool_compare_and_swap(&kmerBuffer.startIndexOfReserve,
+                                             reservedEnd, posToWrite);
             }
         }
     }
