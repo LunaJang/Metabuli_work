@@ -299,6 +299,7 @@ void IndexCreator::createCommonKmerIndex() {
     
     vector<pair<size_t, size_t>> uniqKmerIdxRanges;
     size_t lastProcessedBatchCnt = 0;
+    size_t lastShiftSum = 0;
     while(processedBatchCnt < accessionBatches.size()) {
         // Extract target k-mers
         time_t start = time(nullptr);
@@ -308,13 +309,18 @@ void IndexCreator::createCommonKmerIndex() {
         } else {
             fillTargetKmerBuffer(kmerBuffer, batchChecker, processedBatchCnt, par);
         }
-        // A round that places nothing would repeat for ever: the batch that cannot fit
-        // an empty buffer will not fit the next one either.
-        if (processedBatchCnt == lastProcessedBatchCnt) {
+        // A round may place nothing because every batch it tried was denser than its
+        // estimate, and those batches come back with more room, so that is progress even
+        // though the count did not move. A round that places nothing and raises nothing
+        // would repeat for ever.
+        size_t shiftSum = 0;
+        for (uint8_t sh : batchEstimateShift) { shiftSum += sh; }
+        if (processedBatchCnt == lastProcessedBatchCnt && shiftSum == lastShiftSum) {
             cerr << "No batch fits the k-mer buffer. Raise --max-ram or lower --threads." << endl;
             EXIT(EXIT_FAILURE);
         }
         lastProcessedBatchCnt = processedBatchCnt;
+        lastShiftSum = shiftSum;
         cout << double(time(nullptr) - start) << " s" << endl;
         
         // Sort the k-mers
@@ -995,7 +1001,10 @@ bool IndexCreator::extractKmerFromSixFrames(
     size_t &processedBatchCnt
 ) {
     std::atomic<int> hasOverflow{0};
-    #pragma omp parallel default(none), shared(kmerBuffer, batchChecker, processedBatchCnt, hasOverflow, par, cout)
+    if (batchEstimateShift.size() != accessionBatches.size()) {
+        batchEstimateShift.assign(accessionBatches.size(), 0);
+    }
+    #pragma omp parallel default(none), shared(kmerBuffer, batchChecker, processedBatchCnt, hasOverflow, par, cout, batchEstimateShift)
     {
         ProbabilityMatrix probMatrix(*subMat);
         char *reverseComplement;
@@ -1022,6 +1031,15 @@ bool IndexCreator::extractKmerFromSixFrames(
                 estimatedKmerCnt = static_cast<size_t>(
                     totalLength * 2.5
                 );
+            }
+            // Six frames of L bases yield about 2L amino acids, so 2L k-mers is the
+            // ceiling whatever the syncmer sample retains. The estimate above is what a
+            // typical sequence needs, not that ceiling, so a batch that overruns it comes
+            // back here with the shift raised until it fits or reaches the ceiling.
+            estimatedKmerCnt <<= batchEstimateShift[batchIdx];
+            const size_t estimateCeiling = static_cast<size_t>(totalLength) * 2 + 1024;
+            if (estimatedKmerCnt > estimateCeiling) {
+                estimatedKmerCnt = estimateCeiling;
             }
                 
             // Process current split if buffer has enough space.
@@ -1082,12 +1100,16 @@ bool IndexCreator::extractKmerFromSixFrames(
                     }
                 } else {
                     // The batch needed more room than its estimate. Erase what it wrote so
-                    // no partial genome reaches the sort, and leave it for the next round.
-                    // Empty k-mers are all-zero, which sorts to the front and is skipped
-                    // by the first-meaningful-k-mer scan in filterKmers.
+                    // no partial genome reaches the sort, and leave it for the next round
+                    // with twice the room. Empty k-mers are all-zero, which sorts to the
+                    // front and is skipped by the first-meaningful-k-mer scan in
+                    // filterKmers. hasOverflow is not set: that flag means the buffer is
+                    // full and the round is over, and one dense batch is not that.
                     memset(kmerBuffer.buffer + batchStart, 0, estimatedKmerCnt * sizeof(Kmer));
+                    if (batchEstimateShift[batchIdx] < 4) {
+                        batchEstimateShift[batchIdx]++;
+                    }
                     batchChecker[batchIdx].store(false, std::memory_order_release);
-                    hasOverflow.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 batchChecker[batchIdx].store(false, std::memory_order_release);
