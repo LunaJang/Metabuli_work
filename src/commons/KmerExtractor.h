@@ -185,17 +185,11 @@ public:
         uint32_t & idOffset,
         SeqEntry & savedSeq);
     
-    // Returns false when the sequence needs more room than [posToWrite, posLimit).
-    // The estimate the caller reserves from is a function of sequence length, and
-    // syncmer retention is a function of the sequence itself, so the estimate can be
-    // short. Without the limit the write runs past the reservation and, for a batch
-    // near the end of a full buffer, past the allocation.
-    bool extractKmer_dna2aa(
+    void extractKmer_dna2aa(
         const char *seq,
         int seqLen, 
         Buffer<Kmer> &kmerBuffer, 
         size_t &posToWrite,
-        size_t posLimit,
         uint32_t seqId1, 
         uint32_t seqId2 = 0);
 
