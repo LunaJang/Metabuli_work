@@ -185,11 +185,15 @@ public:
         uint32_t & idOffset,
         SeqEntry & savedSeq);
     
-    void extractKmer_dna2aa(
+    // Returns false on reaching posLimit, the end of the room the caller reserved.
+    // Without it the write runs into the next batch's k-mers and, for the batch that
+    // fills the buffer, past the allocation and over whatever follows it.
+    bool extractKmer_dna2aa(
         const char *seq,
         int seqLen, 
         Buffer<Kmer> &kmerBuffer, 
         size_t &posToWrite,
+        size_t posLimit,
         uint32_t seqId1, 
         uint32_t seqId2 = 0);
 

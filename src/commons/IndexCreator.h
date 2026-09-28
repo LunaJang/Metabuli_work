@@ -182,6 +182,11 @@ protected:
         size_t &processedSplitCnt,
         const LocalParameters &par);
     
+    // One shift per accession batch. A batch whose k-mers outgrew the room its length
+    // asked for is retried with twice as much, so a sequence denser than the estimate
+    // allows for converges in a few rounds instead of blocking.
+    std::vector<uint8_t> batchEstimateShift;
+
     bool extractKmerFromSixFrames(
         Buffer<Kmer> & kmerBuffer,
         std::vector<std::atomic<bool>> & batchChecker,

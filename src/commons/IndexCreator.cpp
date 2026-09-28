@@ -298,6 +298,8 @@ void IndexCreator::createCommonKmerIndex() {
     size_t processedBatchCnt = 0;
     
     vector<pair<size_t, size_t>> uniqKmerIdxRanges;
+    size_t lastProcessedBatchCnt = 0;
+    size_t lastShiftSum = 0;
     while(processedBatchCnt < accessionBatches.size()) {
         // Extract target k-mers
         time_t start = time(nullptr);
@@ -307,6 +309,17 @@ void IndexCreator::createCommonKmerIndex() {
         } else {
             fillTargetKmerBuffer(kmerBuffer, batchChecker, processedBatchCnt, par);
         }
+        // A round may place nothing because every batch it tried outgrew its estimate,
+        // and those come back with more room, which is progress the count does not show.
+        // A round that places nothing and raises nothing would repeat for ever.
+        size_t shiftSum = 0;
+        for (uint8_t sh : batchEstimateShift) { shiftSum += sh; }
+        if (processedBatchCnt == lastProcessedBatchCnt && shiftSum == lastShiftSum) {
+            cerr << "No batch fits the k-mer buffer. Raise --max-ram or lower --threads." << endl;
+            EXIT(EXIT_FAILURE);
+        }
+        lastProcessedBatchCnt = processedBatchCnt;
+        lastShiftSum = shiftSum;
         cout << double(time(nullptr) - start) << " s" << endl;
         
         // Sort the k-mers
@@ -987,7 +1000,10 @@ bool IndexCreator::extractKmerFromSixFrames(
     size_t &processedBatchCnt
 ) {
     std::atomic<int> hasOverflow{0};
-    #pragma omp parallel default(none), shared(kmerBuffer, batchChecker, processedBatchCnt, hasOverflow, par, cout)
+    if (batchEstimateShift.size() != accessionBatches.size()) {
+        batchEstimateShift.assign(accessionBatches.size(), 0);
+    }
+    #pragma omp parallel default(none), shared(kmerBuffer, batchChecker, processedBatchCnt, hasOverflow, par, cout, batchEstimateShift)
     {
         ProbabilityMatrix probMatrix(*subMat);
         char *reverseComplement;
@@ -1007,22 +1023,40 @@ bool IndexCreator::extractKmerFromSixFrames(
             }
 
             if (par.syncmer) {
+                // Six frames of L bases give about 2L amino-acid positions, and a syncmer
+                // sample of them was assumed to keep 2/(k-s+1) of those. Measured over 84
+                // GTDB R226 genomes it keeps twice that, 4/(k-s+1): at k=12 and s=5 the
+                // batches yielded 1.018 to 1.032 k-mers per base against the 0.625 this
+                // asked for, so every batch wrote past its reservation, into the next
+                // batch's k-mers and finally past the buffer itself.
                 estimatedKmerCnt = static_cast<size_t>(
-                    (totalLength * 2.5) / ((12 - par.smerLen + 1) / 2.0)
+                    (totalLength * 2.5) / ((12 - par.smerLen + 1) / 4.0)
                 );
             } else {
                 estimatedKmerCnt = static_cast<size_t>(
                     totalLength * 2.5
                 );
             }
+            // An estimate can still be short on a sequence unlike the ones measured, and
+            // being short is not survivable: the write lands in the next batch or outside
+            // the buffer. A batch that outgrows its room is therefore retried with twice
+            // as much, up to the 2L that six-frame translation cannot exceed.
+            estimatedKmerCnt <<= batchEstimateShift[batchIdx];
+            const size_t estimateCeiling = static_cast<size_t>(totalLength) * 2 + 1024;
+            if (estimatedKmerCnt > estimateCeiling) {
+                estimatedKmerCnt = estimateCeiling;
+            }
                 
             // Process current split if buffer has enough space.
             size_t posToWrite = kmerBuffer.reserveMemory(estimatedKmerCnt);
+            const size_t batchStart = posToWrite;
+            const size_t batchLimit = posToWrite + estimatedKmerCnt;
+            bool batchFits = true;
             if (posToWrite + estimatedKmerCnt < kmerBuffer.bufferSize) {
                 KSeqWrapper* kseq = KSeqFactory(fastaPaths[accessionBatches[batchIdx].whichFasta].c_str());
                 size_t seqCnt = 0;
                 size_t idx = 0;
-                while (kseq->ReadEntry()) {
+                while (batchFits && kseq->ReadEntry()) {
                     if (seqCnt == accessionBatches[batchIdx].orders[idx]) {
                         if (accessionBatches[batchIdx].taxIDs[idx] == 0) {
                             #pragma omp critical
@@ -1043,11 +1077,12 @@ bool IndexCreator::extractKmerFromSixFrames(
                             maskedSeq = e.sequence.s;
                         }
 
-                        kmerExtractor->extractKmer_dna2aa(
+                        batchFits = kmerExtractor->extractKmer_dna2aa(
                             maskedSeq,
                             e.sequence.l,
                             kmerBuffer,
                             posToWrite,
+                            batchLimit,
                             accessionBatches[batchIdx].taxIDs[idx],
                             accessionBatches[batchIdx].speciesID);
                             
@@ -1055,23 +1090,39 @@ bool IndexCreator::extractKmerFromSixFrames(
                         if (par.maskMode) {
                             delete[] maskedSeq;
                         }
-                        if (idx == accessionBatches[batchIdx].lengths.size()) {
+                        if (!batchFits || idx == accessionBatches[batchIdx].lengths.size()) {
                             break;
                         }
                     }
                     seqCnt++;
                 }
                 delete kseq;
-                __sync_fetch_and_add(&processedBatchCnt, 1);
-                #pragma omp critical
-                {
-                    cout << processedBatchCnt << " batches processed out of " << accessionBatches.size() << endl;
-                        // cout << fastaPaths[accessionBatches[batchIdx].whichFasta] << " processed\n";
+                if (batchFits) {
+                    __sync_fetch_and_add(&processedBatchCnt, 1);
+                    #pragma omp critical
+                    {
+                        cout << processedBatchCnt << " batches processed out of " << accessionBatches.size() << endl;
+                    }
+                } else {
+                    // Erase what the batch wrote so no partial genome reaches the sort, and
+                    // leave it for the next round with twice the room. Empty k-mers are
+                    // all-zero, which sorts to the front and is skipped where filterKmers
+                    // looks for the first meaningful k-mer. hasOverflow is not set: that
+                    // means the buffer is full and the round is over, and one dense batch
+                    // is not that.
+                    memset(kmerBuffer.buffer + batchStart, 0, estimatedKmerCnt * sizeof(Kmer));
+                    if (batchEstimateShift[batchIdx] < 4) {
+                        batchEstimateShift[batchIdx]++;
+                    }
+                    batchChecker[batchIdx].store(false, std::memory_order_release);
                 }
             } else {
                 batchChecker[batchIdx].store(false, std::memory_order_release);
                 hasOverflow.fetch_add(1, std::memory_order_relaxed);
-                __sync_fetch_and_sub(&kmerBuffer.startIndexOfReserve, estimatedKmerCnt);
+                // The reservation is not given back. Returning it races with the threads
+                // that reserved after this one: their regions sit above it, and lowering
+                // the counter hands those same addresses out twice. The gap is left empty
+                // and skipped, which costs a little of one buffer and nothing else.
             }
         }
     }
