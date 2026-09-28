@@ -342,13 +342,11 @@ void IndexCreator::createCommonKmerIndex() {
         cout << "Filter k-mers    : " << time(nullptr) - start << " s" << endl; 
         cout << "Selected k-mers  : " << selectedKmerCnt << endl;
 
-        // Write the target files
+        // Write the target files. Always as a flush to be merged, never straight to the
+        // final index: what makes this a common k-mer list is mergeTargetFiles<COMMON_KMER>
+        // below, and writing the final files here would skip it.
         start = time(nullptr);
-        if(processedBatchCnt == accessionBatches.size() && numOfFlush == 0) {
-            writeTargetFilesAndSplits(kmerBuffer, uniqKmerIdx.buffer, selectedKmerCnt, uniqKmerIdxRanges);
-        } else {
-            writeTargetFiles(kmerBuffer, uniqKmerIdx.buffer, uniqKmerIdxRanges);
-        }
+        writeTargetFiles(kmerBuffer, uniqKmerIdx.buffer, uniqKmerIdxRanges);
         cout << "Write k-mers     : " << time(nullptr) - start << " s" << endl;
 
         // Reset buffers
@@ -361,11 +359,11 @@ void IndexCreator::createCommonKmerIndex() {
 
     taxonomy->writeTaxonomyDB(par.filenames[0] + "/taxonomyDB");
     writeDbParameters();
-    
-    if (numOfFlush == 1) {
-        cout << "Index creation completed." << endl;
-        return;
-    }
+
+    // No early return for a single flush. The k-mers that occur in more than one species
+    // are chosen in the merge, so returning before it leaves every k-mer in the list and
+    // the filter the method rests on is never applied. An input that fits one buffer used
+    // to produce a full index under the name of a common k-mer list.
     cout << "Merge reference DB files ... " << endl;
 
     // for (int i = 0; i < 243; i++) {
