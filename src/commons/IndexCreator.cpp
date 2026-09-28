@@ -298,6 +298,7 @@ void IndexCreator::createCommonKmerIndex() {
     size_t processedBatchCnt = 0;
     
     vector<pair<size_t, size_t>> uniqKmerIdxRanges;
+    size_t lastProcessedBatchCnt = 0;
     while(processedBatchCnt < accessionBatches.size()) {
         // Extract target k-mers
         time_t start = time(nullptr);
@@ -307,6 +308,13 @@ void IndexCreator::createCommonKmerIndex() {
         } else {
             fillTargetKmerBuffer(kmerBuffer, batchChecker, processedBatchCnt, par);
         }
+        // A round that places nothing would repeat for ever: the batch that cannot fit
+        // an empty buffer will not fit the next one either.
+        if (processedBatchCnt == lastProcessedBatchCnt) {
+            cerr << "No batch fits the k-mer buffer. Raise --max-ram or lower --threads." << endl;
+            EXIT(EXIT_FAILURE);
+        }
+        lastProcessedBatchCnt = processedBatchCnt;
         cout << double(time(nullptr) - start) << " s" << endl;
         
         // Sort the k-mers
@@ -1018,11 +1026,14 @@ bool IndexCreator::extractKmerFromSixFrames(
                 
             // Process current split if buffer has enough space.
             size_t posToWrite = kmerBuffer.reserveMemory(estimatedKmerCnt);
+            const size_t batchStart = posToWrite;
+            const size_t batchLimit = posToWrite + estimatedKmerCnt;
+            bool batchFits = true;
             if (posToWrite + estimatedKmerCnt < kmerBuffer.bufferSize) {
                 KSeqWrapper* kseq = KSeqFactory(fastaPaths[accessionBatches[batchIdx].whichFasta].c_str());
                 size_t seqCnt = 0;
                 size_t idx = 0;
-                while (kseq->ReadEntry()) {
+                while (batchFits && kseq->ReadEntry()) {
                     if (seqCnt == accessionBatches[batchIdx].orders[idx]) {
                         if (accessionBatches[batchIdx].taxIDs[idx] == 0) {
                             #pragma omp critical
@@ -1043,11 +1054,12 @@ bool IndexCreator::extractKmerFromSixFrames(
                             maskedSeq = e.sequence.s;
                         }
 
-                        kmerExtractor->extractKmer_dna2aa(
+                        batchFits = kmerExtractor->extractKmer_dna2aa(
                             maskedSeq,
                             e.sequence.l,
                             kmerBuffer,
                             posToWrite,
+                            batchLimit,
                             accessionBatches[batchIdx].taxIDs[idx],
                             accessionBatches[batchIdx].speciesID);
                             
@@ -1055,23 +1067,35 @@ bool IndexCreator::extractKmerFromSixFrames(
                         if (par.maskMode) {
                             delete[] maskedSeq;
                         }
-                        if (idx == accessionBatches[batchIdx].lengths.size()) {
+                        if (!batchFits || idx == accessionBatches[batchIdx].lengths.size()) {
                             break;
                         }
                     }
                     seqCnt++;
                 }
                 delete kseq;
-                __sync_fetch_and_add(&processedBatchCnt, 1);
-                #pragma omp critical
-                {
-                    cout << processedBatchCnt << " batches processed out of " << accessionBatches.size() << endl;
-                        // cout << fastaPaths[accessionBatches[batchIdx].whichFasta] << " processed\n";
+                if (batchFits) {
+                    __sync_fetch_and_add(&processedBatchCnt, 1);
+                    #pragma omp critical
+                    {
+                        cout << processedBatchCnt << " batches processed out of " << accessionBatches.size() << endl;
+                    }
+                } else {
+                    // The batch needed more room than its estimate. Erase what it wrote so
+                    // no partial genome reaches the sort, and leave it for the next round.
+                    // Empty k-mers are all-zero, which sorts to the front and is skipped
+                    // by the first-meaningful-k-mer scan in filterKmers.
+                    memset(kmerBuffer.buffer + batchStart, 0, estimatedKmerCnt * sizeof(Kmer));
+                    batchChecker[batchIdx].store(false, std::memory_order_release);
+                    hasOverflow.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 batchChecker[batchIdx].store(false, std::memory_order_release);
                 hasOverflow.fetch_add(1, std::memory_order_relaxed);
-                __sync_fetch_and_sub(&kmerBuffer.startIndexOfReserve, estimatedKmerCnt);
+                // The reservation is not given back. Returning it races with the threads
+                // that reserved after this one: their regions sit above it, and lowering
+                // the counter hands those same addresses out twice. The gap is left empty
+                // and skipped, which costs a little of one buffer and nothing else.
             }
         }
     }

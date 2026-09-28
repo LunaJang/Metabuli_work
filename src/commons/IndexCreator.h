@@ -501,6 +501,11 @@ void IndexCreator::filterKmers(
     size_t & selectedKmerCnt,
     vector<pair<size_t, size_t>> & selectedKmerIdxRanges) 
 {
+    // One entry per split, and splits is rebuilt on every call, so the ranges have to
+    // start empty. Callers hold this vector across flushes and clear it themselves; doing
+    // it here as well keeps the two in step if a caller ever forgets.
+    selectedKmerIdxRanges.clear();
+
     // Find the first index of garbage k-mer (UINT64_MAX)
     for(size_t checkN = kmerBuffer.startIndexOfReserve - 1; checkN != 0; checkN--){
         if(kmerBuffer.buffer[checkN].value != UINT64_MAX){

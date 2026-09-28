@@ -854,11 +854,12 @@ void KmerExtractor::generatePDMNeighborKmers(
 
 }
 
-void KmerExtractor::extractKmer_dna2aa(
+bool KmerExtractor::extractKmer_dna2aa(
     const char *seq,
     int seqLen, 
     Buffer<Kmer> &kmerBuffer, 
     size_t &posToWrite, 
+    size_t posLimit,
     uint32_t seqId1, // eg. taxID
     uint32_t seqId2  // eg. speciesID
 ) {
@@ -899,9 +900,13 @@ void KmerExtractor::extractKmer_dna2aa(
         kmerScanners[threadID]->initScanner(seq, begin, end, isForward);
         Kmer kmer;
         while ((kmer = kmerScanners[threadID]->next()).value != UINT64_MAX) {
+            if (posToWrite >= posLimit) {
+                return false;
+            }
             kmerBuffer.buffer[posToWrite++] = {kmer.value, static_cast<TaxID>(seqId1), static_cast<TaxID>(seqId2)};
         }
     }
+    return true;
 }
 
 int KmerExtractor::extractTargetKmers(
