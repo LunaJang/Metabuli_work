@@ -120,7 +120,9 @@ public:
     PARAMETER(TAXID_COL)
     PARAMETER(WEIGHT_MODE)
     PARAMETER(MIN_EDGE_WEIGHT)
+    PARAMETER(KRAKEN2_FORMAT)
     int weightMode;
+    int kraken2Format;
 
 
     // DB build parameters

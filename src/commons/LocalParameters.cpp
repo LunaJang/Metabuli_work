@@ -398,6 +398,20 @@ LocalParameters::LocalParameters() :
                     typeid(float),
                     (void *) &minVoteScr,
                     "^0(\\.[0-9]+)?|1(\\.0+)?$"),
+        KRAKEN2_FORMAT(KRAKEN2_FORMAT_ID,
+                  "--kraken2",
+                  "Read --score-col as Kraken2's LCA mapping and score it.",
+                  "Kraken2 writes no score, but its fifth output field is the LCA mapping:\n"
+                  "              space separated taxon:count pairs, 'A' for k-mers holding an\n"
+                  "              ambiguous nucleotide and '0' for k-mers queried without a hit,\n"
+                  "              with '|:|' between the mates of a pair. With this flag the column\n"
+                  "              named by --score-col is read that way and each read is scored as\n"
+                  "              Kraken2's confidence: the k-mers mapped to the clade rooted at the\n"
+                  "              assigned taxon, over the k-mers actually queried, which is every\n"
+                  "              count except 'A'. That makes --weight-mode 1 usable on Kraken2.",
+                  typeid(int),
+                  (void *) &kraken2Format,
+                  "^[0-1]{1}$"),
         SCORE_COL(SCORE_COL_ID,
                   "--score-col",
                   "Score column index (ONE-based; apply-group only reader).",
@@ -733,6 +747,7 @@ LocalParameters::LocalParameters() :
     readIdCol = 0;
     taxidCol = 0;
     scoreCol = 0;
+    kraken2Format = 0;
     cladeRank = "";
     skipSecondary = 0;
 
@@ -913,6 +928,7 @@ LocalParameters::LocalParameters() :
     groupApplication.push_back(&READID_COL);
     groupApplication.push_back(&TAXID_COL);
     groupApplication.push_back(&WEIGHT_MODE);
+    groupApplication.push_back(&KRAKEN2_FORMAT);
 
     groupGeneration.push_back(&PARAM_MASK_RESIDUES);
     groupGeneration.push_back(&PARAM_MASK_PROBABILTY);

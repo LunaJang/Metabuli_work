@@ -70,6 +70,43 @@ void GroupApplier::startGroupApplication(const LocalParameters &par) {
 }
 
 
+// Kraken2's confidence, from the LCA mapping it writes in place of a score.
+//
+// The field is space separated taxon:count pairs, with 'A' for k-mers holding an ambiguous
+// nucleotide, '0' for k-mers that were queried and matched nothing, and '|:|' between the
+// mates of a pair. Q is every count except 'A', since those k-mers were never queried; N is
+// the counts whose taxon lies in the clade rooted at the assigned one, which is what makes a
+// read assigned to a genus score on its species' hits as well.
+static float kraken2Confidence(const std::string & mapping,
+                               TaxID assigned,
+                               TaxonomyWrapper * taxonomy) {
+    uint64_t queried = 0;
+    uint64_t inClade = 0;
+    size_t i = 0;
+    const size_t n = mapping.size();
+    while (i < n) {
+        while (i < n && mapping[i] == ' ') { i++; }
+        size_t end = i;
+        while (end < n && mapping[end] != ' ') { end++; }
+        if (end == i) { break; }
+        const size_t colon = mapping.rfind(':', end - 1);
+        if (colon == std::string::npos || colon < i) { i = end; continue; }
+        const std::string key = mapping.substr(i, colon - i);
+        const uint64_t count = strtoull(mapping.c_str() + colon + 1, nullptr, 10);
+        i = end;
+        if (key.empty() || key == "|") { continue; }   // the |:| that separates the mates
+        if (key == "A") { continue; }                  // ambiguous: never queried
+        queried += count;
+        if (key == "0") { continue; }                  // queried, no hit
+        const TaxID hit = static_cast<TaxID>(strtol(key.c_str(), nullptr, 10));
+        if (hit == assigned || (assigned != 0 && taxonomy->IsAncestor(assigned, hit))) {
+            inClade += count;
+        }
+    }
+    if (queried == 0) { return 0.0f; }
+    return static_cast<float>(inClade) / static_cast<float>(queried);
+}
+
 void GroupApplier::loadOrgResult(vector<OrgResult>& orgResults, size_t& processedReadCnt) {
     ifstream inFile(orgRes);
     if (!inFile.is_open()) {
@@ -89,6 +126,24 @@ void GroupApplier::loadOrgResult(vector<OrgResult>& orgResults, size_t& processe
             TaxID taxId = stoi(columns[classificationCol]);
             orgResults.push_back({taxId, 1.0, columns[readNameCol]});
             processedReadCnt++;
+        }
+    } else if (par.kraken2Format) {
+        string line;
+        size_t emptyMappings = 0;
+        while (getline(inFile, line)) {
+            if (line.empty()) continue;
+            if (line.front() == '#') continue;
+            std::vector<std::string> columns = TaxonomyWrapper::splitByDelimiter(line, "\t", 20);
+            TaxID taxId = stoi(columns[classificationCol]);
+            const float score = kraken2Confidence(columns[scoreCol], taxId, taxonomy);
+            if (score == 0.0f) { emptyMappings++; }
+            orgResults.push_back({taxId, score, columns[readNameCol]});
+            processedReadCnt++;
+        }
+        if (emptyMappings > 0) {
+            cout << "Note: " << emptyMappings << " reads scored 0 from column "
+                 << (scoreCol + 1) << ", which is every unclassified read and any whose"
+                 << " k-mers were all ambiguous." << endl;
         }
     } else {
         string line;
