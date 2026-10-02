@@ -409,9 +409,9 @@ LocalParameters::LocalParameters() :
                   "              Kraken2's confidence: the k-mers mapped to the clade rooted at the\n"
                   "              assigned taxon, over the k-mers actually queried, which is every\n"
                   "              count except 'A'. That makes --weight-mode 1 usable on Kraken2.",
-                  typeid(int),
+                  typeid(bool),
                   (void *) &kraken2Format,
-                  "^[0-1]{1}$"),
+                  ""),
         SCORE_COL(SCORE_COL_ID,
                   "--score-col",
                   "Score column index (ONE-based; apply-group only reader).",
@@ -747,7 +747,7 @@ LocalParameters::LocalParameters() :
     readIdCol = 0;
     taxidCol = 0;
     scoreCol = 0;
-    kraken2Format = 0;
+    kraken2Format = false;
     cladeRank = "";
     skipSecondary = 0;
 

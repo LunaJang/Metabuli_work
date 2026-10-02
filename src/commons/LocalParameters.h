@@ -122,7 +122,7 @@ public:
     PARAMETER(MIN_EDGE_WEIGHT)
     PARAMETER(KRAKEN2_FORMAT)
     int weightMode;
-    int kraken2Format;
+    bool kraken2Format;
 
 
     // DB build parameters
