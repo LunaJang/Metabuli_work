@@ -11,7 +11,26 @@ void setGroupApplicationDefaults(LocalParameters & par){
     par.readIdCol = 2;
     par.taxidCol = 3;
     par.weightMode = 1; // 0: uniform, 1: score, 2: score^2
-    par.minVoteScr = 0.15;
+    // 0, not 0.15. The threshold does two things at once and only one of them was
+    // wanted. It filters the vote that picks a group's label, and it decides who that
+    // label is written to: a member below it is overwritten even though it has a label
+    // of its own. At 0.15 on Kraken2 that cost 36 M species labels on CAMI2
+    // plant-associated and 15 M on strain-madness, because a group's LCA is often
+    // coarser than the label it replaced, and the arm came out below both uniform
+    // weighting and no propagation at all.
+    //
+    // At 0 the score still weights the vote and nothing else: only members with no
+    // label are written to, so propagation cannot lower the number of classified reads
+    // at any rank. A threshold remains available for whoever wants one, and it means
+    // what it says rather than two things.
+    //
+    // 0.15 was never a general value either. It is the short-read threshold of
+    // Metabuli-P, derived in that paper from where its own true and false positives
+    // separate. Kraken2's manual defines a confidence but recommends no threshold and
+    // defaults to 0; Centrifuger's score is an unbounded sum of squared hit lengths
+    // whose authors say outright that estimating confidence from it is future work.
+    // One number could not have meant the same thing in all three.
+    par.minVoteScr = 0.0;
 }
 
 int groupApplication(int argc, const char **argv, const Command& command)
