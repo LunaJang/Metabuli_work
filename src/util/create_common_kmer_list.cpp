@@ -86,13 +86,17 @@ int create_common_kmer_list(int argc, const char **argv, const Command &command)
                             taxonomyDir + "/merged.dmp",
                             true);
 
-    IndexCreator idxCre(par, taxonomy, par.kmerFormat);
+    // Not the taxonomy-taking constructor: it builds its KmerExtractor from a MetamerPattern
+    // fixed at 8 amino acids and ignores kmerFormat, so --kmer-format 5 produced 8-mer
+    // metamers that grouping's 12-mer syncmers never matched.
+    IndexCreator idxCre(par, par.kmerFormat);
+    idxCre.setTaxonomy(taxonomy);
     idxCre.createCommonKmerIndex();
+    const int kmerLen = idxCre.getKmerLen();
     delete taxonomy;
 
-    // Record how the k-mers were built. The grouping workflow compares its own --syncmer /
-    // --smer-len against this and refuses to run on a mismatch: the two k-mer spaces would not
-    // line up and the common-k-mer filter would remove nothing, without any error.
+    // Grouping compares its own settings against this and refuses to run on a mismatch.
+    // kmer_len is what the extractor reported, not what was asked for.
     {
         const string paramFile = dbDir + "/kmer_params";
         ofstream out(paramFile);
@@ -102,7 +106,8 @@ int create_common_kmer_list(int argc, const char **argv, const Command &command)
         }
         out << "syncmer " << par.syncmer << "\n"
             << "smer_len " << par.smerLen << "\n"
-            << "kmer_format " << par.kmerFormat << "\n";
+            << "kmer_format " << par.kmerFormat << "\n"
+            << "kmer_len " << kmerLen << "\n";
         out.close();
     }
     return 0;

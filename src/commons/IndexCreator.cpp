@@ -97,10 +97,27 @@ IndexCreator::IndexCreator(
 }
 
 IndexCreator::IndexCreator(
-    const LocalParameters & par, 
-    int kmerFormat) : par(par), kmerFormat(kmerFormat) 
+    const LocalParameters & par,
+    int kmerFormat) : par(par), kmerFormat(kmerFormat)
 {
     dbDir = par.filenames[0];
+    if (par.filenames.size() >= 2) {
+        fnaListFileName = par.filenames[1];
+    }
+    if (par.filenames.size() >= 3) {
+        acc2taxidFileName = par.filenames[2];
+    }
+
+    taxidListFileName = dbDir + "/taxID_list";
+    taxonomyBinaryFileName = dbDir + "/taxonomyDB";
+    versionFileName = dbDir + "/db.version";
+    paramterFileName = dbDir + "/db.parameters";
+
+    this->totalLength = par.dbTotalLength;
+
+    // No MetamerPattern here, so no dnaMask to take this from.
+    MARKER = ~ 0ULL;
+
     // if (par.reducedAA) {
     //     geneticCode = new ReducedGeneticCode();
     // } else {

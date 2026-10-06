@@ -221,7 +221,8 @@ protected:
     );
 
     size_t AminoAcidPart(size_t kmer) {
-        if (kmerFormat == 3 || kmerFormat == 4) {
+        // 3, 4, 5 carry no DNA bits to mask off.
+        if (kmerFormat == 3 || kmerFormat == 4 || kmerFormat == 5) {
             return kmer;
         }
         return (kmer) & MARKER;
@@ -308,6 +309,7 @@ public:
     int getNumOfFlush() const { return numOfFlush; }
     TaxonomyWrapper* getTaxonomy() const { return taxonomy;}
     unordered_set<TaxID> getTaxIdSet() { return taxIdSet; }
+    int getKmerLen() const { return kmerExtractor->getKmerLen(); }
 
     // Setters
     void setIsUpdating(bool isUpdating) { this->isUpdating = isUpdating; }
@@ -315,6 +317,16 @@ public:
     void addFilesToMerge(string diffIdxFileName, string infoFileName);
     void updateTaxId2SpeciesTaxId(const string & taxIdListFileName);
     void setMergedFileNames(string diffFileName, string infoFileName, string splitFileName);
+
+    void setTaxonomy(TaxonomyWrapper * taxonomy) {
+        this->taxonomy = taxonomy;
+        taxaNotToMask.clear();
+        if (taxonomy != nullptr && !par.noMaskTaxa.empty()) {
+            for (const string & taxIdStr : Util::split(par.noMaskTaxa, ",")) {
+                taxaNotToMask.push_back(taxonomy->getInternalTaxID(stoi(taxIdStr)));
+            }
+        }
+    }
 
     void printFilesToMerge() {
         cout << "Files to merge :" << endl;

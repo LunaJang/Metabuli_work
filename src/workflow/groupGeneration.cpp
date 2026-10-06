@@ -64,25 +64,37 @@ static int runGroupGeneration(int argc, const char **argv, const Command& comman
     {
         const std::string dbDir = par.filenames[1 + (par.seqMode == 2)];
         const std::string paramFile = dbDir + "/kmer_params";
-        if (FileUtil::fileExists(paramFile.c_str())) {
-            int dbSyncmer = -1, dbSmerLen = -1, dbKmerFormat = -1;
-            std::ifstream in(paramFile);
-            std::string key;
-            int value = 0;
-            while (in >> key >> value) {
-                if (key == "syncmer") { dbSyncmer = value; }
-                else if (key == "smer_len") { dbSmerLen = value; }
-                else if (key == "kmer_format") { dbKmerFormat = value; }
-            }
-            if (dbSyncmer != par.syncmer || dbSmerLen != par.smerLen || dbKmerFormat != par.kmerFormat) {
-                cerr << "Error: k-mer settings do not match the common k-mer DB at " << dbDir << "." << endl;
-                cerr << "       DB:      --syncmer " << dbSyncmer << " --smer-len " << dbSmerLen
-                     << " (k-mer format " << dbKmerFormat << ")" << endl;
-                cerr << "       Request: --syncmer " << par.syncmer << " --smer-len " << par.smerLen
-                     << " (k-mer format " << par.kmerFormat << ")" << endl;
-                cerr << "       Rebuild the DB with these settings, or pass the DB's settings." << endl;
-                return 1;
-            }
+        // Absence used to skip the check, which is how a list in the wrong k-mer space ran
+        // to completion removing nothing.
+        if (!FileUtil::fileExists(paramFile.c_str())) {
+            cerr << "Error: no kmer_params in the common k-mer DB at " << dbDir << "." << endl;
+            cerr << "       Without it the DB's k-mer settings cannot be checked against this run's," << endl;
+            cerr << "       and a mismatch removes no k-mer at all while reporting success." << endl;
+            cerr << "       Rebuild the list with create-common-kmer-list, and copy kmer_params" << endl;
+            cerr << "       along with diffIdx, info, split and taxID_list." << endl;
+            return 1;
+        }
+        int dbSyncmer = -1, dbSmerLen = -1, dbKmerFormat = -1, dbKmerLen = -1;
+        std::ifstream in(paramFile);
+        std::string key;
+        int value = 0;
+        while (in >> key >> value) {
+            if (key == "syncmer") { dbSyncmer = value; }
+            else if (key == "smer_len") { dbSmerLen = value; }
+            else if (key == "kmer_format") { dbKmerFormat = value; }
+            else if (key == "kmer_len") { dbKmerLen = value; }
+        }
+        // -1 means the file predates kmer_len, not that it disagrees.
+        const int kmerLen = (par.syncmer == 0 && par.kmerFormat <= 2) ? 8 : 12;
+        if (dbSyncmer != par.syncmer || dbSmerLen != par.smerLen || dbKmerFormat != par.kmerFormat
+            || (dbKmerLen != -1 && dbKmerLen != kmerLen)) {
+            cerr << "Error: k-mer settings do not match the common k-mer DB at " << dbDir << "." << endl;
+            cerr << "       DB:      --syncmer " << dbSyncmer << " --smer-len " << dbSmerLen
+                 << " (k-mer format " << dbKmerFormat << ", k " << dbKmerLen << ")" << endl;
+            cerr << "       Request: --syncmer " << par.syncmer << " --smer-len " << par.smerLen
+                 << " (k-mer format " << par.kmerFormat << ", k " << kmerLen << ")" << endl;
+            cerr << "       Rebuild the DB with these settings, or pass the DB's settings." << endl;
+            return 1;
         }
     }
 
